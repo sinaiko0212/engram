@@ -1,0 +1,757 @@
+"""Integration tests for simulation endpoints."""
+
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
+
+from app.database import async_session, init_db
+from app.main import app
+
+
+@pytest.fixture(autouse=True)
+async def setup_db():
+    """Initialize test database and clean data between tests."""
+    await init_db()
+    # Clean all data before each test
+    async with async_session() as session:
+        await session.execute(text("DELETE FROM disc_titles"))
+        await session.execute(text("DELETE FROM disc_jobs"))
+        await session.commit()
+
+
+@pytest.fixture
+async def client():
+    """Create async test client."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.mark.asyncio
+async def test_simulate_insert_disc_creates_job(client):
+    """Test that simulating disc insertion creates a DB record."""
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "drive_id": "E:",
+            "volume_label": "TEST_DISC",
+            "content_type": "tv",
+            "detected_title": "Test Show",
+            "detected_season": 1,
+            "simulate_ripping": False,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "simulated"
+    assert "job_id" in data
+
+    # Verify job exists
+    job_response = await client.get(f"/api/jobs/{data['job_id']}")
+    assert job_response.status_code == 200
+    job = job_response.json()
+    assert job["volume_label"] == "TEST_DISC"
+    assert job["content_type"] == "tv"
+    assert job["detected_title"] == "Test Show"
+
+
+@pytest.mark.asyncio
+async def test_simulate_insert_disc_creates_titles(client):
+    """Test that simulated disc creates title records."""
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "TEST_TV",
+            "content_type": "tv",
+            "simulate_ripping": False,
+            "titles": [
+                {"duration_seconds": 1320, "file_size_bytes": 1000000000},
+                {"duration_seconds": 1350, "file_size_bytes": 1100000000},
+            ],
+        },
+    )
+    data = response.json()
+    job_id = data["job_id"]
+
+    # Verify titles exist
+    titles_response = await client.get(f"/api/jobs/{job_id}/titles")
+    assert titles_response.status_code == 200
+    titles = titles_response.json()
+    assert len(titles) == 2
+    assert titles[0]["duration_seconds"] == 1320
+    assert titles[1]["duration_seconds"] == 1350
+
+
+@pytest.mark.asyncio
+async def test_simulate_advance_job(client):
+    """Test manually advancing a job state."""
+    # Create a job
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "ADVANCE_TEST",
+            "content_type": "movie",
+            "simulate_ripping": False,
+        },
+    )
+    job_id = response.json()["job_id"]
+
+    # Advance the job
+    advance_response = await client.post(f"/api/simulate/advance-job/{job_id}")
+    assert advance_response.status_code == 200
+    data = advance_response.json()
+    assert data["status"] == "advanced"
+
+
+@pytest.mark.asyncio
+async def test_advance_job_to_completed_clears_identity_prompt(client):
+    """Advancing a job to COMPLETED via advance-job clears identity_prompt_json (fix #2)."""
+    import json as stdlib_json
+
+    from app.database import async_session as db_session
+    from app.models import DiscJob, JobState
+
+    # Create a job with a live identity prompt
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "PROMPT_CLEAR_TEST",
+            "content_type": "tv",
+            "detected_title": "My Show",
+            "simulate_ripping": False,
+            "identity_pending": "season",
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    # Confirm the prompt is set
+    async with db_session() as session:
+        job = await session.get(DiscJob, job_id)
+    assert job is not None
+    assert job.state == JobState.RIPPING
+    assert job.identity_prompt_json is not None
+    prompt = stdlib_json.loads(job.identity_prompt_json)
+    assert prompt["kind"] == "season"
+
+    # Advance through RIPPING → MATCHING → ORGANIZING → COMPLETED
+    states_to_advance = [JobState.RIPPING, JobState.MATCHING, JobState.ORGANIZING]
+    for _ in states_to_advance:
+        adv = await client.post(f"/api/simulate/advance-job/{job_id}")
+        assert adv.status_code == 200
+
+    # Verify job is COMPLETED and identity_prompt_json is cleared
+    async with db_session() as session:
+        job = await session.get(DiscJob, job_id)
+    assert job is not None
+    assert job.state == JobState.COMPLETED
+    assert job.identity_prompt_json is None, (
+        f"Expected identity_prompt_json=None after COMPLETED, got {job.identity_prompt_json!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_simulate_remove_disc(client):
+    """Test simulating disc removal."""
+    response = await client.post(
+        "/api/simulate/remove-disc?drive_id=E%3A",
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "removed"
+
+
+@pytest.mark.asyncio
+async def test_simulation_disabled_in_production(client):
+    """Test that simulation endpoints are blocked when DEBUG=false."""
+    # Patch the attribute on the settings singleton rather than a module's
+    # binding of it: require_debug reads the name from its own module, so a
+    # patch aimed at one importer's namespace silently stops gating when the
+    # dependency moves, and this test would pass a 200 as a 403.
+    with patch("app.config.settings.debug", False):
+        response = await client.post(
+            "/api/simulate/insert-disc",
+            json={"volume_label": "BLOCKED"},
+        )
+        assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_clear_completed_jobs(client):
+    """Test clearing completed jobs."""
+    # Create and complete a simulated job
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "CLEAR_TEST",
+            "content_type": "movie",
+            "simulate_ripping": False,
+        },
+    )
+    job_id = response.json()["job_id"]
+
+    # Advance to completed
+    for _ in range(5):
+        try:
+            await client.post(f"/api/simulate/advance-job/{job_id}")
+        except Exception:
+            break
+
+    # Clear completed
+    clear_response = await client.delete("/api/jobs/completed")
+    assert clear_response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_on_title_ripped_transitions_to_ripping(client):
+    """Test that _on_title_ripped correctly transitions a title to MATCHING state.
+
+    When a title's rip is detected as complete, _on_title_ripped transitions it
+    from PENDING/RIPPING to MATCHING (TV) so the UI no longer shows "RIPPING 0.0%"
+    for completed tracks. The matcher then waits for file readiness independently.
+    """
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from app.database import async_session as db_session
+    from app.models.disc_job import DiscTitle, TitleState
+    from app.services.job_manager import job_manager
+
+    # 1. Create a job with titles via simulation (no ripping)
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "drive_id": "E:",
+            "volume_label": "CALLBACK_TEST",
+            "content_type": "tv",
+            "detected_title": "Callback Show",
+            "detected_season": 1,
+            "simulate_ripping": False,
+            "titles": [
+                {"duration_seconds": 1320, "file_size_bytes": 500_000_000},
+                {"duration_seconds": 1350, "file_size_bytes": 510_000_000},
+                {"duration_seconds": 1380, "file_size_bytes": 520_000_000},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    # 2. Fetch titles to build sorted_titles (mimics _run_ripping)
+    from sqlmodel import select
+
+    async with db_session() as session:
+        result = await session.execute(select(DiscTitle).where(DiscTitle.job_id == job_id))
+        disc_titles = result.scalars().all()
+        sorted_titles = sorted(disc_titles, key=lambda t: t.title_index)
+
+    assert len(sorted_titles) == 3
+
+    # 3. Mock WebSocket broadcast and episode matching
+    with (
+        patch(
+            "app.api.websocket.manager.broadcast_title_update", new_callable=AsyncMock
+        ) as mock_broadcast,
+        patch.object(
+            job_manager._matching, "match_single_file", new_callable=AsyncMock
+        ) as mock_match,
+    ):
+        # Simulate MakeMKV completing title 1 (filename pattern: B1_t01.mkv)
+        fake_path = Path("/staging/B1_t01.mkv")
+        await job_manager._on_title_ripped(job_id, 1, fake_path, sorted_titles)
+
+        # 4. Verify DB was updated — _on_title_ripped transitions PENDING/RIPPING
+        # to QUEUED (for TV): the file is on disk, enqueued for matching, waiting
+        # for a slot. The QUEUED→MATCHING flip happens once a match slot is acquired.
+        async with db_session() as session:
+            title = await session.get(DiscTitle, sorted_titles[1].id)
+            assert title is not None
+            assert title.state == TitleState.QUEUED, f"Expected QUEUED, got {title.state}"
+            assert title.output_filename == str(fake_path), (
+                f"Expected {fake_path}, got {title.output_filename}"
+            )
+
+        # 5. Verify WebSocket broadcast was called with queued state
+        mock_broadcast.assert_called_once()
+        call_args = mock_broadcast.call_args
+        assert call_args[0][0] == job_id  # job_id
+        assert call_args[0][1] == sorted_titles[1].id  # title_id
+        assert call_args[0][2] == "queued"  # state (transitioned from pending)
+
+        # 6. Verify matching was started (for TV content)
+        mock_match.assert_called_once_with(job_id, sorted_titles[1].id, fake_path)
+
+
+@pytest.mark.asyncio
+async def test_on_title_ripped_maps_by_filename_index(client):
+    """Test that _on_title_ripped correctly maps MakeMKV filenames to title indices.
+
+    Verifies patterns like B1_t03.mkv → title_index=3.
+    """
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from app.database import async_session as db_session
+    from app.models.disc_job import DiscTitle, TitleState
+    from app.services.job_manager import job_manager
+
+    # Create a job with 5 titles (indices 0-4)
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "drive_id": "E:",
+            "volume_label": "INDEX_MAP_TEST",
+            "content_type": "tv",
+            "detected_title": "Index Test",
+            "detected_season": 1,
+            "simulate_ripping": False,
+            "titles": [
+                {"duration_seconds": 1200 + i * 60, "file_size_bytes": 500_000_000}
+                for i in range(5)
+            ],
+        },
+    )
+    job_id = response.json()["job_id"]
+
+    from sqlmodel import select
+
+    async with db_session() as session:
+        result = await session.execute(select(DiscTitle).where(DiscTitle.job_id == job_id))
+        sorted_titles = sorted(result.scalars().all(), key=lambda t: t.title_index)
+
+    with (
+        patch("app.api.websocket.manager.broadcast_title_update", new_callable=AsyncMock),
+        patch.object(job_manager._matching, "match_single_file", new_callable=AsyncMock),
+    ):
+        # Rip title index 3 (filename: title_t03.mkv)
+        fake_path = Path("/staging/title_t03.mkv")
+        await job_manager._on_title_ripped(job_id, 99, fake_path, sorted_titles)
+
+        # Verify title_index=3 was updated (not rip_index 99)
+        # State transitions to QUEUED (TV content) on rip completion — enqueued
+        # for matching, awaiting a slot.
+        async with db_session() as session:
+            title_3 = await session.get(DiscTitle, sorted_titles[3].id)
+            assert title_3.state == TitleState.QUEUED
+            assert title_3.output_filename == str(fake_path)
+
+            # Other titles should still be pending
+            title_0 = await session.get(DiscTitle, sorted_titles[0].id)
+            assert title_0.state == TitleState.PENDING
+
+
+# ---------------------------------------------------------------------------
+# B8: identity_pending parameter tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_identity_pending_unknown_value_returns_400(client):
+    """Unknown identity_pending value is rejected with 400."""
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "TEST_DISC",
+            "content_type": "tv",
+            "simulate_ripping": False,
+            "identity_pending": "bogus_kind",
+        },
+    )
+    assert response.status_code == 400
+    assert "identity_pending" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["name", "season", "reidentify"])
+async def test_identity_pending_sets_prompt_on_ripping_job(client, kind):
+    """Each valid kind produces a RIPPING job with the matching identity_prompt_json."""
+    import json as stdlib_json
+
+    from app.database import async_session as db_session
+    from app.models import DiscJob, JobState
+
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "FRASIER_S1D1",
+            "content_type": "tv",
+            "detected_title": "Frasier",
+            "simulate_ripping": False,
+            "identity_pending": kind,
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    async with db_session() as session:
+        job = await session.get(DiscJob, job_id)
+    assert job is not None
+    assert job.state == JobState.RIPPING
+    assert job.identity_prompt_json is not None
+
+    prompt = stdlib_json.loads(job.identity_prompt_json)
+    assert prompt["kind"] == kind
+    assert isinstance(prompt["reason"], str)
+    assert len(prompt["reason"]) > 0
+
+    # Verify the reason carries the frontend-contract substrings
+    if kind == "name":
+        assert "unreadable" in prompt["reason"].lower()
+    elif kind == "season":
+        assert "select a season" in prompt["reason"]
+    elif kind == "reidentify":
+        assert "multiple same-name shows" in prompt["reason"]
+
+
+@pytest.mark.asyncio
+async def test_identity_pending_reidentify_seeds_candidates_json(client):
+    """reidentify kind seeds a plausible candidates_json on the job."""
+    import json as stdlib_json
+
+    from app.database import async_session as db_session
+    from app.models import DiscJob
+
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "FRASIER_S1D1",
+            "content_type": "tv",
+            "detected_title": "Frasier",
+            "simulate_ripping": False,
+            "identity_pending": "reidentify",
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    async with db_session() as session:
+        job = await session.get(DiscJob, job_id)
+
+    assert job.candidates_json is not None
+    candidates = stdlib_json.loads(job.candidates_json)
+    assert len(candidates) >= 2
+    for c in candidates:
+        assert "tmdb_id" in c
+        assert "name" in c
+        assert "year" in c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["name", "reidentify"])
+async def test_identity_pending_blocking_parks_titles_queued(client, kind):
+    """Blocking prompt (name/reidentify) lands titles in QUEUED state."""
+    from sqlmodel import select
+
+    from app.database import async_session as db_session
+    from app.models.disc_job import DiscTitle, TitleState
+
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "SHOW_S1D1",
+            "content_type": "tv",
+            "detected_title": "My Show",
+            "simulate_ripping": False,
+            "identity_pending": kind,
+            "titles": [
+                {"duration_seconds": 1320, "file_size_bytes": 1_000_000_000},
+                {"duration_seconds": 1350, "file_size_bytes": 1_100_000_000},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    async with db_session() as session:
+        result = await session.execute(select(DiscTitle).where(DiscTitle.job_id == job_id))
+        titles = result.scalars().all()
+
+    assert len(titles) == 2
+    for t in titles:
+        assert t.state == TitleState.QUEUED, (
+            f"Expected QUEUED for blocking kind={kind!r}, got {t.state}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_identity_pending_season_does_not_park_titles(client):
+    """Non-blocking season prompt leaves titles in their default PENDING state."""
+    from sqlmodel import select
+
+    from app.database import async_session as db_session
+    from app.models.disc_job import DiscTitle, TitleState
+
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "SHOW_S1D1",
+            "content_type": "tv",
+            "detected_title": "My Show",
+            "simulate_ripping": False,
+            "identity_pending": "season",
+            "titles": [
+                {"duration_seconds": 1320, "file_size_bytes": 1_000_000_000},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    async with db_session() as session:
+        result = await session.execute(select(DiscTitle).where(DiscTitle.job_id == job_id))
+        titles = result.scalars().all()
+
+    assert len(titles) == 1
+    # season is non-blocking — titles stay PENDING (normal flow)
+    assert titles[0].state == TitleState.PENDING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["name", "reidentify"])
+async def test_identity_pending_blocking_with_simulate_ripping_converges_to_review(client, kind):
+    """simulate_ripping=True + blocking prompt → REVIEW_NEEDED after rip completes (B4)."""
+    import asyncio
+
+    from app.database import async_session as db_session
+    from app.models import DiscJob, JobState
+
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "volume_label": "SHOW_S1D1",
+            "content_type": "tv",
+            "detected_title": "My Show",
+            "simulate_ripping": True,
+            "rip_speed_multiplier": 100,
+            "identity_pending": kind,
+            "titles": [
+                {"duration_seconds": 1320, "file_size_bytes": 10_000_000},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    # Wait for the rip + convergence to finish (with a timeout). Poll for a
+    # terminal/review state rather than "left RIPPING": the job spends a
+    # moment in IDENTIFYING before the rip task flips it, so `!= RIPPING`
+    # could break on that pre-rip state and assert against a half-run pipeline.
+    deadline = 30
+    for _ in range(deadline * 10):
+        await asyncio.sleep(0.1)
+        async with db_session() as session:
+            job = await session.get(DiscJob, job_id)
+        if job and job.state in (JobState.REVIEW_NEEDED, JobState.COMPLETED, JobState.FAILED):
+            break
+
+    assert job is not None
+    assert job.state == JobState.REVIEW_NEEDED, (
+        f"Expected REVIEW_NEEDED after blocking prompt rip, got {job.state}"
+    )
+    # review_reason carries the literal from the prompt
+    assert job.review_reason is not None
+    if kind == "name":
+        assert "unreadable" in job.review_reason.lower()
+    elif kind == "reidentify":
+        assert "multiple same-name shows" in job.review_reason
+
+    # identity_prompt_json is cleared by convergence (B4 contract)
+    assert job.identity_prompt_json is None
+
+
+@pytest.mark.asyncio
+async def test_identity_pending_ws_broadcast_carries_prompt(client):
+    """WS broadcast for a RIPPING job includes identity_prompt_json."""
+    import json as stdlib_json
+    from unittest.mock import patch
+
+    captured_calls = []
+
+    async def capture_broadcast(job_id, state, **kwargs):
+        captured_calls.append({"job_id": job_id, "state": state, **kwargs})
+
+    with patch(
+        "app.api.websocket.manager.broadcast_job_update",
+        side_effect=capture_broadcast,
+    ):
+        response = await client.post(
+            "/api/simulate/insert-disc",
+            json={
+                "volume_label": "SHOW_S1D1",
+                "content_type": "tv",
+                "detected_title": "My Show",
+                "simulate_ripping": False,
+                "identity_pending": "name",
+            },
+        )
+    assert response.status_code == 200
+
+    # Find the RIPPING broadcast among all captured calls
+    ripping_calls = [c for c in captured_calls if c.get("state") == "ripping"]
+    assert ripping_calls, f"No RIPPING broadcast found; calls: {captured_calls}"
+    ripping = ripping_calls[0]
+    assert "identity_prompt_json" in ripping
+    prompt = stdlib_json.loads(ripping["identity_prompt_json"])
+    assert prompt["kind"] == "name"
+
+
+@pytest.mark.asyncio
+async def test_reset_all_jobs_cancels_in_flight_simulated_rip(client):
+    """reset-all-jobs must stop running sim tasks BEFORE deleting their rows.
+
+    Regression for the E2E flake: ``DELETE /api/simulate/reset-all-jobs`` used
+    to delete ``disc_jobs``/``disc_titles`` out from under a live
+    ``_simulate_ripping`` loop. The loop's next ``session.commit()`` then
+    updated a row that no longer existed and blew up with
+    ``StaleDataError: ... expected to update 1 row(s); 0 were matched``, and
+    until it did, the orphan kept broadcasting job/title updates for a deleted
+    job into the *next* Playwright test.
+    """
+    import asyncio
+
+    from app.services.job_manager import job_manager
+
+    response = await client.post(
+        "/api/simulate/insert-disc",
+        json={
+            "drive_id": "E:",
+            "volume_label": "RESET_RACE_S1D1",
+            "content_type": "tv",
+            "detected_title": "Reset Race",
+            "detected_season": 1,
+            "simulate_ripping": True,
+            # Slowest rip (~2s per title) so the loop is guaranteed to still be
+            # mid-flight when the reset lands.
+            "rip_speed_multiplier": 1,
+            "titles": [
+                {"duration_seconds": 1300, "file_size_bytes": 1050000000, "chapter_count": 5}
+                for _ in range(8)
+            ],
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    task = job_manager._active_jobs.get(job_id)
+    assert task is not None, "simulated rip task should be registered while running"
+    assert not task.done()
+
+    reset = await client.delete("/api/simulate/reset-all-jobs")
+    assert reset.status_code == 200
+    # The count reports tasks that were LIVE, not the size of the registry:
+    # _active_jobs keeps finished tasks around (nothing prunes on success).
+    assert reset.json()["cancelled_tasks"] == 1
+
+    # The reset must have stopped the task, not merely deleted its rows.
+    assert job_id not in job_manager._active_jobs
+    assert task.done(), "reset-all-jobs left a simulated rip task running"
+    assert task.cancelled() or task.exception() is None, (
+        f"orphaned rip task died on its own instead of being cancelled: {task.exception()!r}"
+    )
+
+    # Nothing survives to write to the deleted rows afterwards.
+    await asyncio.sleep(0.5)
+    assert not job_manager._active_jobs
+
+
+@pytest.mark.asyncio
+async def test_drain_cancels_match_tasks_without_routing_them_to_review():
+    """Draining a per-title match task must not fire _handle_match_failure.
+
+    _on_match_dispatch_done hands an unsuppressed cancellation to
+    on_match_task_done, which spawns a DETACHED _handle_match_failure that
+    writes the DiscTitle row. Since the only caller of the drain is
+    reset-all-jobs, which deletes that row moments later, cancelling these
+    without going through _suppress_match_done would recreate the exact
+    write-into-deleted-rows race the drain exists to close.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.job_manager import job_manager
+
+    async def _sleep_forever():
+        await asyncio.sleep(3600)
+
+    job_id, title_id = 4242, 987654
+    task = asyncio.create_task(_sleep_forever())
+    job_manager._match_tasks[title_id] = task
+    task.add_done_callback(lambda t: job_manager._on_match_dispatch_done(t, job_id, title_id))
+
+    with patch.object(
+        job_manager._matching, "_handle_match_failure", new=AsyncMock()
+    ) as handle_failure:
+        cancelled = await job_manager.drain_active_tasks()
+        # Let any detached ensure_future scheduled by the done-callback run.
+        await asyncio.sleep(0.05)
+
+    assert cancelled == 1
+    assert task.cancelled()
+    handle_failure.assert_not_called()
+
+    # Registries are left clean: a leaked suppression id would swallow a real
+    # failure of whatever match task is dispatched next.
+    assert title_id not in job_manager._match_tasks
+    assert title_id not in job_manager._suppress_match_done
+
+
+class TestSimulatedBackup:
+    @pytest.mark.asyncio
+    async def test_simulated_disc_passes_through_backing_up(self, client):
+        resp = await client.post(
+            "/api/simulate/insert-disc",
+            json={
+                "volume_label": "INCEPTION_2010",
+                "content_type": "movie",
+                "simulate_backup": True,
+                "simulate_ripping": False,
+            },
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        # The simulated backup does not auto-advance, so the job rests here.
+        job = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert job["state"] == "backing_up"
+        assert job["backup_status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_advancing_a_simulated_backup_reaches_ripping(self, client):
+        resp = await client.post(
+            "/api/simulate/insert-disc",
+            json={
+                "volume_label": "INCEPTION_2010",
+                "content_type": "movie",
+                "simulate_backup": True,
+                "simulate_ripping": False,
+            },
+        )
+        job_id = resp.json()["job_id"]
+        await client.post(f"/api/simulate/advance-job/{job_id}")
+        job = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert job["state"] == "ripping"
+        assert job["backup_status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_simulate_backup_defaults_off(self, client):
+        """simulate_backup must default False so every existing simulated disc
+
+        is unaffected: omitting it entirely must behave exactly like the
+        pre-existing simulate_ripping=False static-RIPPING path, never
+        parking in BACKING_UP.
+        """
+        resp = await client.post(
+            "/api/simulate/insert-disc",
+            json={
+                "volume_label": "INCEPTION_2010",
+                "content_type": "movie",
+                "simulate_ripping": False,
+            },
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        job = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert job["state"] == "ripping"
+        assert job["backup_status"] is None

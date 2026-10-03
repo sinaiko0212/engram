@@ -1,0 +1,87 @@
+/**
+ * Type definitions for ReviewQueue component
+ */
+
+import { DiscTitle } from '../../types';
+
+export interface LLMSuggestion {
+    episode: number;
+    confidence: number;
+    reasoning: string;
+    runner_up: { episode: number; confidence: number } | null;
+    model: string;
+}
+
+export interface MatchDetails {
+    vote_count?: number;
+    target_votes?: number;
+    file_cov?: number;
+    score?: number;
+    score_gap?: number;
+    runner_ups?: Array<{
+        episode: string;
+        confidence: number;
+        vote_count?: number;
+        target_votes?: number;
+    }>;
+    error?: string;
+    message?: string;
+    matches_found?: number;
+    conflict_reason?: string;
+    auto_sorted?: string;
+    /** LLM-based episode suggestion, if one has been run for this title. */
+    llm_suggestion?: LLMSuggestion;
+}
+
+/** One episode slot from GET /api/jobs/{id}/season-roster. */
+export interface RosterEpisode {
+    episode_code: string;
+    episode_number: number;
+    name: string;
+    /**
+     * TMDB runtime in minutes, when TMDB carries one. Lets review recognise a
+     * track holding several episodes: a segment-format show lists ~7min episodes
+     * while its DVD track is a ~22min three-segment block.
+     */
+    runtime?: number | null;
+    /** Persisted coverage from the server; the UI recomputes live while editing. */
+    status?: 'assigned' | 'duplicate' | 'missing' | 'off';
+    assigned_title_ids?: number[];
+    /**
+     * Subtitle-reference availability — the source of truth for auto-matching.
+     * `missing` means no precomputed vector and no downloaded SRT exist, so the
+     * matcher had nothing to identify the episode against (the silent gap the
+     * roster flags). `null`/undefined when the coverage scan was unavailable.
+     */
+    reference_source?: 'precomputed' | 'downloaded' | 'missing' | null;
+    has_reference?: boolean;
+}
+
+/** One selectable output ordering for a show (#200). */
+export interface OrderingOption {
+    ordering: string; // "aired" | "dvd" (v1 scope)
+    label: string; // human label (e.g. "DVD Order")
+    tmdb_type: number;
+    /** Whether this ordering renumbers any episode matched on this disc. */
+    diverges: boolean;
+    /** Canonical "SxxExx" -> projected "SxxExx" for the season's episodes. */
+    projection: Record<string, string>;
+}
+
+/** Response shape of the season-roster endpoint. */
+export interface SeasonRoster {
+    available: boolean;
+    season_number: number | null;
+    show_id: number | null;
+    episodes: RosterEpisode[];
+    reason: string | null;
+    /** Episode ordering (#200) — selector is only shown when ordering_diverges. */
+    ordering_available?: boolean;
+    ordering_diverges?: boolean;
+    current_ordering?: string;
+    ordering_options?: OrderingOption[];
+    /** Total seasons for the show — populated while the season picker is in play (#370). */
+    season_count?: number | null;
+}
+
+export type { DiscTitle };

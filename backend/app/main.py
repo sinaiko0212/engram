@@ -1,0 +1,312 @@
+"""FastAPI application entry point for Engram."""
+
+import asyncio
+import mimetypes
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
+
+from app import __version__
+from app.api import manager as ws_manager
+from app.api import router as api_router
+from app.api import test_router
+from app.api.validation import router as validation_router
+from app.config import settings
+from app.core.logging import setup_logging
+from app.database import init_db
+from app.services import job_manager
+
+# Override any incorrect Windows Registry MIME type mappings before StaticFiles is mounted.
+# Python's mimetypes module reads from HKEY_CLASSES_ROOT on Windows, which can be corrupted
+# by certain software installs (old Node.js, some IDEs). Browsers silently refuse to apply
+# stylesheets served with a non-"text/css" Content-Type, producing a blank white page.
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("image/svg+xml", ".svg")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown."""
+    # Startup
+    setup_logging()
+    logger.info("Starting Engram Backend...")
+
+    await init_db()
+    logger.info("Database initialized")
+
+    # Auto-detect tools and populate config
+    from app.api.validation import detect_ffmpeg, detect_makemkv
+    from app.services.config_service import get_config, update_config
+
+    config = await get_config()
+
+    # Ensure the contribution pseudonym exists (Phase 1: fingerprint contributions).
+    # Must run after get_config() which guarantees the app_config row exists.
+    from sqlmodel import select as _select
+
+    from app.database import async_session as _async_session
+    from app.models.app_config import AppConfig as _AppConfig
+    from app.services.contribution_pseudonym import generate_pseudonym, validate_pseudonym
+
+    async with _async_session() as _session:
+        # Mirror get_config()'s `.limit(1)` guard so a corrupt/test-polluted DB
+        # with multiple app_config rows doesn't raise MultipleResultsFound
+        # during lifespan startup and block the server from coming up.
+        _result = await _session.execute(_select(_AppConfig).limit(1))
+        _cfg = _result.scalars().first()
+        if _cfg is not None and not validate_pseudonym(_cfg.contribution_pseudonym):
+            _cfg.contribution_pseudonym = generate_pseudonym()
+            _session.add(_cfg)
+            await _session.commit()
+            logger.info(f"Generated contribution pseudonym: {_cfg.contribution_pseudonym}")
+
+    # Reconcile a stored MakeMKV key into MakeMKV's settings.conf on boot so
+    # makemkvcon is registered even if the key was entered before this bridge
+    # existed (idempotent — skips the write when already in sync).
+    if config.makemkv_key:
+        from app.core.makemkv_registration import write_makemkv_settings
+
+        await asyncio.to_thread(write_makemkv_settings, config.makemkv_key)
+
+    # Auto-detect MakeMKV if path is empty
+    if not config.makemkv_path:
+        makemkv_result = await asyncio.to_thread(detect_makemkv)
+        if makemkv_result.found:
+            await update_config(makemkv_path=makemkv_result.path)
+            logger.info(f"Auto-detected MakeMKV: {makemkv_result.path} ({makemkv_result.version})")
+        else:
+            logger.warning(f"MakeMKV not found: {makemkv_result.error}")
+            logger.warning("Please install MakeMKV or configure path in Settings")
+    else:
+        # Validate existing configured path
+        makemkv_result = await asyncio.to_thread(detect_makemkv)
+        if makemkv_result.found:
+            # Update DB if stored path doesn't match the detected path
+            if makemkv_result.path != config.makemkv_path:
+                await update_config(makemkv_path=makemkv_result.path)
+                logger.info(
+                    f"MakeMKV path corrected: {config.makemkv_path!r} -> {makemkv_result.path}"
+                )
+            logger.info(f"MakeMKV validated: {makemkv_result.version}")
+        else:
+            logger.warning(f"Configured MakeMKV path not working: {makemkv_result.error}")
+
+    # Auto-detect FFmpeg if path is empty
+    if not config.ffmpeg_path:
+        ffmpeg_result = await asyncio.to_thread(detect_ffmpeg)
+        if ffmpeg_result.found:
+            await update_config(ffmpeg_path=ffmpeg_result.path)
+            logger.info(f"Auto-detected FFmpeg: {ffmpeg_result.path} ({ffmpeg_result.version})")
+        else:
+            logger.warning(f"FFmpeg not found: {ffmpeg_result.error}")
+            logger.warning("Please install FFmpeg or configure path in Settings")
+    else:
+        ffmpeg_result = await asyncio.to_thread(detect_ffmpeg)
+        if ffmpeg_result.found:
+            if ffmpeg_result.path != config.ffmpeg_path:
+                await update_config(ffmpeg_path=ffmpeg_result.path)
+                logger.info(
+                    f"FFmpeg path corrected: {config.ffmpeg_path!r} -> {ffmpeg_result.path}"
+                )
+            logger.info(f"FFmpeg validated: {ffmpeg_result.version}")
+        else:
+            logger.warning(f"Configured FFmpeg path not working: {ffmpeg_result.error}")
+
+    await job_manager.start()
+    logger.info("Job manager started")
+
+    # Start the fingerprint contribution uploader (Phase 2).
+    from app.services.contribution_uploader import ContributionUploader
+
+    app.state.contribution_uploader = ContributionUploader()
+    await app.state.contribution_uploader.start()
+
+    # Download/refresh the precomputed subtitle-vector cache in the background.
+    # Fire-and-forget: a slow or failed download must never block startup, and
+    # subtitle scraping remains the fallback until the cache lands.
+    from app.services.precomputed_cache_service import ensure_precomputed_cache
+
+    app.state.precomputed_cache_task = asyncio.create_task(ensure_precomputed_cache())
+
+    # Check for updates in the background — fire-and-forget, never blocks startup.
+    from app.core.updater import update_checker
+    from app.services.event_broadcaster import EventBroadcaster
+
+    update_checker.set_broadcaster(EventBroadcaster(ws_manager))
+    app.state.update_check_task = asyncio.create_task(update_checker.start())
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down Engram Backend...")
+    uploader = getattr(app.state, "contribution_uploader", None)
+    if uploader is not None:
+        await uploader.stop()
+    cache_task = getattr(app.state, "precomputed_cache_task", None)
+    if cache_task and not cache_task.done():
+        cache_task.cancel()
+    update_task = getattr(app.state, "update_check_task", None)
+    if update_task and not update_task.done():
+        update_task.cancel()
+    await job_manager.stop()
+    logger.info("Shutdown complete")
+
+
+# Create FastAPI application (version sourced from app/__init__.py — the single
+# source of truth, which also resolves correctly in frozen builds).
+app = FastAPI(
+    title="Engram API",
+    description="Glass-Box automation for disc ripping and organization",
+    version=__version__,
+    lifespan=lifespan,
+)
+
+# Add CORS middleware for frontend communication
+_default_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+_allowed_origins = (
+    [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    if settings.cors_origins
+    else _default_origins
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include API routes
+app.include_router(api_router)
+app.include_router(test_router)
+app.include_router(validation_router, prefix="/api", tags=["validation"])
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates."""
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, handle any incoming messages
+            data = await websocket.receive_text()
+            logger.debug(f"Received WebSocket message: {data}")
+    except WebSocketDisconnect:
+        await ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await ws_manager.disconnect(websocket)
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy"}
+
+
+# Serve bundled frontend in production/PyInstaller builds
+# In frozen builds, _MEIPASS is the bundle root and static files are at app/static/
+# In dev, __file__ is inside app/ so we just append "static"
+if getattr(sys, "_MEIPASS", None):
+    _static_dir = Path(sys._MEIPASS) / "app" / "static"
+else:
+    # __file__ is already absolute for an imported module on 3.9+, so the
+    # abspath() this replaced was a no-op and no resolve() is wanted either:
+    # resolve() would canonicalize symlinked ancestors, which is the behaviour
+    # normalize_user_path deliberately keeps away from (see paths.py).
+    _static_dir = Path(__file__).parent / "static"
+
+if _static_dir.is_dir():
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    # Vite content-hashes everything under /assets (e.g. index-AbC123.js), so the
+    # filename changes whenever the bytes change — they can be cached forever.
+    # The opposite of index.html below, which must never be cached (see serve_spa).
+    class _ImmutableStatic(StaticFiles):
+        # Stamp the header by overriding get_response (the stable async entry
+        # point), NOT file_response: in Starlette 0.50.0 file_response is a *sync*
+        # method that get_response calls without await, so an `async def
+        # file_response` override would make get_response return an un-awaited
+        # coroutine and 500 every /assets request — while a `def file_response`
+        # override is correct only as long as it stays sync. Overriding the async
+        # get_response is robust regardless of file_response's sync/async-ness.
+        async def get_response(self, *args, **kwargs):
+            resp = await super().get_response(*args, **kwargs)
+            if resp.status_code == 200:
+                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            return resp
+
+    # Mount static assets (JS, CSS, images)
+    app.mount("/assets", _ImmutableStatic(directory=_static_dir / "assets"), name="assets")
+
+    # Root-level static files emitted by the Vite build (favicon, SVGs, etc.).
+    # Built once at server startup by listing the static dir — no manual
+    # enumeration needed, but files added later are not seen until a restart.
+    # Maps URL path -> on-disk path; the catch-all uses the request path only
+    # as a dict key, so user input is never interpolated into a filesystem path.
+    _ROOT_STATIC_FILES = {
+        _entry.name: _entry
+        for _entry in _static_dir.iterdir()
+        if _entry.name != "index.html" and _entry.is_file()
+        # is_file() intentionally excludes subdirectories — nested assets belong
+        # under /assets (the StaticFiles mount above). A new root-level subdir
+        # from the Vite build would need its own mount.
+    }
+    _INDEX_HTML = _static_dir / "index.html"
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve the SPA frontend — catch-all for client-side routing."""
+        # full_path is used only as a dict key — the served path is a value
+        # from the startup listing, so no user input is interpolated into a
+        # filesystem path. Nested assets are served by the /assets mount
+        # above; any other path is a client-side route -> index.html.
+        static_file = _ROOT_STATIC_FILES.get(full_path)
+        # is_file() is a runtime safety net — a file present at startup could
+        # have been removed since; fall through to index.html, never a 500.
+        if static_file is not None and static_file.is_file():
+            return FileResponse(static_file)
+        # index.html keeps a stable name across builds, so without this header the
+        # browser heuristically caches it and keeps loading the OLD hashed bundles
+        # after an update. no-cache forces revalidation; FileResponse's ETag makes
+        # the revalidation a cheap 304 when unchanged.
+        return FileResponse(_INDEX_HTML, headers={"Cache-Control": "no-cache"})
+
+else:
+
+    @app.get("/")
+    async def root():
+        """Root endpoint - API status (dev mode only, no bundled frontend)."""
+        return {
+            "name": "Engram",
+            "version": __version__,
+            "status": "running",
+        }
+
+
+if __name__ == "__main__":
+    # For frozen builds, use run.py instead — it wraps ALL imports
+    # in error handling so crashes are always visible.
+    import uvicorn
+
+    from app.core.network import resolve_startup_host
+
+    host = resolve_startup_host(settings.host)
+    app.state.bound_host = host
+    app.state.bound_port = settings.port
+
+    uvicorn.run(
+        app,
+        host=host,
+        port=settings.port,
+        reload=settings.debug,
+        factory=False,
+    )

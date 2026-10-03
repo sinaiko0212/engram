@@ -1,0 +1,307 @@
+// Type definitions for Engram Frontend
+
+export type JobState =
+    | 'idle'
+    | 'identifying'
+    | 'review_needed'
+    | 'backing_up'
+    | 'ripping'
+    | 'matching'
+    | 'organizing'
+    | 'completed'
+    | 'failed';
+
+export type ContentType = 'tv' | 'movie' | 'unknown';
+
+export type TitleState = 'pending' | 'ripping' | 'queued' | 'matching' | 'matched' | 'review' | 'completed' | 'failed' | 'skipped';
+
+export type SubtitleStatus = 'downloading' | 'completed' | 'partial' | 'failed' | null;
+
+export interface Job {
+    id: number;
+    drive_id: string;
+    volume_label: string;
+    content_type: ContentType;
+    state: JobState;
+    current_speed: string;
+    eta_seconds: number;
+    progress_percent: number;
+    current_title: number;
+    total_titles: number;
+    error_message: string | null;
+    detected_title?: string;
+    detected_season?: number;
+    subtitle_status?: SubtitleStatus;
+    subtitle_error_message?: string | null;
+    subtitles_downloaded?: number;
+    subtitles_total?: number;
+    subtitles_failed?: number;
+    review_reason?: string | null;
+    conflict_status?: string | null;
+    /**
+     * Outcome of the optional whole-disc backup that runs between identification
+     * and extraction. Absent/null when the feature never ran for this job.
+     * "skipped" and "failed" both mean the disc was ripped straight from the
+     * drive instead, which is worth telling the user about; "pending" and
+     * "completed" are the in-progress and happy paths and need no warning.
+     */
+    backup_status?: 'pending' | 'completed' | 'failed' | 'skipped' | null;
+    /** Backend-written prose explaining a skipped or failed backup. Rendered verbatim. */
+    backup_status_reason?: string | null;
+    /**
+     * Human-readable cause set by the backend when classification ran WITHOUT
+     * TMDB (key absent or rejected); null/absent when TMDB participated. The
+     * DiscCard renders it verbatim in its degraded-mode alert (#243).
+     */
+    tmdb_degraded_reason?: string | null;
+    destination_mode?: string;
+    created_at?: string;
+    /**
+     * Resolved TMDB identity. `tmdb_id` is null while identity is unconfirmed
+     * (e.g. a same-name collision the analyst withheld an id for). The dashboard
+     * uses it to suppress the dead-end episode-review button, and the re-identify
+     * modal shows name/year/id so the user can confirm which show is selected.
+     */
+    tmdb_id?: number | null;
+    tmdb_name?: string | null;
+    tmdb_year?: number | null;
+    /**
+     * Raw JSON string (from the API) of same-name TMDB candidates recorded at
+     * identify time when >=2 shows share a name, e.g. Frasier 1993 + 2023 revival.
+     * Each entry: `{ tmdb_id, name, year, popularity }`. Drives the quick-pick in
+     * ReIdentifyModal. Null/absent when there was no same-name collision.
+     */
+    candidates_json?: string | null;
+    /**
+     * Non-blocking identity CTA for rip-first jobs (walk-away Phase B). Raw JSON
+     * string: `{ "kind": "name" | "season" | "reidentify", "reason": "<human text>" }`.
+     * Present while the user has an unanswered identity question but the job is
+     * already ripping. Null/absent when no prompt is pending.
+     * Set by the backend during disc identification when an open identity question ships with the rip (walk-away Phase B).
+     */
+    identity_prompt_json?: string | null;
+    /**
+     * How this job's identity was determined: "manual" (user-armed before
+     * insert) or "manual_correction" (user overrode a guess on a live card),
+     * vs. an automatic source (e.g. "tmdb", "discdb", "ai"). Drives the
+     * MANUAL ID provenance chip and the contextual "Edit ID" button label.
+     */
+    classification_source?: string;
+}
+
+export interface DiscTitle {
+    id: number;
+    job_id: number;
+    title_index: number;
+    duration_seconds: number;
+    file_size_bytes: number;
+    chapter_count: number;
+    is_selected: boolean;
+    output_filename: string | null;
+    matched_episode: string | null;
+    match_confidence: number;
+    match_stage?: string;
+    match_progress?: number;
+    video_resolution?: string;
+    edition?: string;
+    match_details?: string | { runner_ups?: Array<{ episode: string; confidence: number }> } | null;
+    state: TitleState;
+    expected_size_bytes?: number;
+    actual_size_bytes?: number;
+    matches_found?: number;
+    matches_rejected?: number;
+    conflict_resolution?: string | null;
+    existing_file_path?: string | null;
+    organized_from?: string | null;
+    organized_to?: string | null;
+    is_extra?: boolean;
+    error_message?: string | null;
+    match_source?: string | null;
+    discdb_match_details?: string | null;
+    discdb_flagged?: boolean;
+    discdb_flag_reason?: string | null;
+}
+
+export interface DriveEvent {
+    type: 'drive_event';
+    drive_id: string;
+    event: 'inserted' | 'removed';
+    volume_label: string;
+}
+
+export interface JobUpdate {
+    type: 'job_update';
+    job_id: number;
+    state: JobState;
+    progress_percent: number;
+    current_speed: string;
+    eta_seconds: number;
+    current_title?: number;
+    total_titles?: number;
+    error_message: string | null;
+    content_type?: ContentType;
+    detected_title?: string;
+    detected_season?: number;
+    review_reason?: string | null;
+    conflict_status?: string | null;
+    /** "" forwarded by the backend clears the field on the {...job, ...message}
+     *  merge; absent means unchanged (#243). */
+    tmdb_degraded_reason?: string | null;
+    /** "" clears a resolved prompt; absent means unchanged (walk-away Phase B). */
+    identity_prompt_json?: string | null;
+}
+
+export interface TitleUpdate {
+    type: 'title_update';
+    job_id: number;
+    title_id: number;
+    state: TitleState;
+    matched_episode?: string | null;
+    match_confidence?: number;
+    match_stage?: string;
+    match_progress?: number;
+    duration_seconds?: number;
+    file_size_bytes?: number;
+    video_resolution?: string;
+    edition?: string;
+    expected_size_bytes?: number;
+    actual_size_bytes?: number;
+    matches_found?: number;
+    matches_rejected?: number;
+    match_details?: string | null;
+    organized_from?: string | null;
+    organized_to?: string | null;
+    output_filename?: string | null;
+    is_extra?: boolean;
+    error?: string | null;
+}
+
+export interface SubtitleEvent {
+    type: 'subtitle_event';
+    job_id: number;
+    status: 'downloading' | 'completed' | 'partial' | 'failed';
+    downloaded: number;
+    total: number;
+    failed_count: number;
+}
+
+/**
+ * Progress of the optional whole-disc backup that runs between identification
+ * and extraction. `speed` and `eta` are always present but usually null:
+ * MakeMKV's backup reports a percentage, not a byte rate. A null must not
+ * erase what the card already shows.
+ */
+export interface BackupProgressMessage {
+    type: 'backup_progress';
+    job_id: number;
+    current_bytes: number;
+    total_bytes: number;
+    speed: string | null;
+    eta: number | null;
+}
+
+export interface TitlesDiscovered {
+    type: 'titles_discovered';
+    job_id: number;
+    titles: Array<{
+        id: number;
+        title_index: number;
+        duration_seconds: number;
+        file_size_bytes: number;
+        chapter_count: number;
+        video_resolution?: string;
+    }>;
+    content_type: ContentType;
+    detected_title?: string;
+    detected_season?: number;
+}
+
+export interface UpdateStatusMessage {
+    type: 'update_status';
+    state: 'idle' | 'checking' | 'up_to_date' | 'downloading' | 'ready' | 'skipped' | 'error';
+    current_version: string;
+    latest_version?: string | null;
+    release_notes?: string | null;
+    release_url?: string | null;
+    current_release_notes?: string | null;
+    current_release_url?: string | null;
+    download_progress?: number | null;
+    error?: string | null;
+    last_update_error?: string | null;
+    last_update_success_version?: string | null;
+    is_frozen?: boolean;
+}
+
+/** Snapshot of update state, stored in App.tsx state. */
+export interface UpdateStatus {
+    state: 'idle' | 'checking' | 'up_to_date' | 'downloading' | 'ready' | 'skipped' | 'error';
+    current_version: string;
+    latest_version: string | null;
+    release_notes: string | null;
+    release_url: string | null;
+    /** Notes for the version currently running (what's-new modal). */
+    current_release_notes: string | null;
+    current_release_url: string | null;
+    download_progress: number | null;
+    error: string | null;
+    last_update_error: string | null;
+    last_update_success_version: string | null;
+    is_frozen: boolean;
+}
+
+export interface FingerprintDisclosureRequiredMessage {
+    type: 'fingerprint_disclosure_required';
+    pending_count: number;
+    pseudonym: string;
+    server_url: string;
+}
+
+/** A disc detected while first-run setup was incomplete (pipeline parked). */
+export interface ParkedDisc {
+    drive_id: string;
+    volume_label: string;
+}
+
+/** Full-list replace of the parked-disc set — no client-side merge logic. */
+export interface ParkedDiscsMessage {
+    type: 'parked_discs';
+    discs: ParkedDisc[];
+}
+
+/**
+ * A drive was armed (identity present) or disarmed/consumed (identity null)
+ * via the manual-disc-identity flow (`POST /api/manual/arm|disarm`, or the
+ * arm being consumed by a subsequent disc insert). `identity` mirrors the
+ * `ArmedIdentity` shape used by `ArmedDriveCard`.
+ */
+export interface DriveArmedMessage {
+    type: 'drive_armed';
+    drive_id: string;
+    identity: {
+        title: string;
+        content_type: string;
+        season: number | null;
+        tmdb_id: number | null;
+        disc_number: number | null;
+    } | null;
+}
+
+export type WebSocketMessage =
+    | DriveEvent
+    | JobUpdate
+    | TitleUpdate
+    | SubtitleEvent
+    | BackupProgressMessage
+    | TitlesDiscovered
+    | UpdateStatusMessage
+    | FingerprintDisclosureRequiredMessage
+    | ParkedDiscsMessage
+    | DriveArmedMessage;
+
+export interface Config {
+    makemkv_path: string;
+    staging_path: string;
+    library_movies_path: string;
+    library_tv_path: string;
+    tmdb_api_key: string;
+}

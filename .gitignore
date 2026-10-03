@@ -1,0 +1,113 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+.venv/
+venv/
+.pytest_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Node.js
+node_modules/
+*.tsbuildinfo
+
+# Vite
+frontend/dist/
+
+# Bundled frontend served from backend (PyInstaller build output)
+backend/app/static/
+
+# Bundled fpcalc binary (fetched by scripts/fetch_fpcalc.py, never committed)
+backend/app/bin/
+
+# Subtitle-cache build outputs (local artifacts of build_subtitle_cache.py;
+# published via gh release upload, not committed).
+backend/engram-subtitle-cache.tar.gz
+backend/manifest.json
+
+# Windows bundle output
+engram-windows-x64/
+engram-windows-*.zip
+
+# Ad-hoc debug screenshots (root-level only)
+/*.png
+/screenshots/
+# docs/screenshots/ is intentionally tracked
+
+# Spike binaries (downloaded, not committed)
+spikes/**/bin/
+
+# MkDocs
+site/
+
+# Playwright
+test-results/
+playwright-report/
+frontend/e2e-storage-state.json
+e2e-screenshots/
+blob-report/
+.playwright-mcp/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backend - Database (contains API keys). Glob rather than a list: parallel
+# sessions and worktrees each need their own DB file (see CLAUDE.md), and every
+# one of them holds credentials — a name nobody thought to list must not be
+# committable.
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+backend/*.db.bak
+backend/engram_e2e.db-shm
+backend/engram_e2e.db-wal
+
+# Backend - Secrets
+backend/.env
+
+# Backend - Runtime data
+backend/staging/
+backend/library/
+backend/subtitles_cache/
+backend/data/cache/
+backend/temp/
+backend/temp_test/
+backend/investigation_output/
+backend/notebooks/
+backend/prototypes/
+backend/~/
+
+# Logs
+*.log
+
+# Claude Code (local settings only)
+.claude/settings.local.json
+.claude/*
+
+# Claude Code superpowers (local brainstorm/session state)
+.superpowers/
+
+# Local artifacts archive (debug screenshots, one-off build outputs — kept locally, never committed)
+artifacts/
+
+# Git worktrees
+.worktrees/

@@ -1,0 +1,2533 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { toast } from 'sonner';
+import { QRCodeSVG } from 'qrcode.react';
+import { FEATURES } from '../config/constants';
+import { EngramSelect } from './ui/EngramSelect';
+import { SvActionButton } from '../app/components/synapse/SvActionButton';
+import { BootstrapLibraryFlow } from './BootstrapLibraryFlow';
+import GpuAccelerationSetting from './GpuAccelerationSetting';
+import BackgroundEffectsSetting from './BackgroundEffectsSetting';
+import { PathStatusHint } from './PathStatusHint';
+import { requestTmdbValidation } from '../utils/tmdbValidation';
+import { requestAiValidation } from '../utils/aiValidation';
+import { fetchLocalModels, isLocalProvider, localProviderDefaultUrl } from '../utils/localModels';
+import { requestDiscordTemplateValidation } from '../utils/discordTemplateValidation';
+import { requestDiscordWebhookTest } from '../utils/discordWebhookTest';
+import { formatToolVersion } from '../utils/formatting';
+import './ConfigWizard.css';
+
+interface ConfigWizardProps {
+    onClose: () => void;
+    onComplete: () => void;
+    isOnboarding?: boolean;
+    /**
+     * Settings mode only: open directly on a given section (e.g. "preferences")
+     * or a finer-grained control (e.g. "gpu", which lands on Preferences and
+     * scrolls the GPU control into view). Ignored during onboarding, which
+     * always starts at step 1.
+     */
+    initialSection?: string;
+}
+
+const STEP_LABELS = ['Paths', 'Tools', 'TMDB', 'Data Sharing', 'Preferences'];
+
+/**
+ * Settings mode (opened from the gear) presents these as a jump-anywhere section
+ * list instead of the onboarding stepper. Each maps to the same `step` index the
+ * wizard flow already uses, so renderStepContent() is shared between both modes.
+ */
+interface SettingsSection {
+    key: string;
+    label: string;
+    step: number;
+}
+
+const SETTINGS_SECTIONS: SettingsSection[] = [
+    { key: 'paths', label: 'Library Paths', step: 1 },
+    { key: 'tools', label: 'Tools & License', step: 2 },
+    { key: 'metadata', label: 'Metadata & Subtitles', step: 3 },
+    { key: 'sharing', label: 'Data Sharing', step: 4 },
+    { key: 'preferences', label: 'Preferences', step: 5 },
+];
+
+// DOM id of the GPU control wrapper, used as a deep-link scroll target.
+const GPU_ANCHOR_ID = 'setting-gpu-acceleration';
+
+/**
+ * Deep-link aliases and finer-grained anchors for `initialSection`. Plain section
+ * keys resolve through SETTINGS_SECTIONS; this map adds alternate spellings and
+ * sub-section anchors (e.g. the GPU control buried inside Preferences) so callers
+ * like the ASR status badge can land the user exactly on the setting they clicked
+ * toward instead of dumping them at step 1.
+ */
+const SECTION_DEEP_LINKS: Record<string, { step: number; anchorId?: string }> = {
+    tmdb: { step: 3 },
+    'data-sharing': { step: 4 },
+    gpu: { step: 5, anchorId: GPU_ANCHOR_ID },
+};
+
+function resolveSection(section: string | undefined): { step: number; anchorId?: string } | null {
+    if (!section) return null;
+    if (section in SECTION_DEEP_LINKS) return SECTION_DEEP_LINKS[section];
+    const match = SETTINGS_SECTIONS.find((s) => s.key === section);
+    return match ? { step: match.step } : null;
+}
+
+const AI_PROVIDER_LABELS: Record<string, string> = {
+    anthropic: 'Anthropic',
+    openai: 'OpenAI',
+    openrouter: 'OpenRouter',
+    gemini: 'Google Gemini',
+    ollama: 'Ollama',
+    lmstudio: 'LM Studio',
+};
+
+const AI_KEY_PLACEHOLDERS: Record<string, string> = {
+    anthropic: 'sk-ant-...',
+    openai: 'sk-...',
+    openrouter: 'sk-or-...',
+    gemini: 'AIzaSy...',
+};
+
+// Shown as the model-field placeholder so the user can see what they are
+// overriding. Mirrors DEFAULT_MODELS in backend/app/core/ai_client.py — the
+// backend is authoritative, this is a label only. The local providers are
+// deliberately absent: they have no default, and the model field is a required
+// dropdown for them rather than an optional override.
+const AI_DEFAULT_MODELS: Record<string, string> = {
+    anthropic: 'claude-haiku-4-5-20251001',
+    openai: 'gpt-4o-mini',
+    openrouter: 'anthropic/claude-haiku-4-5-20251001',
+    gemini: 'gemini-2.5-flash-lite',
+};
+
+// Long enough to swallow a typed-out host, short enough that pasting one and
+// stopping still feels immediate.
+const LOCAL_MODEL_FETCH_DEBOUNCE_MS = 400;
+
+interface NamingPreset {
+    id: string;
+    seasonFormat: string;
+    episodeFormat: string;
+}
+
+const NAMING_PRESETS: NamingPreset[] = [
+    { id: 'plex', seasonFormat: 'Season {season:02d}', episodeFormat: '{show} - S{season:02d}E{episode:02d}' },
+    { id: 'kodi', seasonFormat: 'Season {season:d}', episodeFormat: '{show} - S{season:02d}E{episode:02d}' },
+    { id: 'minimal', seasonFormat: 'S{season:02d}', episodeFormat: '{show} - S{season:02d}E{episode:02d}' },
+];
+
+/**
+ * Naive placeholder substitution for the movie naming preview hint (same spirit as
+ * the TV preview's .replace() chain). Doubled braces are unescaped last so the Plex
+ * "{{tmdb-{tmdb_id}}}" form previews as "{tmdb-78}".
+ */
+function renderMovieNamePreview(format: string): string {
+    return format
+        .replace(/\{title\}/g, 'Blade Runner')
+        .replace(/\{year\}/g, '1982')
+        .replace(/\{tmdb_id\}/g, '78')
+        .replace(/\{edition\}/g, 'Final Cut')
+        .replace(/\{\{/g, '{')
+        .replace(/\}\}/g, '}');
+}
+
+function SavedKeyBadge({ saved, text }: { saved: boolean; text: string }) {
+    if (!saved) {
+        return null;
+    }
+    return <span className="ml-2 text-xs font-normal text-green-500">{text}</span>;
+}
+
+interface ConfigData {
+    stagingPath: string;
+    makemkvPath: string;
+    makemkvKey: string;
+    libraryMoviesPath: string;
+    libraryTvPath: string;
+    tmdbApiKey: string;
+    maxConcurrentMatches: number;
+    enableBackgroundPretranscription: boolean;
+    pretranscribeFullFile: boolean;
+    ffmpegPath: string;
+    conflictResolutionDefault: string;
+    episodeOrderingPreference: 'aired' | 'dvd';
+    autoEjectEnabled: boolean;
+    watchdogEnabled: boolean;
+    timeoutIdentifyingSeconds: number;
+    timeoutRippingSeconds: number;
+    timeoutMatchingSeconds: number;
+    timeoutOrganizingSeconds: number;
+    stagingCleanupPolicy: string;
+    stagingCleanupDays: number;
+    extrasPolicy: string;
+    alwaysReview: boolean;
+    backupBeforeRip: boolean;
+    backupPath: string;
+    namingSeasonFormat: string;
+    namingEpisodeFormat: string;
+    namingMovieFormat: string;
+    namingMovieFileFormat: string;
+    namingTvShowFormat: string;
+    discdbEnabled: boolean;
+    enableFingerprintContributions: boolean;
+    fingerprintServerUrl: string;
+    contributionPseudonym: string;
+    fingerprintDisclosureAccepted: boolean;
+    fingerprintDisclosureAcceptedAt: string | null;
+    aiIdentificationEnabled: boolean;
+    aiEpisodeMatchingEnabled: boolean;
+    aiProvider: string;
+    aiApiKey: string;
+    aiModel: string;
+    aiLocalBaseUrl: string;
+    discdbContributionsEnabled: boolean;
+    discdbContributionTier: number;
+    discdbExportPath: string;
+    discdbApiKey: string;
+    discdbApiUrl: string;
+    opensubtitlesApiKey: string;
+    opensubtitlesUsername: string;
+    opensubtitlesPassword: string;
+    allowLanAccess: boolean;
+    discordWebhookUrl: string;
+    discordTemplateCompleted: string;
+    discordTemplateFailed: string;
+    discordTemplateReview: string;
+    discordTemplateRipped: string;
+    discordNotifyCompleted: boolean;
+    discordNotifyFailed: boolean;
+    discordNotifyReview: boolean;
+    discordNotifyRipped: boolean;
+    discordMentionReview: string;
+    dashboardBaseUrl: string;
+}
+
+interface NetworkInfo {
+    lan_access_enabled: boolean;
+    active_lan_bound: boolean;
+    lan_ip: string | null;
+    port: number;
+    lan_url: string | null;
+}
+
+interface ToolDetectionResult {
+    found: boolean;
+    path: string | null;
+    version: string | null;
+    error: string | null;
+}
+
+interface DetectToolsResponse {
+    makemkv: ToolDetectionResult;
+    ffmpeg: ToolDetectionResult;
+    platform: string;
+}
+
+function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection }: ConfigWizardProps) {
+    // Settings mode can deep-link to a section; onboarding always starts at step 1.
+    const [step, setStep] = useState(() => (!isOnboarding ? resolveSection(initialSection)?.step : undefined) ?? 1);
+    const [isLoading, setIsLoading] = useState(true);
+    const wizardBodyRef = useRef<HTMLDivElement | null>(null);
+    // A deep-linked control (e.g. the GPU toggle) to scroll into view once the
+    // settings body has rendered. Consumed once.
+    const pendingScrollAnchor = useRef<string | null>(
+        !isOnboarding ? (resolveSection(initialSection)?.anchorId ?? null) : null,
+    );
+    const [config, setConfig] = useState<ConfigData>({
+        stagingPath: '',
+        makemkvPath: '',
+        makemkvKey: '',
+        libraryMoviesPath: '',
+        libraryTvPath: '',
+        tmdbApiKey: '',
+        maxConcurrentMatches: 2,
+        enableBackgroundPretranscription: true,
+        pretranscribeFullFile: false,
+        ffmpegPath: '',
+        conflictResolutionDefault: 'ask',
+        episodeOrderingPreference: 'aired',
+        autoEjectEnabled: true,
+        watchdogEnabled: true,
+        timeoutIdentifyingSeconds: 600,
+        timeoutRippingSeconds: 1200,
+        timeoutMatchingSeconds: 1800,
+        timeoutOrganizingSeconds: 600,
+        stagingCleanupPolicy: 'on_success',
+        stagingCleanupDays: 7,
+        extrasPolicy: 'keep',
+        alwaysReview: false,
+        backupBeforeRip: false,
+        backupPath: '',
+        namingSeasonFormat: 'Season {season:02d}',
+        namingEpisodeFormat: '{show} - S{season:02d}E{episode:02d}',
+        namingMovieFormat: '{title} ({year})',
+        namingMovieFileFormat: '',
+        namingTvShowFormat: '{show}',
+        discdbEnabled: true,
+        enableFingerprintContributions: true,
+        fingerprintServerUrl: '',
+        contributionPseudonym: '',
+        fingerprintDisclosureAccepted: false,
+        fingerprintDisclosureAcceptedAt: null,
+        aiIdentificationEnabled: false,
+        aiEpisodeMatchingEnabled: false,
+        aiProvider: 'anthropic',
+        aiApiKey: '',
+        aiModel: '',
+        aiLocalBaseUrl: '',
+        discdbContributionsEnabled: false,
+        discdbContributionTier: 2,
+        discdbExportPath: '',
+        discdbApiKey: '',
+        discdbApiUrl: 'https://thediscdb.com',
+        opensubtitlesApiKey: '',
+        opensubtitlesUsername: '',
+        opensubtitlesPassword: '',
+        allowLanAccess: false,
+        discordWebhookUrl: '',
+        discordTemplateCompleted: '',
+        discordTemplateFailed: '',
+        discordTemplateReview: '',
+        discordTemplateRipped: '',
+        discordNotifyCompleted: true,
+        discordNotifyFailed: true,
+        discordNotifyReview: true,
+        discordNotifyRipped: false,
+        discordMentionReview: '',
+        dashboardBaseUrl: '',
+    });
+    const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null);
+    const [isSaving, setIsSaving] = useState(false);
+    const [discordTemplateErrors, setDiscordTemplateErrors] = useState<{completed: string; failed: string; review: string; ripped: string}>({completed: '', failed: '', review: '', ripped: ''});
+    const [webhookTest, setWebhookTest] = useState<{status: 'idle' | 'testing' | 'ok' | 'invalid' | 'error', error?: string}>({status: 'idle'});
+    const [toolDetection, setToolDetection] = useState<DetectToolsResponse | null>(null);
+    const [isDetecting, setIsDetecting] = useState(false);
+    const [showMakemkvOverride, setShowMakemkvOverride] = useState(false);
+    const [showFfmpegOverride, setShowFfmpegOverride] = useState(false);
+    const [savedKeys, setSavedKeys] = useState<{makemkv: boolean, tmdb: boolean, opensubtitles: boolean, ai: boolean, discord: boolean}>({makemkv: false, tmdb: false, opensubtitles: false, ai: false, discord: false});
+    // 'error' ("couldn't check") is deliberately distinct from 'invalid' ("token
+    // rejected"): conflating them sent users hunting for a token problem that may
+    // not exist (#243). 'error' never counts as validated, but the gate still
+    // lets the user continue without TMDB.
+    const [tmdbValidation, setTmdbValidation] = useState<{status: 'idle' | 'testing' | 'valid' | 'invalid' | 'error', error?: string}>({status: 'idle'});
+    const [aiValidation, setAiValidation] = useState<{status: 'idle' | 'testing' | 'valid' | 'invalid' | 'error', error?: string, model?: string}>({status: 'idle'});
+    const [localModels, setLocalModels] = useState<{models: string[]; error: string | null}>({
+        models: [],
+        error: null,
+    });
+    // Inline validation for manually-entered tool paths (MakeMKV/FFmpeg), keyed by
+    // the config field. Without this, a hand-typed override was saved blind — no
+    // confirmation it actually points at a working binary.
+    const [pathValidation, setPathValidation] = useState<
+        Partial<Record<keyof ConfigData, {status: 'idle' | 'validating' | 'valid' | 'invalid', version?: string, error?: string}>>
+    >({});
+    // Monotonic per-field request counter. Each edit/validate bumps it; a response
+    // is applied only if its id is still current, so a slow earlier response can't
+    // overwrite a newer one (or clobber the user's in-progress edits).
+    const pathValidationSeq = useRef<Partial<Record<keyof ConfigData, number>>>({});
+    // #243: first-run gate — require a validated TMDB token (or explicit skip) before leaving the TMDB step.
+    const [tmdbContinueAnyway, setTmdbContinueAnyway] = useState(false);
+    const [tmdbGatePrompted, setTmdbGatePrompted] = useState(false);
+    const [showBootstrapFlow, setShowBootstrapFlow] = useState(false);
+
+    const totalSteps = STEP_LABELS.length;
+
+    const fetchNetworkInfo = useCallback(async () => {
+        try {
+            const res = await fetch('/api/network/info');
+            if (res.ok) setNetworkInfo(await res.json());
+        } catch {
+            // non-fatal; address panel renders nothing if unreachable
+        }
+    }, []);
+
+    // Fetch network info when the LAN toggle is enabled; clear stale data when disabled.
+    useEffect(() => {
+        if (config.allowLanAccess) {
+            fetchNetworkInfo();
+        } else {
+            setNetworkInfo(null);
+        }
+    }, [config.allowLanAccess, fetchNetworkInfo]);
+
+    // Populate the model dropdown whenever a local provider or its endpoint
+    // changes. The fetch doubles as a reachability check, which is why the local
+    // path does not need a separate Test button to tell the user their server is
+    // down. A failure leaves `models` empty, and the field below falls back to
+    // free text so a user with an unreachable server can still type an id.
+    // Debounced, because aiLocalBaseUrl is a dependency and someone typing a
+    // custom host would otherwise fire one request per keystroke — each of which
+    // the backend turns into its own outbound fetch with a 5s timeout. Clearing
+    // the timer on cleanup means only the last keystroke actually asks; the
+    // `cancelled` flag then guards the state update for a reply that lands after
+    // the inputs changed again.
+    useEffect(() => {
+        if (!config.aiIdentificationEnabled || !isLocalProvider(config.aiProvider)) {
+            setLocalModels({models: [], error: null});
+            return;
+        }
+        let cancelled = false;
+        const timer = setTimeout(() => {
+            void (async () => {
+                const result = await fetchLocalModels(config.aiProvider, config.aiLocalBaseUrl);
+                if (!cancelled) setLocalModels(result);
+            })();
+        }, LOCAL_MODEL_FETCH_DEBOUNCE_MS);
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+    }, [config.aiIdentificationEnabled, config.aiProvider, config.aiLocalBaseUrl]);
+
+    // Load existing config on mount
+    useEffect(() => {
+        const loadConfig = async () => {
+            try {
+                const response = await fetch('/api/config');
+                if (!response.ok) {
+                    throw new Error(`Failed to load config: ${response.status}`);
+                }
+                const data = await response.json();
+                // Track which sensitive keys are already saved in the database
+                setSavedKeys({
+                    makemkv: data.makemkv_key === '***',
+                    tmdb: data.tmdb_api_key === '***',
+                    opensubtitles: data.opensubtitles_api_key === '***',
+                    ai: data.ai_api_key === '***',
+                    discord: data.discord_webhook_url === '***',
+                });
+                // Note: API keys are redacted as "***" for security
+                setConfig({
+                    stagingPath: data.staging_path || '',
+                    makemkvPath: data.makemkv_path || '',
+                    makemkvKey: data.makemkv_key === '***' ? '' : (data.makemkv_key || ''),
+                    libraryMoviesPath: data.library_movies_path || '',
+                    libraryTvPath: data.library_tv_path || '',
+                    tmdbApiKey: data.tmdb_api_key === '***' ? '' : (data.tmdb_api_key || ''),
+                    maxConcurrentMatches: data.max_concurrent_matches ?? 2,
+                    enableBackgroundPretranscription: data.enable_background_pretranscription ?? true,
+                    pretranscribeFullFile: data.pretranscribe_full_file ?? false,
+                    ffmpegPath: data.ffmpeg_path || '',
+                    conflictResolutionDefault: data.conflict_resolution_default || 'ask',
+                    episodeOrderingPreference: data.episode_ordering_preference || 'aired',
+                    autoEjectEnabled: data.auto_eject_enabled ?? true,
+                    watchdogEnabled: data.watchdog_enabled ?? true,
+                    timeoutIdentifyingSeconds: data.timeout_identifying_seconds ?? 600,
+                    timeoutRippingSeconds: data.timeout_ripping_seconds ?? 1200,
+                    timeoutMatchingSeconds: data.timeout_matching_seconds ?? 1800,
+                    timeoutOrganizingSeconds: data.timeout_organizing_seconds ?? 600,
+                    stagingCleanupPolicy: data.staging_cleanup_policy || 'on_success',
+                    stagingCleanupDays: data.staging_cleanup_days ?? 7,
+                    extrasPolicy: data.extras_policy || 'keep',
+                    alwaysReview: data.always_review ?? false,
+                    backupBeforeRip: data.backup_before_rip ?? false,
+                    backupPath: data.backup_path || '',
+                    namingSeasonFormat: data.naming_season_format || 'Season {season:02d}',
+                    namingEpisodeFormat: data.naming_episode_format || '{show} - S{season:02d}E{episode:02d}',
+                    namingMovieFormat: data.naming_movie_format || '{title} ({year})',
+                    // ?? not ||: an empty filename format is meaningful ("reuse the folder format").
+                    namingMovieFileFormat: data.naming_movie_file_format ?? '',
+                    namingTvShowFormat: data.naming_tv_show_format || '{show}',
+                    discdbEnabled: data.discdb_enabled ?? true,
+                    enableFingerprintContributions: data.enable_fingerprint_contributions ?? true,
+                    fingerprintServerUrl: data.fingerprint_server_url || '',
+                    contributionPseudonym: data.contribution_pseudonym || '',
+                    fingerprintDisclosureAccepted: data.fingerprint_disclosure_accepted ?? false,
+                    fingerprintDisclosureAcceptedAt: data.fingerprint_disclosure_accepted_at || null,
+                    aiIdentificationEnabled: data.ai_identification_enabled ?? false,
+                    aiEpisodeMatchingEnabled: data.ai_episode_matching_enabled ?? false,
+                    aiProvider: data.ai_provider || 'anthropic',
+                    aiApiKey: data.ai_api_key === '***' ? '' : (data.ai_api_key || ''),
+                    aiModel: data.ai_model || '',
+                    aiLocalBaseUrl: data.ai_local_base_url || '',
+                    discdbContributionsEnabled: data.discdb_contributions_enabled ?? false,
+                    discdbContributionTier: data.discdb_contribution_tier ?? 2,
+                    discdbExportPath: data.discdb_export_path || '',
+                    discdbApiKey: '',  // Never populated from API (sensitive)
+                    discdbApiUrl: data.discdb_api_url || 'https://thediscdb.com',
+                    opensubtitlesApiKey: data.opensubtitles_api_key === '***' ? '' : (data.opensubtitles_api_key || ''),
+                    opensubtitlesUsername: data.opensubtitles_username || '',
+                    opensubtitlesPassword: data.opensubtitles_password === '***' ? '' : (data.opensubtitles_password || ''),
+                    allowLanAccess: data.allow_lan_access ?? false,
+                    discordWebhookUrl: data.discord_webhook_url === '***' ? '' : (data.discord_webhook_url || ''),
+                    discordTemplateCompleted: data.discord_template_completed || '',
+                    discordTemplateFailed: data.discord_template_failed || '',
+                    discordTemplateReview: data.discord_template_review || '',
+                    discordTemplateRipped: data.discord_template_ripped || '',
+                    discordNotifyCompleted: data.discord_notify_completed ?? true,
+                    discordNotifyFailed: data.discord_notify_failed ?? true,
+                    discordNotifyReview: data.discord_notify_review ?? true,
+                    discordNotifyRipped: data.discord_notify_ripped ?? false,
+                    discordMentionReview: data.discord_mention_review || '',
+                    dashboardBaseUrl: data.dashboard_base_url || '',
+                });
+            } catch (error) {
+                console.error('Failed to load config:', error);
+            } finally {
+                setIsLoading(false);
+            }
+        };
+        loadConfig();
+    }, []);
+
+    // Live Discord template validation, debounced. The real enforcement is
+    // server-side (PUT /api/config re-validates before persisting) — this is
+    // UX only, so a network hiccup ('error' status) doesn't block Save.
+    useEffect(() => {
+        const timer = window.setTimeout(async () => {
+            // Empty template is always valid (falls back to the built-in default) —
+            // skip the round-trip, which also avoids validating on mount before the
+            // user has touched either field.
+            const [completedResult, failedResult, reviewResult, rippedResult] = await Promise.all([
+                config.discordTemplateCompleted
+                    ? requestDiscordTemplateValidation(config.discordTemplateCompleted)
+                    : Promise.resolve({ status: 'valid' as const }),
+                config.discordTemplateFailed
+                    ? requestDiscordTemplateValidation(config.discordTemplateFailed)
+                    : Promise.resolve({ status: 'valid' as const }),
+                config.discordTemplateReview
+                    ? requestDiscordTemplateValidation(config.discordTemplateReview)
+                    : Promise.resolve({ status: 'valid' as const }),
+                config.discordTemplateRipped
+                    ? requestDiscordTemplateValidation(config.discordTemplateRipped)
+                    : Promise.resolve({ status: 'valid' as const }),
+            ]);
+            setDiscordTemplateErrors({
+                completed: completedResult.status === 'invalid' ? completedResult.error : '',
+                failed: failedResult.status === 'invalid' ? failedResult.error : '',
+                review: reviewResult.status === 'invalid' ? reviewResult.error : '',
+                ripped: rippedResult.status === 'invalid' ? rippedResult.error : '',
+            });
+        }, 400);
+        return () => window.clearTimeout(timer);
+    }, [config.discordTemplateCompleted, config.discordTemplateFailed, config.discordTemplateReview, config.discordTemplateRipped]);
+
+    useEffect(() => {
+        if (pendingScrollAnchor.current) {
+            return;
+        }
+
+        const body = wizardBodyRef.current;
+
+        if (!body) {
+            return;
+        }
+
+        if (typeof body.scrollTo === 'function') {
+            body.scrollTo({ top: 0 });
+        }
+
+        body.scrollTop = 0;
+    }, [step]);
+
+    // Detect tools when entering step 2
+    useEffect(() => {
+        if (step === 2 && !toolDetection) {
+            detectTools();
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [step]);
+
+    // Deep-link (M2): once the settings body has rendered, scroll a requested
+    // sub-section control (e.g. the GPU toggle) into view and briefly flash it.
+    // Runs once — the initial step is already set to the right section above.
+    useEffect(() => {
+        if (isLoading) return;
+        const anchorId = pendingScrollAnchor.current;
+        if (!anchorId) return;
+        pendingScrollAnchor.current = null;
+        const el = document.getElementById(anchorId);
+        if (!el) return;
+        el.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+        el.classList.add('settings-anchor-flash');
+        const timer = window.setTimeout(() => el.classList.remove('settings-anchor-flash'), 1800);
+        return () => window.clearTimeout(timer);
+    }, [isLoading]);
+
+    // #243: once the first-run gate has been shown, advance as soon as the user
+    // satisfies it — the token validates in the background, or they opt to continue
+    // without one — so they don't have to click Next a second time. Keeping the
+    // advance here (not in the button) routes every transition through one place.
+    useEffect(() => {
+        if (
+            isOnboarding &&
+            step === 3 &&
+            tmdbGatePrompted &&
+            (tmdbValidation.status === 'valid' || tmdbContinueAnyway)
+        ) {
+            setTmdbGatePrompted(false);
+            setStep((s) => s + 1);
+        }
+    }, [isOnboarding, step, tmdbGatePrompted, tmdbValidation.status, tmdbContinueAnyway]);
+
+    const detectTools = async () => {
+        setIsDetecting(true);
+        try {
+            const response = await fetch('/api/detect-tools');
+            if (!response.ok) {
+                throw new Error(`Detection failed: ${response.status}`);
+            }
+            const data: DetectToolsResponse = await response.json();
+            setToolDetection(data);
+
+            // Update config paths from detection if currently empty
+            if (data.makemkv.found && data.makemkv.path && !config.makemkvPath) {
+                setConfig(prev => ({ ...prev, makemkvPath: data.makemkv.path! }));
+            }
+            if (data.ffmpeg.found && data.ffmpeg.path && !config.ffmpegPath) {
+                setConfig(prev => ({ ...prev, ffmpegPath: data.ffmpeg.path! }));
+            }
+        } catch (error) {
+            console.error('Tool detection failed:', error);
+        } finally {
+            setIsDetecting(false);
+        }
+    };
+
+    const handleInputChange = (field: keyof ConfigData, value: string | boolean | number) => {
+        setConfig(prev => ({ ...prev, [field]: value }));
+    };
+
+    const handleTestWebhook = async () => {
+        // The endpoint tests the SAVED webhook and takes no URL, so an unsaved
+        // edit sitting in the field would be silently ignored and the user would
+        // read the result as being about what they just typed. Say so instead.
+        if (config.discordWebhookUrl) {
+            setWebhookTest({
+                status: 'error',
+                error: 'Save your changes first, then test the saved webhook.',
+            });
+            return;
+        }
+        setWebhookTest({ status: 'testing' });
+        const result = await requestDiscordWebhookTest();
+        setWebhookTest(
+            result.status === 'ok' ? { status: 'ok' } : { status: result.status, error: result.error },
+        );
+    };
+
+    const handleNext = () => {
+        // #243: don't let first-run users sail past the TMDB step with an unvalidated
+        // (or missing) token — it's the single most impactful silent misconfiguration.
+        if (isOnboarding && step === 3) {
+            const tmdbReady = savedKeys.tmdb || tmdbValidation.status === 'valid';
+            if (!tmdbReady && !tmdbContinueAnyway) {
+                if (config.tmdbApiKey.trim() && tmdbValidation.status === 'idle') {
+                    handleTestTmdb();
+                }
+                setTmdbGatePrompted(true);
+                return;
+            }
+        }
+        if (step < totalSteps) {
+            setStep(step + 1);
+        } else {
+            handleSave();
+        }
+    };
+
+    const handleBack = () => {
+        if (step > 1) {
+            setStep(step - 1);
+        }
+    };
+
+    const handleSave = async () => {
+        setIsSaving(true);
+        // Only include a secret key in the payload when the user actually entered one,
+        // so blank fields don't overwrite stored credentials.
+        const optional = (key: string, value: string) => (value ? { [key]: value } : {});
+        try {
+            const response = await fetch('/api/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    staging_path: config.stagingPath,
+                    makemkv_path: config.makemkvPath,
+                    makemkv_key: config.makemkvKey,
+                    library_movies_path: config.libraryMoviesPath,
+                    library_tv_path: config.libraryTvPath,
+                    tmdb_api_key: config.tmdbApiKey,
+                    max_concurrent_matches: config.maxConcurrentMatches,
+                    enable_background_pretranscription: config.enableBackgroundPretranscription,
+                    pretranscribe_full_file: config.pretranscribeFullFile,
+                    ffmpeg_path: config.ffmpegPath,
+                    conflict_resolution_default: config.conflictResolutionDefault,
+                    episode_ordering_preference: config.episodeOrderingPreference,
+                    auto_eject_enabled: config.autoEjectEnabled,
+                    watchdog_enabled: config.watchdogEnabled,
+                    timeout_identifying_seconds: config.timeoutIdentifyingSeconds,
+                    timeout_ripping_seconds: config.timeoutRippingSeconds,
+                    timeout_matching_seconds: config.timeoutMatchingSeconds,
+                    timeout_organizing_seconds: config.timeoutOrganizingSeconds,
+                    staging_cleanup_policy: config.stagingCleanupPolicy,
+                    staging_cleanup_days: config.stagingCleanupDays,
+                    extras_policy: config.extrasPolicy,
+                    always_review: config.alwaysReview,
+                    backup_before_rip: config.backupBeforeRip,
+                    backup_path: config.backupPath,
+                    naming_season_format: config.namingSeasonFormat,
+                    naming_episode_format: config.namingEpisodeFormat,
+                    naming_movie_format: config.namingMovieFormat,
+                    naming_movie_file_format: config.namingMovieFileFormat,
+                    naming_tv_show_format: config.namingTvShowFormat,
+                    discdb_enabled: config.discdbEnabled,
+                    enable_fingerprint_contributions: config.enableFingerprintContributions,
+                    fingerprint_server_url: config.fingerprintServerUrl || null,
+                    ai_identification_enabled: config.aiIdentificationEnabled,
+                    ai_episode_matching_enabled: config.aiEpisodeMatchingEnabled,
+                    ai_provider: config.aiProvider,
+                    ...optional('ai_api_key', config.aiApiKey),
+                    // Sent unconditionally, unlike the key: blank is a meaningful
+                    // value here ("use the provider default"), so optional() —
+                    // which drops blanks so a saved key survives — would make the
+                    // override impossible to clear once set.
+                    ai_model: config.aiModel.trim(),
+                    ai_local_base_url: config.aiLocalBaseUrl.trim(),
+                    discdb_contributions_enabled: config.discdbContributionsEnabled,
+                    discdb_contribution_tier: config.discdbContributionTier,
+                    discdb_export_path: config.discdbExportPath,
+                    ...optional('discdb_api_key', config.discdbApiKey),
+                    discdb_api_url: config.discdbApiUrl,
+                    ...optional('opensubtitles_api_key', config.opensubtitlesApiKey),
+                    opensubtitles_username: config.opensubtitlesUsername,
+                    ...optional('opensubtitles_password', config.opensubtitlesPassword),
+                    allow_lan_access: config.allowLanAccess,
+                    ...optional('discord_webhook_url', config.discordWebhookUrl),
+                    discord_template_completed: config.discordTemplateCompleted,
+                    discord_template_failed: config.discordTemplateFailed,
+                    discord_template_review: config.discordTemplateReview,
+                    discord_template_ripped: config.discordTemplateRipped,
+                    discord_notify_completed: config.discordNotifyCompleted,
+                    discord_notify_failed: config.discordNotifyFailed,
+                    discord_notify_review: config.discordNotifyReview,
+                    discord_notify_ripped: config.discordNotifyRipped,
+                    discord_mention_review: config.discordMentionReview,
+                    dashboard_base_url: config.dashboardBaseUrl,
+                    setup_complete: true,
+                }),
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Failed to save config: ${response.status} ${errorText}`);
+            }
+
+            await response.json();
+            onComplete();
+        } catch (error) {
+            console.error('Failed to save config:', error);
+            toast.error(`Failed to save configuration: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    const handleTestTmdb = async () => {
+        const key = config.tmdbApiKey.trim();
+        if (!key) {
+            setTmdbValidation({status: 'invalid', error: 'Please enter a token first'});
+            return;
+        }
+        setTmdbValidation({status: 'testing'});
+        // requestTmdbValidation tells "token rejected" apart from "couldn't reach
+        // the endpoint" and console.errors the underlying cause for either failure
+        // (#243). The returned discriminated union maps straight onto our state.
+        setTmdbValidation(await requestTmdbValidation(key));
+    };
+
+    const handleTestAi = async () => {
+        const local = isLocalProvider(config.aiProvider);
+        const key = config.aiApiKey.trim();
+        if (!local && !key && !savedKeys.ai) {
+            setAiValidation({status: 'invalid', error: 'Please enter a key first'});
+            return;
+        }
+        if (local && !config.aiModel.trim()) {
+            setAiValidation({status: 'invalid', error: 'Select a model first'});
+            return;
+        }
+        // Prefix hint only, never a gate: provider key formats change, and a
+        // wrong-provider key is the common mistake after switching providers.
+        // Local providers have no key at all, so the hint does not apply.
+        const expectedPrefix = local ? '' : AI_KEY_PLACEHOLDERS[config.aiProvider]?.replace('...', '');
+        if (key && expectedPrefix && !key.startsWith(expectedPrefix)) {
+            setAiValidation({
+                status: 'invalid',
+                error: `That does not look like a ${AI_PROVIDER_LABELS[config.aiProvider] || config.aiProvider} key (expected it to start with "${expectedPrefix}")`,
+            });
+            return;
+        }
+        setAiValidation({status: 'testing'});
+        // The model goes as typed, not as saved: the point of testing is to find
+        // out whether this key can reach this model before committing to it.
+        const result = await requestAiValidation(
+            config.aiProvider,
+            config.aiApiKey,
+            config.aiModel,
+            config.aiLocalBaseUrl,
+        );
+        if (result.status === 'valid') {
+            setAiValidation({status: 'valid', model: result.model});
+        } else {
+            setAiValidation({status: result.status, error: result.error});
+        }
+    };
+
+    // Validate a manually-entered tool path against the backend, which actually
+    // runs the binary. Picks the endpoint by tool; an empty path resets to idle.
+    const validateToolPath = async (
+        toolName: string,
+        configField: keyof ConfigData,
+        rawPath: string,
+    ) => {
+        const path = rawPath.trim();
+        if (!path) {
+            setPathValidation(prev => ({ ...prev, [configField]: { status: 'idle' } }));
+            return;
+        }
+        const endpoint = toolName === 'MakeMKV' ? '/api/validate/makemkv' : '/api/validate/ffmpeg';
+        const requestId = (pathValidationSeq.current[configField] ?? 0) + 1;
+        pathValidationSeq.current[configField] = requestId;
+        const isStale = () => pathValidationSeq.current[configField] !== requestId;
+        setPathValidation(prev => ({ ...prev, [configField]: { status: 'validating' } }));
+        try {
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path }),
+            });
+            if (isStale()) return; // a newer request for this field superseded us
+            const result = await response.json();
+            if (result.valid) {
+                setPathValidation(prev => ({
+                    ...prev,
+                    [configField]: { status: 'valid', version: result.version },
+                }));
+            } else {
+                setPathValidation(prev => ({
+                    ...prev,
+                    [configField]: { status: 'invalid', error: result.error || 'Validation failed' },
+                }));
+            }
+        } catch {
+            if (isStale()) return;
+            setPathValidation(prev => ({
+                ...prev,
+                [configField]: { status: 'invalid', error: 'Failed to reach validation endpoint' },
+            }));
+        }
+    };
+
+    const renderToolStatus = (
+        tool: ToolDetectionResult | undefined,
+        toolName: string,
+        installHint: string,
+        downloadUrl: string | null,
+        showOverride: boolean,
+        setShowOverride: (v: boolean) => void,
+        configField: keyof ConfigData,
+    ) => {
+        if (isDetecting || !tool) {
+            return (
+                <div className="tool-status-card tool-detecting">
+                    <div className="tool-status-header">
+                        <div className="spinner-mini"></div>
+                        <span className="tool-name">{toolName}</span>
+                    </div>
+                    <span className="tool-status-text">Detecting...</span>
+                </div>
+            );
+        }
+
+        if (tool.found) {
+            return (
+                <div className="tool-status-card tool-found">
+                    <div className="tool-status-header">
+                        <span className="tool-status-icon found">OK</span>
+                        <span className="tool-name">{toolName}</span>
+                        <span className="tool-version" title={tool.version ?? undefined}>
+                            {formatToolVersion(tool.version)}
+                        </span>
+                    </div>
+                    <span className="tool-path">{tool.path}</span>
+                </div>
+            );
+        }
+
+        return (
+            <div className="tool-status-card tool-not-found">
+                <div className="tool-status-header">
+                    <span className="tool-status-icon not-found">!!</span>
+                    <span className="tool-name">{toolName} not found</span>
+                </div>
+                <span className="tool-status-text">
+                    {toolName === 'MakeMKV'
+                        ? 'Required for disc ripping.'
+                        : 'Required for audio-based episode matching.'}
+                    {downloadUrl && (
+                        <>
+                            {' '}Download from{' '}
+                            <a href={downloadUrl} target="_blank" rel="noopener noreferrer">
+                                {downloadUrl.replace('https://', '')}
+                            </a>
+                        </>
+                    )}
+                </span>
+                <span className="tool-install-hint">
+                    Install: <code>{installHint}</code>
+                </span>
+                <button
+                    type="button"
+                    className="tool-override-toggle"
+                    onClick={() => setShowOverride(!showOverride)}
+                >
+                    {showOverride ? 'Hide manual override' : 'Override path manually'}
+                </button>
+                {showOverride && (
+                    <div className="tool-override-input">
+                        <input
+                            type="text"
+                            value={config[configField] as string}
+                            onChange={(e) => {
+                                handleInputChange(configField, e.target.value);
+                                // Editing invalidates the previous result and any in-flight
+                                // validation; re-check on blur.
+                                pathValidationSeq.current[configField] =
+                                    (pathValidationSeq.current[configField] ?? 0) + 1;
+                                setPathValidation(prev => ({ ...prev, [configField]: { status: 'idle' } }));
+                            }}
+                            onBlur={(e) => validateToolPath(toolName, configField, e.target.value)}
+                            placeholder={
+                                toolName === 'FFmpeg'
+                                    ? (toolDetection?.platform === 'win32'
+                                        ? 'C:\\Users\\You\\ffmpeg\\bin\\ffmpeg.exe'
+                                        : '/usr/local/bin/ffmpeg')
+                                    : `Path to ${toolName.toLowerCase()} executable`
+                            }
+                        />
+                        <span className="form-hint">
+                            Point to the {toolName} executable file itself, not the folder it lives in.
+                        </span>
+                        {pathValidation[configField]?.status === 'validating' && (
+                            <span style={{ fontSize: '0.85rem' }}>Checking…</span>
+                        )}
+                        {pathValidation[configField]?.status === 'valid' && (
+                            <span style={{ color: '#22c55e', fontSize: '0.85rem' }}>
+                                ✓ {pathValidation[configField]?.version || 'Valid'}
+                            </span>
+                        )}
+                        {pathValidation[configField]?.status === 'invalid' && (
+                            <span style={{ color: '#ef4444', fontSize: '0.85rem' }}>
+                                ✗ {pathValidation[configField]?.error}
+                            </span>
+                        )}
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    const renderStepContent = () => {
+        switch (step) {
+            case 1:
+                return (
+                    <div className="wizard-step">
+                        <h3 className="step-title">Library Paths</h3>
+                        <p className="step-description">
+                            Where should Engram save your ripped media?
+                        </p>
+
+                        <div className="form-group">
+                            <label htmlFor="stagingPath">Staging Directory</label>
+                            <input
+                                id="stagingPath"
+                                type="text"
+                                value={config.stagingPath}
+                                onChange={(e) => handleInputChange('stagingPath', e.target.value)}
+                                placeholder="e.g., C:\Temp\Engram-Staging or ~/.engram/staging"
+                            />
+                            <span className="form-hint">
+                                Temporary storage during ripping. Files are moved to library after processing.
+                                Ensure this directory has adequate disk space (10-50GB recommended).
+                            </span>
+                            <PathStatusHint path={config.stagingPath} label="staging directory" />
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="moviesPath">Movies Library</label>
+                            <input
+                                id="moviesPath"
+                                type="text"
+                                value={config.libraryMoviesPath}
+                                onChange={(e) => handleInputChange('libraryMoviesPath', e.target.value)}
+                                placeholder="e.g., D:\Media\Movies or \server\share\Movies"
+                            />
+                            <PathStatusHint path={config.libraryMoviesPath} label="movies library" />
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="tvPath">TV Shows Library</label>
+                            <input
+                                id="tvPath"
+                                type="text"
+                                value={config.libraryTvPath}
+                                onChange={(e) => handleInputChange('libraryTvPath', e.target.value)}
+                                placeholder="e.g., D:\Media\TV Shows or \server\share\TV"
+                            />
+                            <PathStatusHint path={config.libraryTvPath} label="TV library" />
+                        </div>
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label checkbox-plain">
+                                <input
+                                    type="checkbox"
+                                    checked={config.backupBeforeRip}
+                                    onChange={(e) => handleInputChange('backupBeforeRip', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>Back up disc before ripping</strong>
+                                    <span className="checkbox-hint">
+                                        Writes a full copy of each disc to a separate folder and extracts
+                                        the titles from that copy, so the disc is read once instead of once
+                                        per title, and the copy is kept afterwards. The trade-off is real:
+                                        each disc takes longer, and the copies use tens of gigabytes apiece.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        {config.backupBeforeRip && (
+                            <div className="form-group">
+                                <label htmlFor="backupPath">Disc Backup Folder</label>
+                                <input
+                                    id="backupPath"
+                                    type="text"
+                                    value={config.backupPath}
+                                    onChange={(e) => handleInputChange('backupPath', e.target.value)}
+                                    placeholder="e.g., D:\Media\Disc Backups or ~/engram-backups"
+                                />
+                                <span className="form-hint">
+                                    Where the whole-disc copies are written. Give it plenty of room: one
+                                    Blu-ray backup can be 40GB or more, and backups are not cleaned up
+                                    with staging.
+                                </span>
+                                <PathStatusHint path={config.backupPath} label="disc backup folder" />
+                            </div>
+                        )}
+
+                    </div>
+                );
+
+            case 2: {
+                const isWindows = toolDetection?.platform === 'win32';
+                const makemkvInstallHint = isWindows
+                    ? 'Download installer from makemkv.com'
+                    : 'sudo apt install makemkv-bin makemkv-oss';
+                const ffmpegInstallHint = isWindows
+                    ? 'winget install Gyan.FFmpeg'
+                    : 'sudo apt install ffmpeg';
+
+                return (
+                    <div className="wizard-step">
+                        <h3 className="step-title">Tools & License</h3>
+                        <p className="step-description">
+                            Engram auto-detects required tools on your system.
+                        </p>
+
+                        <div className="tool-detection-section">
+                            {renderToolStatus(
+                                toolDetection?.makemkv,
+                                'MakeMKV',
+                                makemkvInstallHint,
+                                'https://makemkv.com',
+                                showMakemkvOverride,
+                                setShowMakemkvOverride,
+                                'makemkvPath',
+                            )}
+
+                            {renderToolStatus(
+                                toolDetection?.ffmpeg,
+                                'FFmpeg',
+                                ffmpegInstallHint,
+                                'https://ffmpeg.org/download.html',
+                                showFfmpegOverride,
+                                setShowFfmpegOverride,
+                                'ffmpegPath',
+                            )}
+
+                            {toolDetection && (
+                                <button
+                                    type="button"
+                                    className="tool-rescan-btn"
+                                    onClick={() => { setToolDetection(null); detectTools(); }}
+                                    disabled={isDetecting}
+                                >
+                                    Re-scan
+                                </button>
+                            )}
+                        </div>
+
+                        <div className="form-group" style={{ marginTop: '1.5rem' }}>
+                            <label htmlFor="licenseKey">
+                                MakeMKV License Key
+                                <SavedKeyBadge saved={savedKeys.makemkv} text="Key saved" />
+                            </label>
+                            <input
+                                id="licenseKey"
+                                type="text"
+                                value={config.makemkvKey}
+                                onChange={(e) => handleInputChange('makemkvKey', e.target.value)}
+                                placeholder={savedKeys.makemkv ? "Enter new key to replace existing" : "T-xxxxx-xxxxx-xxxxx-xxxxx"}
+                            />
+                            <span className="form-hint">
+                                Found in MakeMKV under Help &rarr; Register. Leave blank to use the beta key (requires periodic updates).
+                            </span>
+                        </div>
+                    </div>
+                );
+            }
+
+            case 3:
+                return (
+                    <div className="wizard-step">
+                        <h3 className="step-title">TMDB Read Access Token</h3>
+                        <p className="step-description">
+                            Required for TV show metadata and episode information.
+                            Go to{' '}
+                            <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">
+                                TMDB API Settings
+                            </a>
+                            {' '}and copy the <strong>Read Access Token</strong> (v4 auth),
+                            not the shorter "API Key" (v3 auth).
+                        </p>
+
+                        <div className="form-group">
+                            <label htmlFor="tmdbApiKey">
+                                TMDB Read Access Token
+                                <SavedKeyBadge saved={savedKeys.tmdb} text="Token saved" />
+                            </label>
+                            <input
+                                id="tmdbApiKey"
+                                type="text"
+                                value={config.tmdbApiKey}
+                                onChange={(e) => {
+                                    handleInputChange('tmdbApiKey', e.target.value);
+                                    setTmdbValidation({status: 'idle'});
+                                }}
+                                onBlur={() => {
+                                    // #243: auto-validate on blur so users get inline ✓/✗ without clicking.
+                                    if (config.tmdbApiKey.trim() && tmdbValidation.status === 'idle') {
+                                        handleTestTmdb();
+                                    }
+                                }}
+                                placeholder={savedKeys.tmdb ? "Enter new token to replace existing" : "Paste your Read Access Token here (long string starting with eyJ…)"}
+                            />
+                            <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem'}}>
+                                <button
+                                    type="button"
+                                    onClick={handleTestTmdb}
+                                    disabled={tmdbValidation.status === 'testing' || (!config.tmdbApiKey && !savedKeys.tmdb)}
+                                    className="btn-secondary"
+                                    style={{padding: '0.25rem 0.75rem', fontSize: '0.85rem'}}
+                                >
+                                    {tmdbValidation.status === 'testing' ? 'Testing...' : 'Test Token'}
+                                </button>
+                                {tmdbValidation.status === 'valid' && (
+                                    <span style={{color: '#22c55e', fontSize: '0.85rem'}}>✓ Valid token</span>
+                                )}
+                                {tmdbValidation.status === 'invalid' && (
+                                    <span style={{color: '#ef4444', fontSize: '0.85rem'}}>✗ {tmdbValidation.error}</span>
+                                )}
+                                {/* "Couldn't check" — amber, not red: the token wasn't rejected,
+                                    the check itself failed. Distinct from 'invalid' (#243). */}
+                                {tmdbValidation.status === 'error' && (
+                                    <span style={{color: '#f59e0b', fontSize: '0.85rem'}}>⚠ {tmdbValidation.error}</span>
+                                )}
+                            </div>
+                            <span className="form-hint">
+                                The Read Access Token is a long JWT string starting with "eyJ...".
+                                Find it under API &rarr; Read Access Token in your TMDB account settings.
+                            </span>
+                        </div>
+
+                        {isOnboarding && tmdbGatePrompted &&
+                            !(savedKeys.tmdb || tmdbValidation.status === 'valid') && !tmdbContinueAnyway && (
+                            <div className="tmdb-gate-warning">
+                                <strong>TMDB token not validated</strong>
+                                <span>
+                                    Without a working token Engram can&apos;t reliably identify shows or movies —
+                                    classification falls back to heuristics only. Enter a token above (it validates
+                                    automatically), or continue without it.
+                                </span>
+                                <SvActionButton
+                                    tone="amber"
+                                    size="md"
+                                    style={{ alignSelf: 'flex-start' }}
+                                    onClick={() => setTmdbContinueAnyway(true)}
+                                >
+                                    Continue without TMDB
+                                </SvActionButton>
+                            </div>
+                        )}
+
+                        <h4 style={{marginTop: '1.5rem', marginBottom: '0.25rem', fontSize: '1rem', fontWeight: 600}}>
+                            OpenSubtitles.com <span style={{fontWeight: 400, fontSize: '0.85rem', opacity: 0.7}}>(Optional)</span>
+                        </h4>
+                        <p className="step-description" style={{marginTop: 0}}>
+                            Enables automatic subtitle downloads for episode matching.{' '}
+                            Register a free account at{' '}
+                            <a href="https://www.opensubtitles.com" target="_blank" rel="noopener noreferrer">opensubtitles.com</a>,
+                            then create a consumer at{' '}
+                            <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener noreferrer">opensubtitles.com/consumers</a>{' '}
+                            to get an API key.
+                        </p>
+
+                        <div className="form-group">
+                            <label htmlFor="osApiKey">
+                                API Key
+                                <SavedKeyBadge saved={savedKeys.opensubtitles} text="Key saved" />
+                            </label>
+                            <input
+                                id="osApiKey"
+                                type="password"
+                                value={config.opensubtitlesApiKey}
+                                onChange={(e) => handleInputChange('opensubtitlesApiKey', e.target.value)}
+                                placeholder={savedKeys.opensubtitles ? 'Enter new key to replace existing' : 'API key from opensubtitles.com/consumers'}
+                            />
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="osUsername">Username</label>
+                            <input
+                                id="osUsername"
+                                type="text"
+                                value={config.opensubtitlesUsername}
+                                onChange={(e) => handleInputChange('opensubtitlesUsername', e.target.value)}
+                                placeholder="Your opensubtitles.com username"
+                            />
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="osPassword">Password</label>
+                            <input
+                                id="osPassword"
+                                type="password"
+                                value={config.opensubtitlesPassword}
+                                onChange={(e) => handleInputChange('opensubtitlesPassword', e.target.value)}
+                                placeholder={savedKeys.opensubtitles ? 'Enter new password to replace existing' : 'Your opensubtitles.com password'}
+                            />
+                            <span className="form-hint">
+                                Free accounts get 5 subtitle downloads/day. Used only for TV episode matching; skipped if not configured.
+                            </span>
+                        </div>
+                    </div>
+                );
+
+            case 4: {
+                const providerLabel = AI_PROVIDER_LABELS[config.aiProvider] || config.aiProvider;
+                return (
+                    <div className="wizard-step">
+                        <h3 className="step-title">Data Sharing</h3>
+                        <p className="step-description">
+                            Everything here is optional and governs data that leaves your machine. Fingerprint
+                            contributions are on by default and ask for your consent before the first upload;
+                            TheDiscDB contributions are off until you turn them on. No filenames, paths, or
+                            personal information are ever sent.
+                        </p>
+
+                        {/* ── Fingerprint network ─────────────────────────────── */}
+                        <details className="wizard-group" open>
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Fingerprint network
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.enableFingerprintContributions}
+                                    onChange={(e) => handleInputChange('enableFingerprintContributions', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>Contribute audio fingerprints</strong>
+                                    <span className="checkbox-hint">
+                                        Engram extracts a perceptual audio fingerprint from each ripped title and shares
+                                        it with the community catalog so everyone&apos;s rips identify faster. It also
+                                        contributes disc-layout identity records — a pressed disc&apos;s content hash plus
+                                        how its titles map to episodes (release-level data about the disc, not you). Only
+                                        the fingerprint and disc layout are sent — never audio, filenames, or paths. Both
+                                        share this toggle and your anonymous ID. Untick to keep everything on this machine.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        {config.enableFingerprintContributions && (
+                            <>
+                                <div className="form-group">
+                                    <label htmlFor="fingerprintServerUrl">Fingerprint network server URL</label>
+                                    <input
+                                        id="fingerprintServerUrl"
+                                        type="text"
+                                        placeholder="https://api.engramfp.com"
+                                        value={config.fingerprintServerUrl}
+                                        onChange={(e) => handleInputChange('fingerprintServerUrl', e.target.value)}
+                                    />
+                                    <span className="form-hint">
+                                        Base URL of the fingerprint network (no trailing path). Leave blank to use the
+                                        default network. To stop contributing entirely, untick the toggle above.
+                                    </span>
+                                </div>
+
+                                <div className="id-panel">
+                                    <div className="id-panel-row">
+                                        <div>
+                                            <div className="id-panel-label">Your anonymous contribution ID</div>
+                                            <div className="id-panel-value">
+                                                {config.contributionPseudonym || '(generated on first run)'}
+                                            </div>
+                                        </div>
+                                        {config.fingerprintDisclosureAccepted ? (
+                                            <span className="contrib-badge contrib-badge--green">
+                                                <span className="dot" />
+                                                Disclosure accepted
+                                            </span>
+                                        ) : (
+                                            <span className="contrib-badge contrib-badge--amber">
+                                                <span className="dot" />
+                                                Disclosure not accepted
+                                            </span>
+                                        )}
+                                    </div>
+                                    {config.fingerprintDisclosureAccepted && config.fingerprintDisclosureAcceptedAt && (
+                                        <span className="form-hint">
+                                            Accepted on {new Date(config.fingerprintDisclosureAcceptedAt).toLocaleString()}.
+                                        </span>
+                                    )}
+                                    <div className="id-panel-actions">
+                                        <SvActionButton
+                                            tone="red"
+                                            size="md"
+                                            onClick={async () => {
+                                                if (!window.confirm(
+                                                    'This deletes your raw contributions on the fingerprint server, clears the local queue, and generates a new anonymous ID. Already-promoted consensus data cannot be recalled. Continue?'
+                                                )) return;
+                                                try {
+                                                    const r = await fetch('/api/fingerprint/forget', { method: 'POST' });
+                                                    if (!r.ok) {
+                                                        const detail = await r.text();
+                                                        window.alert(`Forget failed: ${r.status} ${detail}`);
+                                                        return;
+                                                    }
+                                                    const d = await r.json();
+                                                    window.alert(
+                                                        `Done. Server deleted ${d.server_rows_deleted} row(s), local queue cleared (${d.local_rows_deleted}). New anonymous ID: ${d.new_pseudonym}`
+                                                    );
+                                                    setConfig((prev) => ({
+                                                        ...prev,
+                                                        contributionPseudonym: d.new_pseudonym,
+                                                        fingerprintDisclosureAccepted: false,
+                                                        fingerprintDisclosureAcceptedAt: null,
+                                                    }));
+                                                } catch (err) {
+                                                    window.alert(`Forget failed: ${err}`);
+                                                }
+                                            }}
+                                        >
+                                            Forget me on the server
+                                        </SvActionButton>
+                                    </div>
+                                    <span className="form-hint">
+                                        Forgetting deletes your raw contributions on the server, clears the local queue,
+                                        and rotates your ID. Already-promoted consensus data can&apos;t be recalled.
+                                    </span>
+                                </div>
+                            </>
+                        )}
+
+                        {config.enableFingerprintContributions && (
+                            <div className="form-group" style={{ marginTop: '0.75rem' }}>
+                                <SvActionButton
+                                    tone="cyan"
+                                    size="md"
+                                    onClick={() => setShowBootstrapFlow(true)}
+                                >
+                                    Contribute from existing library&hellip;
+                                </SvActionButton>
+                                <span className="form-hint" style={{ display: 'block', marginTop: '0.4rem' }}>
+                                    Seed the fingerprint network from your existing TV library (reads filenames only — no files are uploaded).
+                                </span>
+                            </div>
+                        )}
+
+                            </div>
+                        </details>
+
+                        {/* ── AI assistance ───────────────────────────────────── */}
+                        <details className="wizard-group">
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>AI assistance
+                                {/* Not "API key required" any more: the local providers
+                                    (Ollama, LM Studio) authenticate to nothing, so a key
+                                    is only needed for the hosted ones. */}
+                                <span className="wizard-group-sub">optional · hosted or local</span>
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.aiIdentificationEnabled}
+                                    onChange={(e) => handleInputChange('aiIdentificationEnabled', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>AI-Powered Title Resolution</strong>
+                                    <span className="checkbox-hint">
+                                        When TMDB lookup fails (obscure titles, abbreviations), use an LLM to identify the disc. Requires an API key below.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        {config.aiIdentificationEnabled && (
+                            <>
+                                <div className="wizard-grid">
+                                <div className="form-group">
+                                    <label htmlFor="aiProvider">AI Provider</label>
+                                    <EngramSelect
+                                        id="aiProvider"
+                                        value={config.aiProvider}
+                                        onValueChange={(v) => {
+                                            handleInputChange('aiProvider', v);
+                                            // The base URL is shared by both local
+                                            // slugs, so carrying a customised Ollama
+                                            // port over to LM Studio would silently
+                                            // point at the wrong server. Reset to the
+                                            // new slug's default (blank for remote).
+                                            handleInputChange('aiLocalBaseUrl', '');
+                                            handleInputChange('aiModel', '');
+                                            setAiValidation({status: 'idle'});
+                                        }}
+                                        options={[
+                                            { value: 'anthropic', label: 'Anthropic (Claude)' },
+                                            { value: 'openai', label: 'OpenAI' },
+                                            { value: 'openrouter', label: 'OpenRouter' },
+                                            { value: 'gemini', label: 'Google Gemini' },
+                                            { value: 'ollama', label: 'Ollama (local)' },
+                                            { value: 'lmstudio', label: 'LM Studio (local)' },
+                                        ]}
+                                    />
+                                </div>
+                                {!isLocalProvider(config.aiProvider) && (
+                                <div className="form-group">
+                                    <label htmlFor="aiApiKey">
+                                        {providerLabel} API Key
+                                        <SavedKeyBadge saved={savedKeys.ai} text="Key saved" />
+                                    </label>
+                                    <input
+                                        id="aiApiKey"
+                                        type="password"
+                                        placeholder={savedKeys.ai ? 'Enter new key to replace existing' : (AI_KEY_PLACEHOLDERS[config.aiProvider] || '')}
+                                        value={config.aiApiKey}
+                                        onChange={(e) => {
+                                            handleInputChange('aiApiKey', e.target.value);
+                                            setAiValidation({status: 'idle'});
+                                        }}
+                                    />
+                                    <span className="form-hint">
+                                        API key for {providerLabel}. Used only when TMDB lookup fails.
+                                    </span>
+                                </div>
+                                )}
+                                {isLocalProvider(config.aiProvider) && (
+                                <div className="form-group">
+                                    <label htmlFor="aiLocalBaseUrl">Server Address</label>
+                                    <input
+                                        id="aiLocalBaseUrl"
+                                        type="text"
+                                        placeholder={localProviderDefaultUrl(config.aiProvider)}
+                                        value={config.aiLocalBaseUrl}
+                                        onChange={(e) => {
+                                            handleInputChange('aiLocalBaseUrl', e.target.value);
+                                            setAiValidation({status: 'idle'});
+                                        }}
+                                    />
+                                    <span className="form-hint">
+                                        Leave blank to use {providerLabel}'s default address
+                                        ({localProviderDefaultUrl(config.aiProvider)}). No API
+                                        key is needed for a local server.
+                                    </span>
+                                    {localModels.error && (
+                                        <span style={{color: '#f59e0b', fontSize: '0.85rem'}}>
+                                            ⚠ {localModels.error}
+                                        </span>
+                                    )}
+                                </div>
+                                )}
+                                <div className="form-group">
+                                    <label htmlFor="aiModel">
+                                        {isLocalProvider(config.aiProvider) ? 'Model' : 'Model (optional)'}
+                                    </label>
+                                    {isLocalProvider(config.aiProvider) && localModels.models.length > 0 ? (
+                                        <EngramSelect
+                                            id="aiModel"
+                                            value={config.aiModel}
+                                            onValueChange={(v) => {
+                                                handleInputChange('aiModel', v);
+                                                setAiValidation({status: 'idle'});
+                                            }}
+                                            options={localModels.models.map((m) => ({value: m, label: m}))}
+                                        />
+                                    ) : (
+                                        <input
+                                            id="aiModel"
+                                            type="text"
+                                            placeholder={
+                                                isLocalProvider(config.aiProvider)
+                                                    ? 'e.g. llama3.1:8b'
+                                                    : (AI_DEFAULT_MODELS[config.aiProvider] || '')
+                                            }
+                                            value={config.aiModel}
+                                            onChange={(e) => {
+                                                handleInputChange('aiModel', e.target.value);
+                                                setAiValidation({status: 'idle'});
+                                            }}
+                                        />
+                                    )}
+                                    <span className="form-hint">
+                                        {isLocalProvider(config.aiProvider)
+                                            ? "Required. Local providers have no default, because it depends on which models you have installed."
+                                            : "Leave blank to use Engram's default. Set this if your key cannot reach the default model."}
+                                    </span>
+                                </div>
+                                <div className="form-group">
+                                    <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem'}}>
+                                        <button
+                                            type="button"
+                                            onClick={handleTestAi}
+                                            disabled={aiValidation.status === 'testing' || (!isLocalProvider(config.aiProvider) && !config.aiApiKey && !savedKeys.ai)}
+                                            className="btn-secondary"
+                                            style={{padding: '0.25rem 0.75rem', fontSize: '0.85rem'}}
+                                        >
+                                            {aiValidation.status === 'testing' ? 'Testing...' : 'Test Connection'}
+                                        </button>
+                                        {aiValidation.status === 'valid' && (
+                                            <span style={{color: '#22c55e', fontSize: '0.85rem'}}>
+                                                ✓ Connected{aiValidation.model ? ` (${aiValidation.model})` : ''}
+                                            </span>
+                                        )}
+                                        {aiValidation.status === 'invalid' && (
+                                            <span style={{color: '#ef4444', fontSize: '0.85rem'}}>✗ {aiValidation.error}</span>
+                                        )}
+                                        {/* Amber, not red: the key wasn't rejected, the check
+                                            itself failed. Same distinction as the TMDB test. */}
+                                        {aiValidation.status === 'error' && (
+                                            <span style={{color: '#f59e0b', fontSize: '0.85rem'}}>⚠ {aiValidation.error}</span>
+                                        )}
+                                    </div>
+                                </div>
+                                {/* Advisory only, never an override: a local server is
+                                    one GPU or CPU, so parallel requests queue rather
+                                    than overlap, and several large contexts at once can
+                                    exhaust VRAM. Silently clamping a setting the user
+                                    configured would be worse than telling them. */}
+                                {isLocalProvider(config.aiProvider) && config.maxConcurrentMatches > 1 && (
+                                    <div className="form-group">
+                                        <span className="form-hint" style={{color: '#f59e0b'}}>
+                                            ⚠ Max Concurrent Matches is set to {config.maxConcurrentMatches}.
+                                            A local server processes one request at a time, so parallel
+                                            matches queue rather than run faster, and several at once can
+                                            exhaust VRAM. Consider setting it to 1 in Matching settings.
+                                        </span>
+                                    </div>
+                                )}
+                                </div>
+                                <div className="form-group checkbox-group">
+                                    <label className="checkbox-label">
+                                        <input
+                                            type="checkbox"
+                                            checked={config.aiEpisodeMatchingEnabled}
+                                            onChange={(e) => handleInputChange('aiEpisodeMatchingEnabled', e.target.checked)}
+                                        />
+                                        <span className="checkbox-text">
+                                            <strong>AI-Powered Episode Matching (TV)</strong>
+                                            <span className="checkbox-hint">
+                                                When episode matching can't identify a TV episode, send the cleaned transcript and TMDB synopses to your AI provider for a suggested episode. Always confirmed via the review queue — never auto-organizes. <em>Gemini Flash-Lite recommended for best accuracy on this task.</em>
+                                            </span>
+                                        </span>
+                                    </label>
+                                </div>
+                            </>
+                        )}
+
+                            </div>
+                        </details>
+
+                        {/* ── TheDiscDB (feature-flagged) ──────────────────────── */}
+                        {(FEATURES.DISCDB_LOOKUP || FEATURES.DISCDB_CONTRIBUTE) && (
+                            <details className="wizard-group">
+                                <summary>
+                                    <span className="wizard-group-chevron">▸</span>TheDiscDB
+                                </summary>
+                                <div className="wizard-group-body">
+                                {FEATURES.DISCDB_LOOKUP && (
+                                <div className="form-group checkbox-group">
+                                    <label className="checkbox-label">
+                                        <input
+                                            type="checkbox"
+                                            checked={config.discdbEnabled}
+                                            onChange={(e) => handleInputChange('discdbEnabled', e.target.checked)}
+                                        />
+                                        <span className="checkbox-text">
+                                            <strong>Enable TheDiscDB Lookup</strong>
+                                            <span className="checkbox-hint">
+                                                Query TheDiscDB to help identify a disc. Episode matching still runs locally (audio); DiscDB episode order is used only as a fallback when audio matching is uncertain. No API key required.
+                                            </span>
+                                        </span>
+                                    </label>
+                                </div>
+                                )}
+                                {FEATURES.DISCDB_CONTRIBUTE && (
+                                <>
+                                <div className="form-group checkbox-group">
+                                    <label className="checkbox-label">
+                                        <input
+                                            type="checkbox"
+                                            checked={config.discdbContributionsEnabled}
+                                            onChange={(e) => handleInputChange('discdbContributionsEnabled', e.target.checked)}
+                                        />
+                                        <span className="checkbox-text">
+                                            <strong>Enable TheDiscDB Contributions</strong>
+                                            <span className="checkbox-hint">
+                                                Share disc metadata (track info, episode mappings) with TheDiscDB after each rip. Helps others identify their discs automatically. No personal data is shared.
+                                            </span>
+                                        </span>
+                                    </label>
+                                </div>
+
+                                {config.discdbContributionsEnabled && (
+                                    <>
+                                        <div className="form-group">
+                                            <label htmlFor="discdbContributionTier">Contribution Level</label>
+                                            <EngramSelect
+                                                id="discdbContributionTier"
+                                                value={String(config.discdbContributionTier)}
+                                                onValueChange={(v) => handleInputChange('discdbContributionTier', parseInt(v, 10))}
+                                                options={[
+                                                    { value: '2', label: 'Automatic — share auto-collected data' },
+                                                    { value: '3', label: 'Full — prompt for UPC and images' },
+                                                ]}
+                                            />
+                                        </div>
+
+                                        <div className="form-group">
+                                            <label htmlFor="discdbApiKey">TheDiscDB API Key</label>
+                                            <input
+                                                id="discdbApiKey"
+                                                type="password"
+                                                value={config.discdbApiKey}
+                                                onChange={(e) => handleInputChange('discdbApiKey', e.target.value)}
+                                                placeholder="Optional"
+                                            />
+                                            <small>No API key is needed: TheDiscDB accepts contributions without an account. This field is only for contributors who have been issued a key.</small>
+                                        </div>
+
+                                        <div className="form-group">
+                                            <label htmlFor="discdbExportPath">Export Directory (optional)</label>
+                                            <input
+                                                id="discdbExportPath"
+                                                type="text"
+                                                value={config.discdbExportPath}
+                                                onChange={(e) => handleInputChange('discdbExportPath', e.target.value)}
+                                                placeholder="~/.engram/discdb-exports"
+                                            />
+                                            <small>Leave empty for the default location</small>
+                                        </div>
+                                    </>
+                                )}
+                                </>
+                                )}
+                                </div>
+                            </details>
+                        )}
+
+                    </div>
+                );
+            }
+
+            case 5:
+                return (
+                    <div className="wizard-step">
+                        <h3 className="step-title">Preferences</h3>
+                        <p className="step-description">
+                            How Engram matches, names, and tidies up — all processed locally on this machine.
+                        </p>
+
+                        {/* ── Matching & ordering ─────────────────────────────── */}
+                        <details className="wizard-group" open>
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Matching &amp; ordering
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group">
+                            <label htmlFor="maxConcurrentMatches">Max Concurrent Matches</label>
+                            <input
+                                id="maxConcurrentMatches"
+                                type="number"
+                                min={1}
+                                max={8}
+                                value={config.maxConcurrentMatches}
+                                onChange={(e) => handleInputChange('maxConcurrentMatches', Math.max(1, Math.min(8, parseInt(e.target.value) || 1)))}
+                            />
+                            <span className="form-hint">
+                                Requested number of episodes transcribed in parallel. Automatically
+                                clamped to your hardware (CPU cores, or a GPU limit). Takes effect
+                                after a backend restart.
+                            </span>
+                        </div>
+
+                        <div id={GPU_ANCHOR_ID}>
+                            <GpuAccelerationSetting />
+                        </div>
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.enableBackgroundPretranscription}
+                                    onChange={(e) => handleInputChange('enableBackgroundPretranscription', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>Background Pre-Transcription</strong>
+                                    <span className="checkbox-hint">
+                                        While a job waits in the review queue, transcribe its unresolved tracks in the background so re-matching after your review is near-instant. Runs in the background while jobs wait for your review; transcripts are cached locally.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        {config.enableBackgroundPretranscription && (
+                            <div className="form-group checkbox-group">
+                                <label className="checkbox-label">
+                                    <input
+                                        type="checkbox"
+                                        checked={config.pretranscribeFullFile}
+                                        onChange={(e) => handleInputChange('pretranscribeFullFile', e.target.checked)}
+                                    />
+                                    <span className="checkbox-text">
+                                        <strong>Pre-Transcribe Entire Files</strong>
+                                        <span className="checkbox-hint">
+                                            Also transcribe each unresolved track end-to-end, not just short samples. Expensive (roughly 5&ndash;10 minutes of GPU time per file, substantially longer on CPU) &mdash; worth it when matches often fall back to full-file transcription.
+                                        </span>
+                                    </span>
+                                </label>
+                            </div>
+                        )}
+
+                        <div className="form-group">
+                            <label htmlFor="conflictResolution">Default Conflict Resolution</label>
+                            <EngramSelect
+                                id="conflictResolution"
+                                value={config.conflictResolutionDefault}
+                                onValueChange={(v) => handleInputChange('conflictResolutionDefault', v)}
+                                options={[
+                                    { value: 'ask', label: 'Always ask me' },
+                                    { value: 'rename', label: 'Automatically rename (keep both)' },
+                                    { value: 'overwrite', label: 'Automatically overwrite' },
+                                    { value: 'skip', label: 'Automatically skip' },
+                                ]}
+                            />
+                            <span className="form-hint">
+                                What should Engram do when a file already exists in your library?
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="episodeOrdering">Episode Ordering</label>
+                            <EngramSelect
+                                id="episodeOrdering"
+                                value={config.episodeOrderingPreference}
+                                onValueChange={(v) => handleInputChange('episodeOrderingPreference', v)}
+                                options={[
+                                    { value: 'aired', label: 'Aired Order (Default)' },
+                                    { value: 'dvd', label: 'DVD Order' },
+                                ]}
+                            />
+                            <span className="form-hint">
+                                How TV episodes are numbered in filenames. DVD order uses the disc
+                                release's numbering (e.g. Firefly) when a show provides it, falling back
+                                to aired order otherwise. This only affects new rips' filenames — matching,
+                                history, and the fingerprint network always use canonical aired numbering.
+                                Individual shows can be overridden during review.
+                            </span>
+                        </div>
+
+                            </div>
+                        </details>
+
+                        {/* ── Maintenance & watchdog ──────────────────────────── */}
+                        <details className="wizard-group">
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Maintenance &amp; watchdog
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.autoEjectEnabled}
+                                    onChange={(e) => handleInputChange('autoEjectEnabled', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>Auto-Eject Disc When Ripping Completes</strong>
+                                    <span className="checkbox-hint">
+                                        Automatically eject the disc from the drive when ripping finishes.
+                                        Disable if you want to keep the disc loaded after ripping — for
+                                        manual verification or re-ripping without re-inserting the disc.
+                                        When disabled, after manually ejecting wait a few seconds before
+                                        inserting the next disc so it is reliably detected.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="stagingCleanup">Staging Cleanup Policy</label>
+                            <EngramSelect
+                                id="stagingCleanup"
+                                value={config.stagingCleanupPolicy}
+                                onValueChange={(v) => handleInputChange('stagingCleanupPolicy', v)}
+                                options={[
+                                    { value: 'on_success', label: 'Clean on success (delete after organization)' },
+                                    { value: 'on_completion', label: 'Clean on completion (delete after success or failure)' },
+                                    { value: 'after_days', label: 'Clean after N days' },
+                                    { value: 'manual', label: 'Manual only (never auto-delete)' },
+                                ]}
+                            />
+                            <span className="form-hint">
+                                When should staging files be automatically deleted? A single Blu-ray rip can be 30-50GB.
+                            </span>
+                        </div>
+
+                        {config.stagingCleanupPolicy === 'after_days' && (
+                            <div className="form-group">
+                                <label htmlFor="stagingCleanupDays">Cleanup After (days)</label>
+                                <input
+                                    id="stagingCleanupDays"
+                                    type="number"
+                                    min={1}
+                                    max={365}
+                                    value={config.stagingCleanupDays}
+                                    onChange={(e) => handleInputChange('stagingCleanupDays', Math.max(1, parseInt(e.target.value) || 7))}
+                                />
+                                <span className="form-hint">
+                                    Delete staging files older than this many days.
+                                </span>
+                            </div>
+                        )}
+
+                        <div className="form-group">
+                            <label htmlFor="watchdogEnabled">Stale-Job Watchdog</label>
+                            <EngramSelect
+                                id="watchdogEnabled"
+                                value={config.watchdogEnabled ? 'on' : 'off'}
+                                onValueChange={(v) => handleInputChange('watchdogEnabled', v === 'on')}
+                                options={[
+                                    { value: 'on', label: 'Enabled (auto-advance stuck jobs)' },
+                                    { value: 'off', label: 'Disabled' },
+                                ]}
+                            />
+                            <span className="form-hint">
+                                When a job stops making progress for longer than its phase timeout, Engram
+                                resolves the stuck tracks (ripped-but-unmatched → review) and moves the job
+                                forward instead of leaving it stuck. You can also force this manually per job.
+                            </span>
+                        </div>
+
+                        {config.watchdogEnabled && (
+                            <div className="form-group">
+                                <label>Phase Timeouts (seconds of no progress)</label>
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
+                                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
+                                        Identifying
+                                        <input
+                                            type="number"
+                                            min={30}
+                                            value={config.timeoutIdentifyingSeconds}
+                                            onChange={(e) => handleInputChange('timeoutIdentifyingSeconds', Math.max(30, parseInt(e.target.value) || 600))}
+                                        />
+                                    </label>
+                                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
+                                        Ripping
+                                        <input
+                                            type="number"
+                                            min={60}
+                                            value={config.timeoutRippingSeconds}
+                                            onChange={(e) => handleInputChange('timeoutRippingSeconds', Math.max(60, parseInt(e.target.value) || 1200))}
+                                        />
+                                    </label>
+                                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
+                                        Matching
+                                        <input
+                                            type="number"
+                                            min={60}
+                                            value={config.timeoutMatchingSeconds}
+                                            onChange={(e) => handleInputChange('timeoutMatchingSeconds', Math.max(60, parseInt(e.target.value) || 1800))}
+                                        />
+                                    </label>
+                                    <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 13 }}>
+                                        Organizing
+                                        <input
+                                            type="number"
+                                            min={30}
+                                            value={config.timeoutOrganizingSeconds}
+                                            onChange={(e) => handleInputChange('timeoutOrganizingSeconds', Math.max(30, parseInt(e.target.value) || 600))}
+                                        />
+                                    </label>
+                                </div>
+                                <span className="form-hint">
+                                    Ripping leans on MakeMKV&apos;s own no-growth stall watchdog; this is an
+                                    additional ceiling on total silence per phase.
+                                </span>
+                            </div>
+                        )}
+
+                            </div>
+                        </details>
+
+                        {/* ── Naming & extras ─────────────────────────────────── */}
+                        <details className="wizard-group">
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Naming &amp; extras
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label checkbox-plain">
+                                <input
+                                    type="checkbox"
+                                    checked={config.alwaysReview}
+                                    onChange={(e) => handleInputChange('alwaysReview', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>Review every disc before organizing</strong>
+                                    <span className="checkbox-hint">
+                                        Hold every disc in the Review Queue for confirmation, however confident
+                                        the match was. The matcher still runs and pre-fills its best guess — you
+                                        get the last word before anything moves into the library. Worth turning
+                                        on for shows the matcher struggles with.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="extrasPolicy">Extras Handling</label>
+                            <EngramSelect
+                                id="extrasPolicy"
+                                value={config.extrasPolicy}
+                                onValueChange={(v) => handleInputChange('extrasPolicy', v)}
+                                options={[
+                                    { value: 'keep', label: 'Keep all extras (organize to Extras/ folder)' },
+                                    { value: 'skip', label: 'Skip extras (discard after ripping)' },
+                                    { value: 'ask', label: 'Ask me (show in Review Queue)' },
+                                ]}
+                            />
+                            <span className="form-hint">
+                                How to handle bonus content that doesn&apos;t match any episode runtime.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="namingConvention">Naming Convention</label>
+                            <EngramSelect
+                                id="namingConvention"
+                                value={
+                                    NAMING_PRESETS.find(
+                                        (p) =>
+                                            p.seasonFormat === config.namingSeasonFormat &&
+                                            p.episodeFormat === config.namingEpisodeFormat,
+                                    )?.id ?? 'custom'
+                                }
+                                onValueChange={(v) => {
+                                    const preset = NAMING_PRESETS.find((p) => p.id === v);
+                                    if (preset) {
+                                        handleInputChange('namingSeasonFormat', preset.seasonFormat);
+                                        handleInputChange('namingEpisodeFormat', preset.episodeFormat);
+                                    }
+                                }}
+                                options={[
+                                    { value: 'plex', label: 'Plex (Season 01 / Show - S01E01)' },
+                                    { value: 'kodi', label: 'Kodi (Season 1 / Show - S01E01)' },
+                                    { value: 'minimal', label: 'Minimal (S01 / Show - S01E01)' },
+                                    { value: 'custom', label: 'Custom' },
+                                ]}
+                            />
+                            <span className="form-hint">
+                                Preview: TV/{config.namingSeasonFormat.replace('{season:02d}', '01').replace('{season:d}', '1')}/{config.namingEpisodeFormat.replace('{show}', 'Breaking Bad').replace('{season:02d}', '01').replace('{season:d}', '1').replace('{episode:02d}', '05').replace('{episode:d}', '5')}.mkv
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="namingTvShowFormat">Show Folder Format</label>
+                            <input
+                                id="namingTvShowFormat"
+                                type="text"
+                                value={config.namingTvShowFormat}
+                                onChange={(e) => handleInputChange('namingTvShowFormat', e.target.value)}
+                                placeholder="{show}"
+                            />
+                            <span className="form-hint">
+                                Placeholders: {'{show}'}, {'{year}'}, {'{tmdb_id}'}. Default{' '}
+                                {'{show}'} keeps your current folders. To let same-name shows
+                                coexist (e.g. Frasier 1993 vs 2023), use Plex{' '}
+                                &quot;{'{show} ({year}) {{tmdb-{tmdb_id}}}'}&quot; or Jellyfin{' '}
+                                &quot;{'{show} ({year}) [tmdbid-{tmdb_id}]'}&quot;.
+                            </span>
+                        </div>
+
+                        {!NAMING_PRESETS.some((p) => p.seasonFormat === config.namingSeasonFormat) && (
+                            <>
+                                <div className="form-group">
+                                    <label htmlFor="namingSeasonFormat">Season Folder Format</label>
+                                    <input
+                                        id="namingSeasonFormat"
+                                        type="text"
+                                        value={config.namingSeasonFormat}
+                                        onChange={(e) => handleInputChange('namingSeasonFormat', e.target.value)}
+                                        placeholder="Season {season:02d}"
+                                    />
+                                    <span className="form-hint">
+                                        Placeholders: {'{season}'} — e.g., &quot;Season {'{season:02d}'}&quot; → Season 01
+                                    </span>
+                                </div>
+                                <div className="form-group">
+                                    <label htmlFor="namingEpisodeFormat">Episode Filename Format</label>
+                                    <input
+                                        id="namingEpisodeFormat"
+                                        type="text"
+                                        value={config.namingEpisodeFormat}
+                                        onChange={(e) => handleInputChange('namingEpisodeFormat', e.target.value)}
+                                        placeholder="{show} - S{season:02d}E{episode:02d}"
+                                    />
+                                    <span className="form-hint">
+                                        Placeholders: {'{show}'}, {'{season}'}, {'{episode}'}
+                                    </span>
+                                </div>
+                            </>
+                        )}
+
+                        <div className="form-group">
+                            <label htmlFor="namingMovieFormat">Movie Folder Format</label>
+                            <input
+                                id="namingMovieFormat"
+                                type="text"
+                                value={config.namingMovieFormat}
+                                onChange={(e) => handleInputChange('namingMovieFormat', e.target.value)}
+                                placeholder="{title} ({year})"
+                            />
+                            <span className="form-hint">
+                                Placeholders: {'{title}'}, {'{year}'}, {'{tmdb_id}'}. Newly ripped
+                                movies are filed as {'{title} ({year})'}; use {'{title}'} on its own
+                                for the older bare-name layout. Existing folders are never moved. To
+                                pin the exact movie for your media server, use Plex{' '}
+                                &quot;{'{title} ({year}) {{tmdb-{tmdb_id}}}'}&quot; or Jellyfin{' '}
+                                &quot;{'{title} ({year}) [tmdbid-{tmdb_id}]'}&quot;.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="namingMovieFileFormat">Movie Filename Format</label>
+                            <input
+                                id="namingMovieFileFormat"
+                                type="text"
+                                value={config.namingMovieFileFormat}
+                                onChange={(e) => handleInputChange('namingMovieFileFormat', e.target.value)}
+                                placeholder="Same as folder"
+                            />
+                            <span className="form-hint">
+                                Placeholders: {'{title}'}, {'{year}'}, {'{tmdb_id}'}, {'{edition}'}.
+                                Leave blank to reuse the folder format above; when a movie has an
+                                edition, the Plex &quot;{'{edition-...}'}&quot; tag is appended to the
+                                filename automatically (Plex reads the edition off the file, not the
+                                folder). Setting a format here takes full control and turns off both
+                                the inheritance and the automatic edition tag.
+                            </span>
+                            <span className="form-hint">
+                                Preview: Movies/{renderMovieNamePreview(config.namingMovieFormat)}/
+                                {renderMovieNamePreview(config.namingMovieFileFormat || config.namingMovieFormat)}.mkv
+                            </span>
+                        </div>
+
+                            </div>
+                        </details>
+
+                        {/* ── Network access ──────────────────────────────────── */}
+                        <details className="wizard-group">
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Network access
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.allowLanAccess}
+                                    onChange={(e) => handleInputChange('allowLanAccess', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    <strong>Allow access from other devices on my network (LAN)</strong>
+                                    <span className="checkbox-hint">
+                                        ⚠ Engram has no login — anyone on your network can view and control it.
+                                        Use only on a trusted home network. Takes effect after restarting Engram.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        {config.allowLanAccess && (
+                            <div className="lan-address-panel">
+                                {!networkInfo ? (
+                                    <div className="lan-loading">Detecting network address…</div>
+                                ) : networkInfo.active_lan_bound ? (
+                                    <>
+                                        <div className="lan-status-live">
+                                            <span className="lan-status-dot" />
+                                            Engram is live on your network
+                                        </div>
+                                        {networkInfo.lan_url && (
+                                            <>
+                                                <div className="lan-url-row">
+                                                    <code className="lan-url">{networkInfo.lan_url}</code>
+                                                    <button
+                                                        type="button"
+                                                        className="lan-copy-btn"
+                                                        onClick={() => {
+                                                            navigator.clipboard?.writeText(networkInfo.lan_url as string).catch(() => {
+                                                                // HTTP context (LAN): clipboard API unavailable; select text for manual copy
+                                                                const el = document.querySelector('.lan-url') as HTMLElement;
+                                                                if (el) window.getSelection()?.selectAllChildren(el);
+                                                            });
+                                                        }}
+                                                    >
+                                                        Copy
+                                                    </button>
+                                                </div>
+                                                <div className="lan-qr">
+                                                    <QRCodeSVG value={networkInfo.lan_url} size={120} />
+                                                </div>
+                                            </>
+                                        )}
+                                    </>
+                                ) : (
+                                    <>
+                                        <div className="lan-restart-notice">
+                                            Save settings and restart Engram to apply.
+                                        </div>
+                                        {networkInfo.lan_url && (
+                                            <>
+                                                <span className="form-hint">After restart, access Engram at:</span>
+                                                <div className="lan-url-row">
+                                                    <code className="lan-url">{networkInfo.lan_url}</code>
+                                                    <button
+                                                        type="button"
+                                                        className="lan-copy-btn"
+                                                        onClick={() => {
+                                                            navigator.clipboard?.writeText(networkInfo.lan_url as string).catch(() => {
+                                                                // HTTP context (LAN): clipboard API unavailable; select text for manual copy
+                                                                const el = document.querySelector('.lan-url') as HTMLElement;
+                                                                if (el) window.getSelection()?.selectAllChildren(el);
+                                                            });
+                                                        }}
+                                                    >
+                                                        Copy
+                                                    </button>
+                                                </div>
+                                                <div className="lan-qr lan-qr-pending">
+                                                    <QRCodeSVG value={networkInfo.lan_url} size={120} />
+                                                </div>
+                                            </>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                            </div>
+                        </details>
+
+                        {/* ── Notifications ───────────────────────────────────── */}
+                        <details className="wizard-group">
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Notifications
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <div className="form-group">
+                            <label htmlFor="discordWebhookUrl">
+                                Discord Webhook URL
+                                <SavedKeyBadge saved={savedKeys.discord} text="Configured" />
+                            </label>
+                            <input
+                                id="discordWebhookUrl"
+                                type="url"
+                                value={config.discordWebhookUrl}
+                                onChange={(e) => {
+                                    handleInputChange('discordWebhookUrl', e.target.value);
+                                    setWebhookTest({ status: 'idle' });
+                                }}
+                                placeholder="https://discord.com/api/webhooks/..."
+                            />
+                            <span className="form-hint">
+                                When a disc finishes (completed or failed), Engram posts a message to this channel.
+                                Create a webhook in your Discord server's channel settings under Integrations.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <SvActionButton
+                                tone="cyan"
+                                size="md"
+                                onClick={handleTestWebhook}
+                                disabled={webhookTest.status === 'testing'}
+                            >
+                                {webhookTest.status === 'testing' ? 'Sending...' : 'Send test message'}
+                            </SvActionButton>
+                            {webhookTest.status === 'ok' && (
+                                <span data-testid="webhook-test-status" style={{color: '#22c55e', fontSize: '0.85rem', marginLeft: '0.5rem'}}>✓ Sent</span>
+                            )}
+                            {webhookTest.status === 'invalid' && (
+                                <span data-testid="webhook-test-status" style={{color: '#ef4444', fontSize: '0.85rem', marginLeft: '0.5rem'}}>✗ {webhookTest.error}</span>
+                            )}
+                            {/* "Couldn't check" (network/endpoint failure) is distinct from 'invalid'
+                                (the server rejected the webhook): amber, not red, same distinction
+                                the TMDB and AI validators above make. */}
+                            {webhookTest.status === 'error' && (
+                                <span data-testid="webhook-test-status" style={{color: '#f59e0b', fontSize: '0.85rem', marginLeft: '0.5rem'}}>⚠ {webhookTest.error}</span>
+                            )}
+                            <span className="form-hint">
+                                Posts a sample notification to the saved webhook. If you just changed the URL above, save first.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="dashboardBaseUrl">Dashboard URL</label>
+                            <input
+                                id="dashboardBaseUrl"
+                                type="url"
+                                value={config.dashboardBaseUrl}
+                                onChange={(e) => handleInputChange('dashboardBaseUrl', e.target.value)}
+                                placeholder="http://192.168.1.50:5173"
+                            />
+                            <span className="form-hint">
+                                Where this dashboard is reachable on your network. When set, notifications link
+                                straight to the job, so a review ping is one tap from the review screen.
+                            </span>
+                        </div>
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.discordNotifyCompleted}
+                                    onChange={(e) => handleInputChange('discordNotifyCompleted', e.target.checked)}
+                                />
+                                <span className="checkbox-text">Notify when a disc completes</span>
+                            </label>
+                        </div>
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.discordNotifyFailed}
+                                    onChange={(e) => handleInputChange('discordNotifyFailed', e.target.checked)}
+                                />
+                                <span className="checkbox-text">Notify when a disc fails</span>
+                            </label>
+                        </div>
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.discordNotifyReview}
+                                    onChange={(e) => handleInputChange('discordNotifyReview', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    Notify when a disc needs review
+                                    <span className="checkbox-hint">
+                                        Engram pings the channel when a disc parks waiting for you, so a walk-away
+                                        rip does not stall silently.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        <div className="form-group checkbox-group">
+                            <label className="checkbox-label">
+                                <input
+                                    type="checkbox"
+                                    checked={config.discordNotifyRipped}
+                                    onChange={(e) => handleInputChange('discordNotifyRipped', e.target.checked)}
+                                />
+                                <span className="checkbox-text">
+                                    Notify when a disc finishes ripping
+                                    <span className="checkbox-hint">
+                                        Fires as soon as Engram is finished with the drive, before any
+                                        matching or review, whether or not auto-eject is on. The Status
+                                        field says whether the rip completed, stopped early, or was a
+                                        re-rip. Use this if you swap discs as they finish and review later.
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="discordMentionReview">Review Mention</label>
+                            <input
+                                id="discordMentionReview"
+                                type="text"
+                                value={config.discordMentionReview}
+                                onChange={(e) => handleInputChange('discordMentionReview', e.target.value)}
+                                placeholder="<@123456789012345678>"
+                            />
+                            <span className="form-hint">
+                                Sent alongside the review notification so Discord actually pushes it to your phone.
+                                Accepts {'<@userid>'}, {'<@&roleid>'}, or @here. Leave blank for no mention.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="discordTemplateCompleted">Completed Message</label>
+                            <textarea
+                                id="discordTemplateCompleted"
+                                value={config.discordTemplateCompleted}
+                                onChange={(e) => handleInputChange('discordTemplateCompleted', e.target.value)}
+                                placeholder="**{{title}}**"
+                                rows={2}
+                            />
+                            {discordTemplateErrors.completed && (
+                                <span style={{color: '#ef4444', fontSize: '0.85rem'}}>✗ {discordTemplateErrors.completed}</span>
+                            )}
+                            <span className="form-hint">
+                                Available variables: {'{{'}title{'}}'}, {'{{'}volume_label{'}}'}, {'{{'}drive_id{'}}'},{' '}
+                                {'{{'}disc_number{'}}'}, {'{{'}discdb_disc_slug{'}}'}, {'{{'}content_type{'}}'}, {'{{'}season{'}}'},{' '}
+                                {'{{'}episodes{'}}'}, {'{{'}state{'}}'}, {'{{'}tmdb_name{'}}'}, {'{{'}tmdb_year{'}}'},{' '}
+                                {'{{'}duration{'}}'}, {'{{'}subtitle_status{'}}'}, {'{{'}path{'}}'}, {'{{'}total_titles{'}}'}.{' '}
+                                {'{{'}drive{'}}'} still works but is a deprecated alias for {'{{'}volume_label{'}}'}.
+                                Disc name, season and episodes also appear automatically as fields, so a blank
+                                template still identifies the disc. Leave blank to use the default. Use triple braces
+                                ({'{{{'}var{'}}}'}) instead of double to avoid HTML-escaping characters like {'&'}, {'<'}, {'>'}.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="discordTemplateFailed">Failed Message</label>
+                            <textarea
+                                id="discordTemplateFailed"
+                                value={config.discordTemplateFailed}
+                                onChange={(e) => handleInputChange('discordTemplateFailed', e.target.value)}
+                                placeholder="**{{title}}**"
+                                rows={2}
+                            />
+                            {discordTemplateErrors.failed && (
+                                <span style={{color: '#ef4444', fontSize: '0.85rem'}}>✗ {discordTemplateErrors.failed}</span>
+                            )}
+                            <span className="form-hint">
+                                Same variables as above, plus {'{{'}error{'}}'} for the failure reason. Leave blank to use the default.
+                                Use triple braces ({'{{{'}var{'}}}'}) to avoid HTML-escaping.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="discordTemplateReview">Review Needed Message</label>
+                            <textarea
+                                id="discordTemplateReview"
+                                value={config.discordTemplateReview}
+                                onChange={(e) => handleInputChange('discordTemplateReview', e.target.value)}
+                                placeholder="**{{title}}**"
+                                rows={2}
+                            />
+                            {discordTemplateErrors.review && (
+                                <span style={{color: '#ef4444', fontSize: '0.85rem'}}>✗ {discordTemplateErrors.review}</span>
+                            )}
+                            <span className="form-hint">
+                                Same variables as above, plus {'{{'}review_reason{'}}'}. Leave blank to use the default.
+                            </span>
+                        </div>
+
+                        <div className="form-group">
+                            <label htmlFor="discordTemplateRipped">Finished Ripping Message</label>
+                            <textarea
+                                id="discordTemplateRipped"
+                                value={config.discordTemplateRipped}
+                                onChange={(e) => handleInputChange('discordTemplateRipped', e.target.value)}
+                                placeholder="**{{title}}**"
+                                rows={2}
+                            />
+                            {discordTemplateErrors.ripped && (
+                                <span style={{color: '#ef4444', fontSize: '0.85rem'}}>✗ {discordTemplateErrors.ripped}</span>
+                            )}
+                            <span className="form-hint">
+                                Same variables as above, plus {'{{'}rip_outcome{'}}'}, which reads Complete,
+                                Stopped early or Re-rip. Only that event fills it in. Leave blank to use the default.
+                            </span>
+                        </div>
+
+                            </div>
+                        </details>
+
+                        {/* ── Display ──────────────────────────────────────────── */}
+                        <details className="wizard-group" open>
+                            <summary>
+                                <span className="wizard-group-chevron">▸</span>Display
+                            </summary>
+                            <div className="wizard-group-body">
+
+                        <BackgroundEffectsSetting />
+
+                            </div>
+                        </details>
+
+                        <div className="config-summary">
+                            <h4>Configuration Summary</h4>
+                            <dl>
+                                <dt>Movies:</dt>
+                                <dd>{config.libraryMoviesPath || 'Not set'}</dd>
+                                <dt>TV Shows:</dt>
+                                <dd>{config.libraryTvPath || 'Not set'}</dd>
+                                <dt>MakeMKV Key:</dt>
+                                <dd>{config.makemkvKey ? 'New key entered' : (savedKeys.makemkv ? 'Configured' : 'Not set')}</dd>
+                                <dt>TMDB Token:</dt>
+                                <dd>{config.tmdbApiKey ? 'New token entered' : (savedKeys.tmdb ? 'Configured' : 'Not set')}</dd>
+                                {(config.aiApiKey || savedKeys.ai) && (
+                                    <>
+                                        <dt>AI Key:</dt>
+                                        <dd>{config.aiApiKey ? 'New key entered' : 'Configured'}</dd>
+                                    </>
+                                )}
+                            </dl>
+                        </div>
+                    </div>
+                );
+
+            default:
+                return null;
+        }
+    };
+
+    // Shared scrollable content pane — same in both modes, only the surrounding
+    // chrome (stepper vs. section nav) differs.
+    const wizardBody = (
+        <div
+            className="wizard-body"
+            ref={wizardBodyRef}
+        >
+            {isLoading ? (
+                <div className="wizard-loading">
+                    <div className="spinner-mini"></div>
+                    <span>Loading configuration...</span>
+                </div>
+            ) : (
+                renderStepContent()
+            )}
+        </div>
+    );
+
+    return (
+        <>
+        <div className="wizard-overlay" onClick={onClose} role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+            <div className="wizard-modal" onClick={(e) => e.stopPropagation()}>
+                <div className="modal-header">
+                    <h2 className="modal-title" id="wizard-title">{isOnboarding ? 'Setup Wizard' : 'Settings'}</h2>
+                    <button
+                        className="modal-close"
+                        onClick={onClose}
+                        aria-label={isOnboarding ? 'Close setup wizard' : 'Close settings'}
+                    >
+                        &times;
+                    </button>
+                </div>
+
+                {isOnboarding ? (
+                    <>
+                        {/* Onboarding: linear stepper showing first-run progress. */}
+                        <div className="wizard-progress">
+                            {Array.from({ length: totalSteps }, (_, i) => i + 1).map((s) => (
+                                <div
+                                    key={s}
+                                    className={`progress-step ${s === step ? 'active' : ''} ${s < step ? 'completed' : ''}`}
+                                    aria-label={`Step ${s}: ${STEP_LABELS[s - 1]}${s === step ? ' (current)' : ''}`}
+                                    aria-current={s === step ? 'step' : undefined}
+                                >
+                                    <span className="step-number">{s < step ? '✓' : s}</span>
+                                    <span className="step-label">{STEP_LABELS[s - 1]}</span>
+                                </div>
+                            ))}
+                        </div>
+                        {wizardBody}
+                    </>
+                ) : (
+                    /* Settings: jump-anywhere section list — no linear progression. */
+                    <div className="settings-main">
+                        <nav className="settings-nav" aria-label="Settings sections">
+                            {SETTINGS_SECTIONS.map((section) => (
+                                <button
+                                    key={section.key}
+                                    type="button"
+                                    className={`settings-nav-item ${step === section.step ? 'active' : ''}`}
+                                    aria-current={step === section.step ? 'page' : undefined}
+                                    onClick={() => setStep(section.step)}
+                                >
+                                    {section.label}
+                                </button>
+                            ))}
+                        </nav>
+                        {wizardBody}
+                    </div>
+                )}
+
+                <div className="wizard-actions">
+                    {step > 1 && isOnboarding && (
+                        <button className="btn-secondary" onClick={handleBack}>
+                            &larr; Back
+                        </button>
+                    )}
+
+                    {isOnboarding ? (
+                        <button
+                            className="btn-primary"
+                            onClick={handleNext}
+                            disabled={isSaving || !!discordTemplateErrors.completed || !!discordTemplateErrors.failed || !!discordTemplateErrors.review || !!discordTemplateErrors.ripped}
+                        >
+                            {step === totalSteps ? (isSaving ? 'Saving...' : 'Complete Setup') : 'Next →'}
+                        </button>
+                    ) : (
+                        <button
+                            className="btn-primary"
+                            onClick={handleSave}
+                            disabled={isSaving || !!discordTemplateErrors.completed || !!discordTemplateErrors.failed || !!discordTemplateErrors.review || !!discordTemplateErrors.ripped}
+                        >
+                            {isSaving ? 'Saving...' : 'Save Changes'}
+                        </button>
+                    )}
+                </div>
+            </div>
+        </div>
+
+        {showBootstrapFlow && (
+            <BootstrapLibraryFlow onClose={() => setShowBootstrapFlow(false)} />
+        )}
+    </>
+    );
+}
+
+export default ConfigWizard;

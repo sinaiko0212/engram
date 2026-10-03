@@ -1,0 +1,791 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
+import { motion } from "motion/react";
+import { IcoLibrary, IcoFilter, IcoError, IcoDisc } from "../app/components/icons";
+import { SvPanel, sv } from "../app/components/synapse";
+import { formatBytesScaled as fmtBytes } from "../utils/formatting";
+import {
+  browseDir,
+  previewImport,
+  startImport,
+  type BlockedUnit,
+  type BrowseEntry,
+  type PreviewDiscImage,
+  type ImportStartResult,
+  type PreviewResult,
+} from "../api/client";
+
+interface Props {
+  onClose: () => void;
+  defaultPath: string;
+  defaultDestinationMode: "library" | "in_place";
+}
+
+export default function ImportModal({ onClose, defaultPath, defaultDestinationMode }: Props) {
+  const [cwd, setCwd] = useState<string | null>(null);
+  const [parent, setParent] = useState<string | null>(null);
+  const [entries, setEntries] = useState<BrowseEntry[]>([]);
+  const [roots, setRoots] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const [destMode, setDestMode] = useState<"library" | "in_place">(defaultDestinationMode);
+  const [error, setError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  // Set when a start attempt came back with blocked units. Holds the modal open
+  // so the user can act on them instead of the modal closing on a silent skip.
+  const [conflict, setConflict] = useState<ImportStartResult | null>(null);
+  const [pathInput, setPathInput] = useState(defaultPath || "");
+  const [landmark, setLandmark] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cwdRef = useRef<string | null>(null);
+  // Job ids started by this modal session (across possibly multiple
+  // runImport calls on the same folder). An in_flight block whose job_ids are
+  // all in this set is a job we ourselves just started, not a real conflict.
+  const startedJobIds = useRef<Set<number>>(new Set());
+  // Monotonic request tokens so a slow earlier click can't overwrite the state
+  // of a later one (navigate and choose fire together per directory click).
+  const navSeq = useRef(0);
+  const chooseSeq = useRef(0);
+  // Set once the user edits the path field, cleared when they submit it. Guards
+  // the cwd sync below; a ref, not state, since it must not trigger a re-render
+  // and must be readable in the same commit that applies a new cwd.
+  const pathDirty = useRef(false);
+
+  // Returns false when the browse failed OR was superseded by a newer navigation.
+  // Only the failure case surfaces an error notice; callers must not chain a
+  // preview off a false return either way.
+  const navigate = useCallback(async (path: string): Promise<boolean> => {
+    const seq = ++navSeq.current;
+    setError(null);
+    // Any navigation (a row click, .., a typed submit) is a fresh location
+    // gesture, so hand the field back to the cwd sync. If the user resumes
+    // typing before the browse resolves, onChange re-dirties it and their text
+    // is preserved.
+    pathDirty.current = false;
+    try {
+      const res = await browseDir(path);
+      if (seq !== navSeq.current) return false; // a newer navigation superseded this one
+      const prev = cwdRef.current;
+      cwdRef.current = res.cwd;
+      setLandmark(prev && res.entries.some((e) => e.path === prev) ? prev : null);
+      setCwd(res.cwd);
+      setParent(res.parent);
+      setEntries(res.entries);
+      setRoots(res.roots);
+      return true;
+    } catch (e) {
+      if (seq === navSeq.current) {
+        setError(e instanceof Error ? e.message : "Could not read directory");
+      }
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    navigate(defaultPath || "");
+  }, [navigate, defaultPath]);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
+  // Keep the field showing the current directory, but never overwrite text the
+  // user is actively typing: a slow browse can resolve mid-keystroke.
+  useEffect(() => {
+    if (cwd && !pathDirty.current) setPathInput(cwd);
+  }, [cwd]);
+
+  const choose = useCallback(async (path: string) => {
+    const seq = ++chooseSeq.current;
+    setSelected(path);
+    setPreview(null);
+    setError(null);
+    setConflict(null);
+    startedJobIds.current = new Set();
+    try {
+      const result = await previewImport(path);
+      if (seq !== chooseSeq.current) return; // a newer selection superseded this one
+      setPreview(result);
+    } catch (e) {
+      if (seq === chooseSeq.current) {
+        setError(e instanceof Error ? e.message : "Could not scan folder");
+      }
+    }
+  }, []);
+
+  const submitPath = useCallback(
+    async (e: FormEvent) => {
+      e.preventDefault();
+      const target = pathInput.trim();
+      if (!target) return;
+      // Mirrors the directory-click gesture: browse into it, and preview it.
+      // Only preview if the browse resolved, so one typo yields one error.
+      // navigate() clears the dirty flag; on a failed browse cwd never changes,
+      // so no sync fires and the bad text stays for the user to fix.
+      if (await navigate(target)) await choose(target);
+    },
+    [pathInput, navigate, choose],
+  );
+
+  const runImport = useCallback(
+    async (forceKeys: string[]) => {
+      if (!selected) return;
+      setStarting(true);
+      setError(null);
+      try {
+        const res = await startImport(selected, destMode, forceKeys);
+        for (const id of res.job_ids) startedJobIds.current.add(id);
+        // A block is only a genuine conflict if it isn't fully covered by jobs
+        // this session already started: a rescan during a forced re-import can
+        // reclassify a job we just kicked off (still IDENTIFYING) as in_flight,
+        // reporting our own success back to us as a conflict.
+        const unresolved = res.blocked.filter(
+          (b) =>
+            !(b.reason === "in_flight" && b.job_ids.every((id) => startedJobIds.current.has(id))),
+        );
+        if (unresolved.length === 0) {
+          onClose();
+          return;
+        }
+        setConflict({ ...res, blocked: unresolved });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Import failed to start");
+      } finally {
+        setStarting(false);
+      }
+    },
+    [selected, destMode, onClose],
+  );
+
+  const onStart = useCallback(() => {
+    if (!preview || preview.total_jobs === 0) return;
+    setConflict(null);
+    void runImport([]);
+  }, [preview, runImport]);
+
+  // Only already_imported units are forceable. in_flight blocks are excluded here
+  // and have no button, because a second job would race the live one.
+  const onForce = useCallback(() => {
+    const keys = (conflict?.blocked ?? [])
+      .filter((b) => b.reason === "already_imported")
+      .map((b) => b.unit_key);
+    if (keys.length > 0) void runImport(keys);
+  }, [conflict, runImport]);
+
+  // Optional on the type only for tolerance of an older backend; the current
+  // one always sends the key.
+  const discImages: PreviewDiscImage[] = preview?.disc_images ?? [];
+
+  const seasonsByShow = (p: PreviewResult) => {
+    const map = new Map<string, typeof p.units>();
+    for (const u of p.units) {
+      const key = u.show_name ?? "Unknown";
+      map.set(key, [...(map.get(key) ?? []), u]);
+    }
+    return [...map.entries()];
+  };
+
+  return (
+    <motion.div
+      ref={dialogRef}
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ outline: "none" }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      onKeyDown={(e) => e.key === "Escape" && onClose()}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Import media"
+    >
+      <motion.div
+        className="absolute inset-0"
+        style={{ background: `${sv.bg0}d9`, backdropFilter: "blur(4px)" }}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        onClick={onClose}
+        data-testid="import-backdrop"
+      />
+      {/* min() so the 82vh cap always wins on short viewports: a bare
+          minHeight: 340 would beat max-height below ~415px tall and re-overflow. */}
+      <motion.div
+        className="relative w-full"
+        style={{ maxWidth: 820, maxHeight: "82vh", minHeight: "min(340px, 82vh)", display: "flex" }}
+        initial={{ opacity: 0, scale: 0.96, y: 16 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.96, y: 16 }}
+        transition={{ type: "spring", stiffness: 400, damping: 30 }}
+      >
+        <SvPanel
+          glow
+          pad={0}
+          testid="import-panel"
+          style={{
+            background: sv.bg1,
+            display: "flex",
+            flexDirection: "column",
+            flex: 1,
+            minHeight: 0,
+          }}
+        >
+          {/* Header */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "14px 18px",
+              borderBottom: `1px solid ${sv.line}`,
+              flexShrink: 0,
+            }}
+          >
+            <IcoLibrary size={18} color={sv.cyan} />
+            <span
+              style={{
+                fontFamily: sv.mono,
+                fontWeight: 700,
+                letterSpacing: "0.2em",
+                fontSize: 13,
+                color: sv.cyanHi,
+              }}
+            >
+              IMPORT MEDIA
+            </span>
+            <button
+              onClick={onClose}
+              aria-label="Close"
+              data-testid="import-close-btn"
+              style={{
+                marginLeft: "auto",
+                background: "transparent",
+                border: "none",
+                color: sv.inkDim,
+                cursor: "pointer",
+                fontSize: 16,
+              }}
+            >
+              ✕
+            </button>
+          </div>
+
+          <form
+            onSubmit={submitPath}
+            data-testid="import-path-form"
+            style={{
+              display: "flex",
+              gap: 6,
+              padding: "8px 12px",
+              borderBottom: `1px solid ${sv.line}`,
+              flexShrink: 0,
+            }}
+          >
+            <input
+              data-testid="import-path-input"
+              value={pathInput}
+              onChange={(e) => {
+                pathDirty.current = true;
+                setPathInput(e.target.value);
+              }}
+              spellCheck={false}
+              aria-label="Path"
+              placeholder="Type or paste a folder path"
+              style={{
+                flex: 1,
+                minWidth: 0,
+                fontFamily: sv.mono,
+                fontSize: 11,
+                padding: "5px 8px",
+                background: sv.bg0,
+                border: `1px solid ${sv.lineMid}`,
+                color: sv.ink,
+                outline: "none",
+              }}
+            />
+            <button
+              type="submit"
+              data-testid="import-path-go"
+              style={{
+                fontFamily: sv.mono,
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: "0.1em",
+                padding: "5px 12px",
+                border: `1px solid ${sv.cyan}`,
+                background: "transparent",
+                color: sv.cyan,
+                cursor: "pointer",
+              }}
+            >
+              GO
+            </button>
+          </form>
+
+          <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+            {/* Left: navigator */}
+            <div
+              style={{
+                width: "46%",
+                borderRight: `1px solid ${sv.line}`,
+                display: "flex",
+                flexDirection: "column",
+                minHeight: 0,
+              }}
+            >
+              <div data-testid="import-nav-list" style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+                {parent !== null && (
+                  <Row label=".." onClick={() => navigate(parent)} kind="dir" />
+                )}
+                {roots.map((r) => (
+                  <Row key={r} label={r} onClick={() => navigate(r)} kind="dir" />
+                ))}
+                {entries.map((e) => (
+                  <Row
+                    key={e.path}
+                    label={e.name}
+                    count={e.type === "dir" ? e.mkv_count : undefined}
+                    kind={e.type}
+                    active={selected === e.path || landmark === e.path}
+                    scrollTo={landmark === e.path}
+                    onClick={() =>
+                      e.type === "dir"
+                        ? (navigate(e.path), choose(e.path))
+                        : choose(e.path)
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Right: preview */}
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+              <div
+                style={{
+                  padding: "8px 14px",
+                  fontFamily: sv.mono,
+                  fontSize: 9,
+                  letterSpacing: "0.2em",
+                  color: sv.inkFaint,
+                  borderBottom: `1px solid ${sv.line}`,
+                }}
+              >
+                PREVIEW
+              </div>
+              <div style={{ flex: 1, overflow: "auto", padding: 14, minHeight: 0 }}>
+                {!preview && (
+                  <p style={{ fontFamily: sv.mono, fontSize: 11, color: sv.inkFaint }}>
+                    Select a folder or file to preview.
+                  </p>
+                )}
+                {preview && preview.total_jobs === 0 && (
+                  <p style={{ fontFamily: sv.mono, fontSize: 11, color: sv.inkDim }}>
+                    No MKV files or disc backups found here.
+                  </p>
+                )}
+                {discImages.length > 0 && (
+                  <div style={{ marginBottom: 12 }} data-testid="import-disc-images">
+                    <div
+                      style={{
+                        fontFamily: sv.mono,
+                        fontSize: 13,
+                        color: sv.magenta,
+                        marginBottom: 4,
+                      }}
+                    >
+                      Disc backups
+                    </div>
+                    {discImages.map((d) => (
+                      <div
+                        key={d.path}
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          fontFamily: sv.mono,
+                          fontSize: 11,
+                          color: sv.inkDim,
+                          padding: "3px 0",
+                        }}
+                      >
+                        <IcoDisc size={11} color={sv.magenta} />
+                        <span
+                          style={{
+                            flex: 1,
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {d.name}
+                        </span>
+                        <span>{d.kind === "iso" ? "ISO" : "BACKUP"}</span>
+                        <span>{fmtBytes(d.total_bytes)}</span>
+                        <span style={{ color: sv.magenta }}>1 job</span>
+                      </div>
+                    ))}
+                    {/* An MKV import files what has already been ripped; a disc
+                        backup import starts a full extraction, which is a far
+                        longer operation. Say so before START is pressed. */}
+                    <p
+                      style={{
+                        fontFamily: sv.mono,
+                        fontSize: 10,
+                        lineHeight: 1.5,
+                        color: sv.inkFaint,
+                        margin: "6px 0 0 0",
+                      }}
+                    >
+                      Disc backups are scanned and extracted like a disc in the drive, not
+                      filed as-is. Expect a full rip per backup, not a quick move.
+                    </p>
+                  </div>
+                )}
+                {preview &&
+                  seasonsByShow(preview).map(([show, units]) => (
+                    <div key={show} style={{ marginBottom: 12 }}>
+                      <div
+                        style={{
+                          fontFamily: sv.mono,
+                          fontSize: 13,
+                          color: sv.cyanHi,
+                          marginBottom: 4,
+                        }}
+                      >
+                        {show}
+                      </div>
+                      {units.map((u, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            display: "flex",
+                            gap: 8,
+                            fontFamily: sv.mono,
+                            fontSize: 11,
+                            color: sv.inkDim,
+                            padding: "3px 0",
+                          }}
+                        >
+                          <span style={{ width: 90 }}>
+                            {u.season != null ? `SEASON ${u.season}` : "ALL SEASONS"}
+                          </span>
+                          <span style={{ flex: 1 }}>{u.file_count} files</span>
+                          <span style={{ color: sv.cyan }}>1 job</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+
+                {preview && preview.loose_files.length > 0 && (
+                  <Notice
+                    text={`${preview.loose_files.length} loose file(s) have no Season folder; they will match across all seasons.`}
+                  />
+                )}
+                {preview?.truncated && (
+                  <Notice text="This folder is very large; only part of it was scanned." />
+                )}
+                {error && <Notice text={error} tone="error" />}
+                {conflict && (
+                  <ConflictPanel result={conflict} onForce={onForce} busy={starting} />
+                )}
+              </div>
+
+              {/* Destination */}
+              <div
+                style={{ padding: "10px 14px", borderTop: `1px solid ${sv.line}`, flexShrink: 0 }}
+              >
+                <div
+                  style={{
+                    fontFamily: sv.mono,
+                    fontSize: 9,
+                    letterSpacing: "0.15em",
+                    color: sv.inkFaint,
+                    marginBottom: 6,
+                  }}
+                >
+                  DESTINATION
+                </div>
+                <div style={{ display: "flex" }}>
+                  {(["library", "in_place"] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setDestMode(m)}
+                      style={{
+                        fontFamily: sv.mono,
+                        fontSize: 10,
+                        padding: "5px 11px",
+                        cursor: "pointer",
+                        border: `1px solid ${sv.lineMid}`,
+                        background: destMode === m ? sv.cyan : "transparent",
+                        color: destMode === m ? sv.bg0 : sv.inkDim,
+                        fontWeight: destMode === m ? 700 : 400,
+                        marginRight: m === "library" ? -1 : 0,
+                      }}
+                    >
+                      {m === "library" ? "Organize into library" : "Organize in place"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Footer */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "12px 16px",
+              borderTop: `1px solid ${sv.line}`,
+              flexShrink: 0,
+            }}
+          >
+            <span style={{ fontFamily: sv.mono, fontSize: 10, color: sv.inkFaint }}>
+              {preview
+                ? `${preview.total_jobs} jobs · ${preview.total_files} files${
+                    discImages.length > 0 ? ` · ${discImages.length} disc backup${discImages.length === 1 ? "" : "s"}` : ""
+                  } · ${fmtBytes(preview.total_bytes)}`
+                : ""}
+            </span>
+            <button
+              onClick={onClose}
+              style={{
+                marginLeft: "auto",
+                fontFamily: sv.mono,
+                fontSize: 10,
+                padding: "7px 14px",
+                border: `1px solid ${sv.lineMid}`,
+                background: "transparent",
+                color: sv.inkDim,
+                cursor: "pointer",
+              }}
+            >
+              CANCEL
+            </button>
+            <button
+              onClick={onStart}
+              disabled={!preview || preview.total_jobs === 0 || starting}
+              data-testid="import-start-btn"
+              style={{
+                fontFamily: sv.mono,
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: "0.1em",
+                padding: "7px 16px",
+                border: `1px solid ${sv.cyan}`,
+                background:
+                  !preview || preview.total_jobs === 0 || starting ? "transparent" : sv.cyan,
+                color: !preview || preview.total_jobs === 0 || starting ? sv.inkFaint : sv.bg0,
+                cursor:
+                  !preview || preview.total_jobs === 0 || starting ? "not-allowed" : "pointer",
+              }}
+            >
+              {starting
+                ? "STARTING…"
+                : `START IMPORT${preview && preview.total_jobs ? ` · ${preview.total_jobs} JOBS` : ""}`}
+            </button>
+          </div>
+        </SvPanel>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+/**
+ * A disc backup is not a folder of media, so it does not get the folder icon or
+ * an "N mkv" count (it has none). It gets the disc mark in magenta plus a short
+ * kind tag, so a shelf of backups is distinguishable at a glance from the
+ * season folders sitting next to it.
+ */
+const DISC_ROW_TAG: Record<string, string> = { disc_image: "disc backup", iso: "iso" };
+
+function Row({
+  label,
+  count,
+  kind,
+  active,
+  scrollTo,
+  onClick,
+}: {
+  label: string;
+  count?: number;
+  kind: BrowseEntry["type"];
+  active?: boolean;
+  scrollTo?: boolean;
+  onClick: () => void;
+}) {
+  const ref = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (scrollTo) ref.current?.scrollIntoView({ block: "center" });
+  }, [scrollTo]);
+
+  return (
+    <button
+      ref={ref}
+      onClick={onClick}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        width: "100%",
+        textAlign: "left",
+        padding: "8px 12px",
+        fontFamily: sv.mono,
+        fontSize: 11,
+        color: active ? sv.cyanHi : sv.inkDim,
+        background: active ? `${sv.cyan}14` : "transparent",
+        border: "none",
+        borderBottom: `1px solid ${sv.line}`,
+        boxShadow: active ? `inset 2px 0 0 ${sv.cyan}` : "none",
+        cursor: "pointer",
+      }}
+    >
+      {DISC_ROW_TAG[kind] ? (
+        <IcoDisc size={12} color={sv.magenta} className="import-disc-icon" />
+      ) : (
+        <IcoFilter size={12} color={kind === "mkv" ? sv.inkFaint : sv.cyan} />
+      )}
+      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {label}
+      </span>
+      {DISC_ROW_TAG[kind] && (
+        <span style={{ fontSize: 9, color: sv.magenta, letterSpacing: "0.1em" }}>
+          {DISC_ROW_TAG[kind]}
+        </span>
+      )}
+      {count != null && count > 0 && (
+        <span style={{ fontSize: 9, color: sv.cyan }}>{count} mkv</span>
+      )}
+    </button>
+  );
+}
+
+function Notice({ text, tone = "warn" }: { text: string; tone?: "warn" | "error" }) {
+  const color = tone === "error" ? sv.red : sv.yellow;
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 8,
+        alignItems: "flex-start",
+        marginTop: 10,
+        padding: "8px 10px",
+        border: `1px solid ${color}4d`,
+        background: `${color}14`,
+      }}
+    >
+      <IcoError size={14} color={color} style={{ flexShrink: 0, marginTop: 1 }} />
+      <span style={{ fontFamily: sv.mono, fontSize: 10, color, lineHeight: 1.5 }}>{text}</span>
+    </div>
+  );
+}
+
+/**
+ * Blocked-unit report shown in place of closing the modal.
+ *
+ * Deliberately an inline panel rather than a nested modal: a dismissed modal in
+ * this app can leave a stuck opacity-0 overlay that swallows clicks under
+ * automation, and nesting one here would put that hazard directly in the path of
+ * this feature's E2E test.
+ */
+function ConflictPanel({
+  result,
+  onForce,
+  busy,
+}: {
+  result: ImportStartResult;
+  onForce: () => void;
+  busy: boolean;
+}) {
+  const soft = result.blocked.filter((b) => b.reason === "already_imported");
+  const hard = result.blocked.filter((b) => b.reason === "in_flight");
+  const total = result.job_ids.length + result.blocked.length;
+
+  const label = (b: BlockedUnit) =>
+    `${b.show_name ?? "Unknown"}${b.season != null ? ` · Season ${b.season}` : ""}`;
+
+  const heading = (text: string) => (
+    <div
+      style={{
+        fontFamily: sv.mono,
+        fontSize: 9,
+        letterSpacing: "0.15em",
+        color: sv.inkFaint,
+        marginTop: 8,
+        marginBottom: 4,
+      }}
+    >
+      {text}
+    </div>
+  );
+
+  const row = (b: BlockedUnit, text: string) => (
+    <div key={b.unit_key} style={{ padding: "2px 0" }}>
+      <div style={{ fontFamily: sv.mono, fontSize: 11, color: sv.inkDim }}>{text}</div>
+      <div
+        style={{
+          fontFamily: sv.mono,
+          fontSize: 9,
+          color: sv.inkFaint,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {b.display_path}
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      data-testid="import-conflict-panel"
+      style={{
+        marginTop: 10,
+        padding: "10px 12px",
+        border: `1px solid ${sv.yellow}4d`,
+        background: `${sv.yellow}14`,
+      }}
+    >
+      {result.job_ids.length > 0 && (
+        <div style={{ fontFamily: sv.mono, fontSize: 11, color: sv.yellow }}>
+          Started {result.job_ids.length} of {total}.
+        </div>
+      )}
+
+      {hard.length > 0 && (
+        <>
+          {heading("ALREADY PROCESSING")}
+          {hard.map((b) => row(b, `${label(b)} (job ${b.job_ids.join(", ")})`))}
+        </>
+      )}
+
+      {soft.length > 0 && (
+        <>
+          {heading("PREVIOUSLY IMPORTED")}
+          {soft.map((b) => row(b, label(b)))}
+          <button
+            onClick={onForce}
+            disabled={busy}
+            data-testid="import-force-btn"
+            style={{
+              marginTop: 8,
+              fontFamily: sv.mono,
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: "0.1em",
+              padding: "6px 12px",
+              border: `1px solid ${sv.yellow}`,
+              background: "transparent",
+              color: sv.yellow,
+              cursor: busy ? "not-allowed" : "pointer",
+            }}
+          >
+            RE-IMPORT ANYWAY
+          </button>
+        </>
+      )}
+    </div>
+  );
+}

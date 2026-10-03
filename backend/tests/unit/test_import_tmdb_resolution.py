@@ -1,0 +1,410 @@
+"""Regression tests: imports / generic-label jobs must resolve a missing ``tmdb_id``.
+
+Bug: a watch-folder import derives show + season from the folder tree, but the
+identify-time TMDB lookup is gated on the (nameless) volume label ("SEASON_3"),
+so ``job.tmdb_id`` was persisted as null. Since the subtitle/reference cache is
+keyed by tmdb_id (#288), a null id sent the matcher to a non-existent name-keyed
+directory (``cache/data/Seinfeld``) instead of ``cache/data/1400`` -> "No reference
+subtitle files found" -> every track degraded to a filename guess and went to
+review. ``identify_from_staging`` (and ``set_name_and_resume``) must resolve and
+persist the id from the known title, while still leaving same-name twins (Frasier
+1993 vs 2023) for review.
+
+The coordinator is driven directly with its DB / IO collaborators stubbed; the
+in-memory engine comes from the autouse ``isolate_database`` fixture, which does
+NOT patch ``identification_coordinator.async_session`` — this module redirects it,
+plus the TMDB resolver (``classify_from_tmdb``) and config loader.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock
+
+import pytest
+
+import app.services.identification_coordinator as idc_mod
+from app.models import DiscJob, JobState
+from app.models.disc_job import ContentType
+from app.services.event_broadcaster import EventBroadcaster
+from app.services.job_state_machine import JobStateMachine
+from tests.unit.conftest import _unit_session_factory
+
+
+def _fake_analysis(detected_name: str = "Seinfeld") -> SimpleNamespace:
+    """Classification result for a generic-label import: title/season known, id null."""
+    return SimpleNamespace(
+        content_type=ContentType.TV,
+        detected_name=detected_name,
+        detected_season=3,
+        confidence=0.95,
+        classification_source="staging_import",
+        tmdb_id=None,
+        tmdb_name=detected_name,
+        is_ambiguous_movie=False,
+        play_all_title_indices=None,
+        review_reason="Same-name collision",
+        _tmdb_signal=None,
+    )
+
+
+def _confident_signal() -> SimpleNamespace:
+    """A confident single TMDB match (no same-name twins). ``all_candidates`` carries
+    the show's own year so ``_resolve_show_year`` short-circuits without a network call."""
+    return SimpleNamespace(
+        content_type=ContentType.TV,
+        confidence=0.85,
+        tmdb_id=1400,
+        tmdb_name="Seinfeld",
+        ambiguous_identity=False,
+        candidates=[],
+        all_candidates=[{"tmdb_id": 1400, "name": "Seinfeld", "year": "1989", "popularity": 80.0}],
+    )
+
+
+def _ambiguous_signal() -> SimpleNamespace:
+    """A same-name collision (Frasier 1993 vs 2023) — must NOT be auto-picked."""
+    return SimpleNamespace(
+        content_type=ContentType.TV,
+        confidence=0.60,
+        tmdb_id=3452,
+        tmdb_name="Frasier",
+        ambiguous_identity=True,
+        candidates=[
+            {"tmdb_id": 3452, "name": "Frasier", "year": "1993"},
+            {"tmdb_id": 195241, "name": "Frasier", "year": "2023"},
+        ],
+        all_candidates=[
+            {"tmdb_id": 3452, "name": "Frasier", "year": "1993", "popularity": 30.0},
+            {"tmdb_id": 195241, "name": "Frasier", "year": "2023", "popularity": 20.0},
+        ],
+    )
+
+
+def _make_staging(tmp_path, count: int):
+    staging_dir = tmp_path / "Season 3"
+    staging_dir.mkdir()
+    for i in range(count):
+        (staging_dir / f"{i:02d}.mkv").write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 1024)
+    return staging_dir
+
+
+async def _make_import_job(staging_path: str, volume_label: str) -> int:
+    async with _unit_session_factory() as session:
+        job = DiscJob(
+            drive_id="import",
+            volume_label=volume_label,
+            staging_path=staging_path,
+            state=JobState.IDENTIFYING,
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        return job.id
+
+
+def _build_coordinator(analysis, monkeypatch, *, signal):
+    """Wire an IdentificationCoordinator with DB / IO / TMDB collaborators stubbed."""
+    broadcaster_ws = AsyncMock()
+    broadcaster = EventBroadcaster(broadcaster_ws)
+    state_machine = JobStateMachine(broadcaster)
+
+    coordinator = idc_mod.IdentificationCoordinator(
+        analyst=MagicMock(),
+        extractor=MagicMock(),
+        event_broadcaster=broadcaster,
+        state_machine=state_machine,
+    )
+
+    coordinator._run_classification = AsyncMock(return_value=analysis)
+    coordinator._match_single_file = AsyncMock(return_value=None)
+    coordinator._on_match_task_done = Mock()
+    coordinator._finalize_disc_job = AsyncMock(return_value=None)
+    coordinator._start_subtitle_download = Mock()
+
+    module_ws = AsyncMock()
+    monkeypatch.setattr(idc_mod, "async_session", _unit_session_factory)
+    monkeypatch.setattr(idc_mod, "ws_manager", module_ws)
+    # raising=False: the production import promotes classify_from_tmdb to a module
+    # attribute as part of the fix; keep the patch valid in the pre-fix (RED) run.
+    monkeypatch.setattr(
+        idc_mod, "classify_from_tmdb", MagicMock(return_value=signal), raising=False
+    )
+    monkeypatch.setattr(
+        "app.services.config_service.get_config",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                tmdb_api_key="testkey",
+                # The resume path routes through next_state_after_identify,
+                # which reads both backup fields off the config.
+                backup_before_rip=False,
+                backup_path="",
+            )
+        ),
+    )
+
+    return coordinator, broadcaster_ws, module_ws
+
+
+@pytest.mark.asyncio
+async def test_import_resolves_missing_tmdb_id_and_keys_subtitles(tmp_path, monkeypatch):
+    """A generic-label TV import resolves its tmdb_id from the folder-derived title,
+    persists it, and keys the subtitle download on the real id (1400) — so the matcher
+    reads ``cache/data/1400`` instead of the empty name-keyed dir."""
+    staging = _make_staging(tmp_path, count=3)
+    coordinator, _bw, _mw = _build_coordinator(
+        _fake_analysis(), monkeypatch, signal=_confident_signal()
+    )
+    job_id = await _make_import_job(str(staging), "SEASON_3")
+
+    await coordinator.identify_from_staging(job_id)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.tmdb_id == 1400  # resolved, not left null
+        assert job.state == JobState.MATCHING
+
+    coordinator._start_subtitle_download.assert_called_once_with(job_id, "Seinfeld", 3, 1400)
+
+
+@pytest.mark.asyncio
+async def test_import_ambiguous_show_stays_null_and_routes_to_review(tmp_path, monkeypatch):
+    """A same-name twin (Frasier 1993 vs 2023) must NOT be auto-resolved: tmdb_id stays
+    null and the job routes to review for the user to disambiguate (#287 safety)."""
+    staging = _make_staging(tmp_path, count=3)
+    coordinator, _bw, _mw = _build_coordinator(
+        _fake_analysis(detected_name="Frasier"), monkeypatch, signal=_ambiguous_signal()
+    )
+    job_id = await _make_import_job(str(staging), "SEASON_1")
+
+    await coordinator.identify_from_staging(job_id)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.tmdb_id is None  # never auto-picked
+        assert job.state == JobState.REVIEW_NEEDED
+
+    coordinator._start_subtitle_download.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_name_and_resume_resolves_tmdb_id(tmp_path, monkeypatch):
+    """The generic-label disc path (user names an unreadable disc) has the identical
+    bug: ``set_name_and_resume`` must resolve+persist the id for the provided name."""
+    coordinator, _bw, _mw = _build_coordinator(
+        _fake_analysis(), monkeypatch, signal=_confident_signal()
+    )
+    async with _unit_session_factory() as session:
+        job = DiscJob(
+            drive_id="E:",
+            volume_label="SEASON_3",
+            state=JobState.REVIEW_NEEDED,
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        job_id = job.id
+
+    await coordinator.set_name_and_resume(job_id, "Seinfeld", "tv", season=3)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.tmdb_id == 1400
+        assert job.detected_title == "Seinfeld"
+        assert job.state == JobState.RIPPING
+
+
+@pytest.mark.asyncio
+async def test_import_tmdb_resolution_failure_proceeds_with_null_id(tmp_path, monkeypatch):
+    """A transient TMDB failure during resolution must NOT fail the import — the job
+    proceeds (to MATCHING) with a null tmdb_id, treating it as a recoverable error
+    (log warning, continue) per project convention, not a fatal one."""
+    staging = _make_staging(tmp_path, count=2)
+    coordinator, _bw, _mw = _build_coordinator(_fake_analysis(), monkeypatch, signal=None)
+    # classify_from_tmdb raises (network timeout / HTTP error / bad payload).
+    monkeypatch.setattr(
+        idc_mod,
+        "classify_from_tmdb",
+        MagicMock(side_effect=RuntimeError("TMDB unreachable")),
+        raising=False,
+    )
+    job_id = await _make_import_job(str(staging), "SEASON_3")
+
+    await coordinator.identify_from_staging(job_id)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.tmdb_id is None  # resolution swallowed the error
+        assert job.state == JobState.MATCHING  # import still proceeded, not FAILED
+
+
+@pytest.mark.asyncio
+async def test_resolve_missing_tmdb_id_prefers_tv_for_box_set(monkeypatch):
+    """The resume/import rescue path pins a TV job's lookup to the TV namespace.
+
+    An over-specified TV title ("Avatar: The Last Airbender Book One: Water")
+    resolves on TMDB to BOTH the canonical series and a fuzzy movie. Without a
+    namespace preference _resolve_missing_tmdb_id would adopt the movie id
+    (980431) — it doesn't check that the signal's content type matches the job's.
+    For a TV job it now requests the TV namespace and lands TMDB TV id 246.
+    (Avatar box-set regression.)"""
+    coordinator = idc_mod.IdentificationCoordinator.__new__(idc_mod.IdentificationCoordinator)
+
+    tv_signal = SimpleNamespace(
+        content_type=ContentType.TV,
+        confidence=0.85,
+        tmdb_id=246,
+        tmdb_name="Avatar: The Last Airbender",
+        ambiguous_identity=False,
+        candidates=[],
+        all_candidates=[
+            {
+                "tmdb_id": 246,
+                "name": "Avatar: The Last Airbender",
+                "year": "2005",
+                "popularity": 80.0,
+            }
+        ],
+    )
+    movie_signal = SimpleNamespace(
+        content_type=ContentType.MOVIE,
+        confidence=0.70,
+        tmdb_id=980431,
+        tmdb_name="Avatar Aang: The Last Airbender",
+        ambiguous_identity=False,
+        candidates=[],
+        all_candidates=None,
+    )
+
+    seen_prefers = []
+
+    def fake_classify(name, api_key, prefer_content_type=None):
+        seen_prefers.append(prefer_content_type)
+        return tv_signal if prefer_content_type == ContentType.TV else movie_signal
+
+    monkeypatch.setattr(idc_mod, "classify_from_tmdb", fake_classify, raising=False)
+    monkeypatch.setattr(
+        "app.services.config_service.get_config",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                tmdb_api_key="testkey",
+                # The resume path routes through next_state_after_identify,
+                # which reads both backup fields off the config.
+                backup_before_rip=False,
+                backup_path="",
+            )
+        ),
+    )
+
+    job = SimpleNamespace(
+        id=1,
+        tmdb_id=None,
+        detected_title="Avatar: The Last Airbender Book One: Water",
+        content_type=ContentType.TV,
+        volume_label="AVATAR_BOOK_1_DISC_1",
+        tmdb_name=None,
+        tmdb_year=None,
+        candidates_json=None,
+        tmdb_degraded_reason=None,
+    )
+
+    await coordinator._resolve_missing_tmdb_id(job)
+
+    assert job.tmdb_id == 246  # the series, not the fuzzy movie (980431)
+    assert ContentType.TV in seen_prefers
+
+
+# --- The resolved TMDB name, not the folder name, names the show (#667) ---------
+# Matching keys on tmdb_id, so a folder named "Psych Season 3" matched Psych
+# correctly while the library was filed under "TV/Psych Season 3/", because every
+# organize call site reads detected_title and the import left the folder name there.
+
+
+def _psych_signal() -> SimpleNamespace:
+    return SimpleNamespace(
+        content_type=ContentType.TV,
+        confidence=0.85,
+        tmdb_id=1447,
+        tmdb_name="Psych",
+        ambiguous_identity=False,
+        candidates=[],
+        all_candidates=[{"tmdb_id": 1447, "name": "Psych", "year": "2006", "popularity": 40.0}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_import_adopts_resolved_tmdb_name_as_show_title(tmp_path, monkeypatch):
+    staging = _make_staging(tmp_path, count=3)
+    coordinator, _bw, _mw = _build_coordinator(
+        _fake_analysis(detected_name="Psych Season 3"), monkeypatch, signal=_psych_signal()
+    )
+    job_id = await _make_import_job(str(staging), "Psych Season 3")
+
+    await coordinator.identify_from_staging(job_id)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.tmdb_id == 1447
+        assert job.detected_title == "Psych"
+        assert job.state == JobState.MATCHING
+
+    coordinator._start_subtitle_download.assert_called_once_with(job_id, "Psych", 3, 1447)
+
+
+@pytest.mark.asyncio
+async def test_import_adopts_tmdb_name_found_at_classification(tmp_path, monkeypatch):
+    """Classification can resolve the show itself; the folder-name hint must not
+    then overwrite the canonical name it found."""
+    staging = _make_staging(tmp_path, count=3)
+    analysis = _fake_analysis(detected_name="Psych Season 3")
+    analysis.tmdb_id = 1447
+    analysis.tmdb_name = "Psych"
+    coordinator, _bw, _mw = _build_coordinator(analysis, monkeypatch, signal=None)
+    job_id = await _make_import_job(str(staging), "Psych Season 3")
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        job.detected_title = "Psych Season 3"  # the scanner's folder-derived hint
+        await session.commit()
+
+    await coordinator.identify_from_staging(job_id)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.detected_title == "Psych"
+
+
+@pytest.mark.asyncio
+async def test_import_ambiguous_show_keeps_folder_title(tmp_path, monkeypatch):
+    """A same-name twin is routed to review unresolved, so it must keep the user's
+    folder name rather than adopting one twin's name before the user picks."""
+    staging = _make_staging(tmp_path, count=3)
+    coordinator, _bw, _mw = _build_coordinator(
+        _fake_analysis(detected_name="Frasier Season 1"), monkeypatch, signal=_ambiguous_signal()
+    )
+    job_id = await _make_import_job(str(staging), "SEASON_1")
+
+    await coordinator.identify_from_staging(job_id)
+
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        assert job.state == JobState.REVIEW_NEEDED
+        assert job.detected_title == "Frasier Season 1"
+
+
+@pytest.mark.asyncio
+async def test_import_broadcasts_adopted_tmdb_name(tmp_path, monkeypatch):
+    """The dashboard learned the folder name from titles_discovered; the MATCHING
+    update must carry the TMDB name or the card keeps the stale one (#681 review)."""
+    staging = _make_staging(tmp_path, count=3)
+    coordinator, _bw, module_ws = _build_coordinator(
+        _fake_analysis(detected_name="Psych Season 3"), monkeypatch, signal=_psych_signal()
+    )
+    job_id = await _make_import_job(str(staging), "Psych Season 3")
+
+    await coordinator.identify_from_staging(job_id)
+
+    matching_updates = [
+        c
+        for c in module_ws.broadcast_job_update.await_args_list
+        if c.args[1:2] == (JobState.MATCHING.value,)
+    ]
+    assert matching_updates, "expected a MATCHING job_update"
+    assert matching_updates[-1].kwargs.get("detected_title") == "Psych"

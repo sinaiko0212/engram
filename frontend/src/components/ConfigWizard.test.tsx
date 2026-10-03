@@ -1,0 +1,647 @@
+import '@testing-library/jest-dom';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { toast } from 'sonner';
+import ConfigWizard from './ConfigWizard';
+
+/**
+ * jsdom lacks scrollIntoView (our GPU deep-link calls it) and the
+ * matchMedia/ResizeObserver Radix Select touches. Polyfill them per-test so the
+ * Preferences step (which renders several EngramSelects + GpuAccelerationSetting)
+ * mounts cleanly and the deep-link scroll is observable.
+ */
+beforeEach(() => {
+    localStorage.clear();
+    Element.prototype.scrollIntoView = vi.fn();
+    if (!window.matchMedia) {
+        window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn(),
+            addListener: vi.fn(),
+            removeListener: vi.fn(),
+            dispatchEvent: vi.fn(),
+        })) as unknown as typeof window.matchMedia;
+    }
+    if (!(globalThis as { ResizeObserver?: unknown }).ResizeObserver) {
+        (globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+            observe() {}
+            unobserve() {}
+            disconnect() {}
+        };
+    }
+    mockApi();
+});
+
+afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+});
+
+const ASR_STATUS = {
+    device: 'cpu',
+    compute_type: 'int8',
+    model: 'small',
+    workers: 1,
+    cpu_threads: 4,
+    max_concurrent_matches: 2,
+    gpu_detected: true,
+    gpu_enabled: false,
+    gpu_runtime_installed: true,
+    gpu_download_size_bytes: 1.2e9,
+    gpu_download: { state: 'idle', downloaded: 0, total: 0, error: null },
+    gpu_state: 'available_not_enabled',
+};
+
+/** Route the component's startup fetches (config, asr-status, detect-tools). */
+function mockApi(configOverrides: Record<string, unknown> = {}, options: { discordWebhookValid?: boolean } = {}) {
+    const config = {
+        setup_complete: true,
+        staging_path: '/staging',
+        library_movies_path: '/movies',
+        library_tv_path: '/tv',
+        ...configOverrides,
+    };
+    const { discordWebhookValid = true } = options;
+    vi.stubGlobal(
+        'fetch',
+        vi.fn((input: RequestInfo | URL) => {
+            const url = typeof input === 'string' ? input : input.toString();
+            const json = async () => {
+                if (url.includes('/api/asr-status')) return ASR_STATUS;
+                if (url.includes('/api/detect-tools'))
+                    return {
+                        makemkv: { found: false, path: null, version: null, error: null },
+                        ffmpeg: { found: false, path: null, version: null, error: null },
+                        platform: 'win32',
+                    };
+                if (url.includes('/api/network/info'))
+                    return { lan_access_enabled: false, active_lan_bound: false, lan_ip: null, port: 8000, lan_url: null };
+                if (url.includes('/api/validate/discord-template')) return { valid: true };
+                if (url.includes('/api/validate/discord-webhook'))
+                    return discordWebhookValid
+                        ? { valid: true }
+                        : { valid: false, error: 'Discord rejected the webhook URL' };
+                return config;
+            };
+            return Promise.resolve({ ok: true, status: 200, json, text: async () => JSON.stringify(config) });
+        }),
+    );
+}
+
+const noop = { onClose: vi.fn(), onComplete: vi.fn() };
+
+describe('ConfigWizard — settings mode (M1)', () => {
+    it('titles the modal "Settings" when opened from the gear', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        expect(await screen.findByRole('heading', { level: 2, name: 'Settings' })).toBeInTheDocument();
+        expect(screen.queryByRole('heading', { level: 2, name: 'Setup Wizard' })).not.toBeInTheDocument();
+    });
+
+    it('renders a section nav instead of the numbered stepper', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        // Section list, not a linear stepper: the onboarding "Step N:" affordances are gone.
+        expect(within(nav).getByRole('button', { name: 'Library Paths' })).toBeInTheDocument();
+        expect(within(nav).getByRole('button', { name: 'Preferences' })).toBeInTheDocument();
+        expect(screen.queryByLabelText(/^Step 1:/)).not.toBeInTheDocument();
+    });
+
+    it('clicking a section in the nav shows that section', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        // Default lands on Library Paths, not Preferences content.
+        expect(screen.queryByText('Max Concurrent Matches')).not.toBeInTheDocument();
+        fireEvent.click(within(nav).getByRole('button', { name: 'Preferences' }));
+        expect(await screen.findByText('Max Concurrent Matches')).toBeInTheDocument();
+    });
+
+    it('preserves a single global "Save Changes" action (no stepper Next/Back)', async () => {
+        const onComplete = vi.fn();
+        render(<ConfigWizard {...noop} onComplete={onComplete} isOnboarding={false} />);
+        const save = await screen.findByRole('button', { name: 'Save Changes' });
+        expect(screen.queryByRole('button', { name: /next/i })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /^back/i })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /complete setup/i })).not.toBeInTheDocument();
+
+        fireEvent.click(save);
+        await waitFor(() => expect(onComplete).toHaveBeenCalled());
+        const putCall = (fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.find(
+            (c) => c[1]?.method === 'PUT',
+        );
+        expect(putCall).toBeTruthy();
+        expect(putCall?.[0]).toContain('/api/config');
+    });
+});
+
+describe('ConfigWizard — onboarding mode unchanged (M1 regression)', () => {
+    it('keeps the "Setup Wizard" title and the numbered stepper', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={true} />);
+        expect(await screen.findByRole('heading', { level: 2, name: 'Setup Wizard' })).toBeInTheDocument();
+        // Stepper affordance present…
+        expect(screen.getByLabelText(/^Step 1: Paths/)).toBeInTheDocument();
+        // …and the settings section nav absent.
+        expect(screen.queryByRole('navigation', { name: /settings sections/i })).not.toBeInTheDocument();
+    });
+});
+
+describe('ConfigWizard — deep-linking (M2)', () => {
+    it('opens directly on a requested section via initialSection', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="preferences" />);
+        expect(await screen.findByText('Max Concurrent Matches')).toBeInTheDocument();
+    });
+
+    it('initialSection="gpu" opens Preferences and scrolls the GPU control into view', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="gpu" />);
+        // Preferences section is shown…
+        expect(await screen.findByText('Max Concurrent Matches')).toBeInTheDocument();
+        // …the GPU control has a scroll anchor…
+        const anchor = document.getElementById('setting-gpu-acceleration');
+        expect(anchor).not.toBeNull();
+        // …and we scrolled to it.
+        await waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled());
+    });
+
+    it('ignores initialSection in onboarding mode (always starts at step 1)', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={true} initialSection="gpu" />);
+        // Onboarding always begins on Library Paths regardless of deep-link.
+        expect(await screen.findByRole('heading', { level: 3, name: 'Library Paths' })).toBeInTheDocument();
+        expect(screen.queryByText('Max Concurrent Matches')).not.toBeInTheDocument();
+    });
+});
+
+describe('ConfigWizard — background pre-transcription toggles', () => {
+    it('renders both toggles with defaults and sends the flipped value on save', async () => {
+        const onComplete = vi.fn();
+        render(<ConfigWizard {...noop} onComplete={onComplete} isOnboarding={false} initialSection="preferences" />);
+
+        // Master switch ships enabled; the expensive full-file option ships off.
+        const master = await screen.findByRole('checkbox', { name: /background pre-transcription/i });
+        expect(master).toBeChecked();
+        const fullFile = screen.getByRole('checkbox', { name: /pre-transcribe entire files/i });
+        expect(fullFile).not.toBeChecked();
+
+        // Disabling the master switch hides the dependent full-file option.
+        fireEvent.click(master);
+        expect(screen.queryByRole('checkbox', { name: /pre-transcribe entire files/i })).not.toBeInTheDocument();
+
+        // The flipped value reaches the PUT payload (three-way sync, frontend leg).
+        fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+        await waitFor(() => expect(onComplete).toHaveBeenCalled());
+        const putCall = (fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.find(
+            (c) => c[1]?.method === 'PUT',
+        );
+        const body = JSON.parse(putCall?.[1]?.body as string);
+        expect(body.enable_background_pretranscription).toBe(false);
+        expect(body.pretranscribe_full_file).toBe(false);
+    });
+
+    it('reads snake_case GET fields and does not fall back to defaults when values are present', async () => {
+        // Verifies the camelCase←snake_case GET mapping: a typo in the reader key would
+        // let the ?? fallback silently paper over the bug and this test would fail.
+        mockApi({ enable_background_pretranscription: false, pretranscribe_full_file: true });
+        const onComplete = vi.fn();
+        render(<ConfigWizard {...noop} onComplete={onComplete} isOnboarding={false} initialSection="preferences" />);
+
+        // Master off — GET value (false) must win over the ?? true default.
+        const master = await screen.findByRole('checkbox', { name: /background pre-transcription/i });
+        expect(master).not.toBeChecked();
+
+        // Sub-toggle is hidden while master is off; re-enable master to reveal it.
+        fireEvent.click(master);
+        const fullFile = await screen.findByRole('checkbox', { name: /pre-transcribe entire files/i });
+        // GET value (true) must win over the ?? false default — not just the default.
+        expect(fullFile).toBeChecked();
+    });
+
+    it('sends pretranscribe_full_file=true in PUT when sub-toggle is explicitly enabled', async () => {
+        // Pins the non-default value on the PUT leg (camelCase→snake_case serialisation).
+        const onComplete = vi.fn();
+        render(<ConfigWizard {...noop} onComplete={onComplete} isOnboarding={false} initialSection="preferences" />);
+
+        // Master is on by default; turn on the sub-toggle (ships off).
+        await screen.findByRole('checkbox', { name: /background pre-transcription/i });
+        const fullFile = screen.getByRole('checkbox', { name: /pre-transcribe entire files/i });
+        expect(fullFile).not.toBeChecked();
+        fireEvent.click(fullFile);
+        expect(fullFile).toBeChecked();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+        await waitFor(() => expect(onComplete).toHaveBeenCalled());
+        const putCall = (fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.find(
+            (c) => c[1]?.method === 'PUT',
+        );
+        const body = JSON.parse(putCall?.[1]?.body as string);
+        // Both fields sent; sub-toggle carries non-default true value.
+        expect(body.enable_background_pretranscription).toBe(true);
+        expect(body.pretranscribe_full_file).toBe(true);
+    });
+});
+
+describe('ConfigWizard — background effects preference', () => {
+    it('shows a Background Animation checkbox in Preferences, on by default, and persists a toggle to localStorage without an API call', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        fireEvent.click(within(nav).getByRole('button', { name: 'Preferences' }));
+
+        const toggle = await screen.findByRole('checkbox', { name: /background animation/i });
+        expect(toggle).toBeChecked();
+
+        await waitFor(() => expect((fetch as unknown as Mock).mock.calls.length).toBeGreaterThan(0));
+        const callsBeforeToggle = (fetch as unknown as Mock).mock.calls.length;
+
+        fireEvent.click(toggle);
+
+        expect(toggle).not.toBeChecked();
+        expect(localStorage.getItem('engram:backgroundEffectsEnabled')).toBe('false');
+        expect((fetch as unknown as Mock).mock.calls.length).toBe(callsBeforeToggle);
+    });
+});
+
+describe('ConfigWizard — Discord notification templates', () => {
+    it('reads the saved templates from GET and sends edits on PUT', async () => {
+        mockApi({
+            discord_template_completed: '{{title}} is done',
+            discord_template_failed: '{{title}} failed: {{error}}',
+        });
+        const onComplete = vi.fn();
+        render(<ConfigWizard {...noop} onComplete={onComplete} isOnboarding={false} initialSection="preferences" />);
+
+        const completedField = await screen.findByLabelText(/completed message/i);
+        expect(completedField).toHaveValue('{{title}} is done');
+        const failedField = screen.getByLabelText(/failed message/i);
+        expect(failedField).toHaveValue('{{title}} failed: {{error}}');
+
+        fireEvent.change(completedField, { target: { value: '{{title}} - {{duration}}' } });
+
+        fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+        await waitFor(() => expect(onComplete).toHaveBeenCalled());
+        const putCall = (fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.find(
+            (c) => c[1]?.method === 'PUT',
+        );
+        const body = JSON.parse(putCall?.[1]?.body as string);
+        expect(body.discord_template_completed).toBe('{{title}} - {{duration}}');
+        expect(body.discord_template_failed).toBe('{{title}} failed: {{error}}');
+    });
+
+    it('surfaces a 422 validation error from the server as a toast', async () => {
+        mockApi();
+        vi.stubGlobal(
+            'fetch',
+            vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+                const url = typeof input === 'string' ? input : input.toString();
+                if (init?.method === 'PUT') {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 422,
+                        json: async () => ({ detail: 'discord_template_completed: Unknown template variable(s): bogus' }),
+                        text: async () => JSON.stringify({ detail: 'discord_template_completed: Unknown template variable(s): bogus' }),
+                    });
+                }
+                const config = { setup_complete: true, staging_path: '/staging', library_movies_path: '/movies', library_tv_path: '/tv' };
+                if (url.includes('/api/asr-status')) return Promise.resolve({ ok: true, status: 200, json: async () => ASR_STATUS, text: async () => '' });
+                if (url.includes('/api/detect-tools'))
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        json: async () => ({
+                            makemkv: { found: false, path: null, version: null, error: null },
+                            ffmpeg: { found: false, path: null, version: null, error: null },
+                            platform: 'win32',
+                        }),
+                        text: async () => '',
+                    });
+                if (url.includes('/api/network/info'))
+                    return Promise.resolve({ ok: true, status: 200, json: async () => ({ lan_access_enabled: false, active_lan_bound: false, lan_ip: null, port: 8000, lan_url: null }), text: async () => '' });
+                return Promise.resolve({ ok: true, status: 200, json: async () => config, text: async () => JSON.stringify(config) });
+            }),
+        );
+
+        const toastErrorSpy = vi.spyOn(toast, 'error');
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="preferences" />);
+        const completedField = await screen.findByLabelText(/completed message/i);
+        fireEvent.change(completedField, { target: { value: '{{bogus}}' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() =>
+            expect(toastErrorSpy).toHaveBeenCalledWith(expect.stringContaining('Unknown template variable')),
+        );
+    });
+
+    it('shows a live validation error and disables Save Changes while a template is invalid', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+                const url = typeof input === 'string' ? input : input.toString();
+                const config = { setup_complete: true, staging_path: '/staging', library_movies_path: '/movies', library_tv_path: '/tv' };
+                const json = async () => {
+                    if (url.includes('/api/asr-status')) return ASR_STATUS;
+                    if (url.includes('/api/detect-tools'))
+                        return {
+                            makemkv: { found: false, path: null, version: null, error: null },
+                            ffmpeg: { found: false, path: null, version: null, error: null },
+                            platform: 'win32',
+                        };
+                    if (url.includes('/api/network/info'))
+                        return { lan_access_enabled: false, active_lan_bound: false, lan_ip: null, port: 8000, lan_url: null };
+                    if (url.includes('/api/validate/discord-template')) {
+                        const { template } = JSON.parse((init?.body as string) || '{}');
+                        return template === '{{bogus}}'
+                            ? { valid: false, error: 'Unknown template variable(s): bogus' }
+                            : { valid: true };
+                    }
+                    return config;
+                };
+                return Promise.resolve({ ok: true, status: 200, json, text: async () => JSON.stringify(config) });
+            }),
+        );
+
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="preferences" />);
+        const completedField = await screen.findByLabelText(/completed message/i);
+        const saveButton = screen.getByRole('button', { name: 'Save Changes' });
+        expect(saveButton).toBeEnabled();
+
+        fireEvent.change(completedField, { target: { value: '{{bogus}}' } });
+
+        expect(await screen.findByText(/unknown template variable/i)).toBeInTheDocument();
+        await waitFor(() => expect(saveButton).toBeDisabled());
+    });
+
+    it('clears the validation error and re-enables Save Changes once the template becomes valid', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+                const url = typeof input === 'string' ? input : input.toString();
+                const config = { setup_complete: true, staging_path: '/staging', library_movies_path: '/movies', library_tv_path: '/tv' };
+                const json = async () => {
+                    if (url.includes('/api/asr-status')) return ASR_STATUS;
+                    if (url.includes('/api/detect-tools'))
+                        return {
+                            makemkv: { found: false, path: null, version: null, error: null },
+                            ffmpeg: { found: false, path: null, version: null, error: null },
+                            platform: 'win32',
+                        };
+                    if (url.includes('/api/network/info'))
+                        return { lan_access_enabled: false, active_lan_bound: false, lan_ip: null, port: 8000, lan_url: null };
+                    if (url.includes('/api/validate/discord-template')) {
+                        const { template } = JSON.parse((init?.body as string) || '{}');
+                        return template === '{{bogus}}'
+                            ? { valid: false, error: 'Unknown template variable(s): bogus' }
+                            : { valid: true };
+                    }
+                    return config;
+                };
+                return Promise.resolve({ ok: true, status: 200, json, text: async () => JSON.stringify(config) });
+            }),
+        );
+
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="preferences" />);
+        const completedField = await screen.findByLabelText(/completed message/i);
+        const saveButton = screen.getByRole('button', { name: 'Save Changes' });
+
+        fireEvent.change(completedField, { target: { value: '{{bogus}}' } });
+        expect(await screen.findByText(/unknown template variable/i)).toBeInTheDocument();
+        await waitFor(() => expect(saveButton).toBeDisabled());
+
+        fireEvent.change(completedField, { target: { value: '{{title}}' } });
+
+        await waitFor(() => expect(screen.queryByText(/unknown template variable/i)).not.toBeInTheDocument());
+        await waitFor(() => expect(saveButton).toBeEnabled());
+    });
+});
+
+describe('ConfigWizard: Discord notification settings', () => {
+    async function openPreferences() {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        fireEvent.click(within(nav).getByRole('button', { name: 'Preferences' }));
+    }
+
+    it('renders the review notification controls', async () => {
+        await openPreferences();
+
+        expect(await screen.findByLabelText(/Review Needed Message/i)).toBeInTheDocument();
+        expect(screen.getByLabelText(/Review Mention/i)).toBeInTheDocument();
+        expect(screen.getByLabelText(/Dashboard URL/i)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Send test message/i })).toBeInTheDocument();
+    });
+
+    it('reports success after a webhook test', async () => {
+        await openPreferences();
+
+        fireEvent.click(await screen.findByRole('button', { name: /Send test message/i }));
+
+        const status = await screen.findByTestId('webhook-test-status');
+        expect(status).toHaveTextContent('Sent');
+    });
+
+    it('surfaces a rejected webhook instead of reporting success', async () => {
+        mockApi({}, { discordWebhookValid: false });
+        await openPreferences();
+
+        fireEvent.click(await screen.findByRole('button', { name: /Send test message/i }));
+
+        const status = await screen.findByTestId('webhook-test-status');
+        expect(status).toHaveTextContent(/rejected|failed/i);
+        expect(status).not.toHaveTextContent(/^\s*✓/);
+    });
+
+    it('clears a previous test result when the webhook url is edited', async () => {
+        await openPreferences();
+
+        fireEvent.click(await screen.findByRole('button', { name: /Send test message/i }));
+        expect(await screen.findByTestId('webhook-test-status')).toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText(/Discord Webhook URL/i), {
+            target: { value: 'https://discord.com/api/webhooks/2/other' },
+        });
+
+        expect(screen.queryByTestId('webhook-test-status')).not.toBeInTheDocument();
+    });
+});
+
+describe('ConfigWizard — local AI provider settings', () => {
+    /** Data Sharing → AI assistance is collapsed by default; expand it and turn
+     *  the feature on so the provider/model fields render. */
+    async function openAiAssistance() {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        fireEvent.click(within(nav).getByRole('button', { name: 'Data Sharing' }));
+
+        const summary = await screen.findByText('AI assistance');
+        fireEvent.click(summary);
+
+        const enable = await screen.findByRole('checkbox', { name: /AI-Powered Title Resolution/i });
+        fireEvent.click(enable);
+    }
+
+    async function selectProvider(label: string) {
+        const trigger = screen.getByLabelText('AI Provider');
+        fireEvent.click(trigger);
+        fireEvent.click(await screen.findByText(label));
+    }
+
+    it('selecting a local provider hides the API-key field and shows Server Address', async () => {
+        await openAiAssistance();
+
+        expect(screen.getByLabelText(/Anthropic API Key/i)).toBeInTheDocument();
+        expect(screen.queryByLabelText('Server Address')).not.toBeInTheDocument();
+
+        await selectProvider('Ollama (local)');
+
+        expect(document.getElementById('aiApiKey')).toBeNull();
+        expect(await screen.findByLabelText('Server Address')).toBeInTheDocument();
+    });
+
+    it('shows the concurrency hint only for a local provider with Max Concurrent Matches > 1', async () => {
+        mockApi({ max_concurrent_matches: 3 });
+        await openAiAssistance();
+
+        // Remote provider (default): no hint even though concurrency is 3.
+        expect(screen.queryByText(/processes one request at a time/i)).not.toBeInTheDocument();
+
+        await selectProvider('Ollama (local)');
+
+        expect(await screen.findByText(/processes one request at a time/i)).toBeInTheDocument();
+    });
+
+    it('does not show the concurrency hint for a local provider when Max Concurrent Matches is 1', async () => {
+        mockApi({ max_concurrent_matches: 1 });
+        await openAiAssistance();
+
+        await selectProvider('Ollama (local)');
+
+        expect(screen.queryByText(/processes one request at a time/i)).not.toBeInTheDocument();
+    });
+});
+
+describe('ConfigWizard: webhook test targets the saved value', () => {
+    it('refuses to test an unsaved webhook edit instead of silently testing the old one', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        fireEvent.click(within(nav).getByRole('button', { name: 'Preferences' }));
+
+        fireEvent.change(await screen.findByLabelText(/Discord Webhook URL/i), {
+            target: { value: 'https://discord.com/api/webhooks/9/unsaved' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: /Send test message/i }));
+
+        const status = await screen.findByTestId('webhook-test-status');
+        expect(status).toHaveTextContent(/save your changes first/i);
+    });
+});
+
+describe('ConfigWizard: Discord finished-ripping notification', () => {
+    it('round-trips the ripped notification toggle and template', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="preferences" />);
+
+        const toggle = await screen.findByLabelText(/notify when a disc finishes ripping/i);
+        expect(toggle).not.toBeChecked();
+
+        fireEvent.click(toggle);
+        const template = screen.getByLabelText(/finished ripping message/i);
+        fireEvent.change(template, { target: { value: '{{title}} done' } });
+
+        fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() =>
+            expect((fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.some((c) => c[1]?.method === 'PUT')).toBe(true),
+        );
+        const putCall = (fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.find(
+            (c) => c[1]?.method === 'PUT',
+        );
+        const body = JSON.parse(putCall?.[1]?.body as string);
+        expect(body.discord_notify_ripped).toBe(true);
+        expect(body.discord_template_ripped).toBe('{{title}} done');
+    });
+});
+
+describe('ConfigWizard: disc backup before ripping', () => {
+    it('reveals the backup folder field only once the toggle is on', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="paths" />);
+
+        const toggle = await screen.findByLabelText(/back up disc before ripping/i);
+        expect(toggle).not.toBeChecked();
+        expect(screen.queryByLabelText('Disc Backup Folder')).not.toBeInTheDocument();
+
+        fireEvent.click(toggle);
+        expect(await screen.findByLabelText('Disc Backup Folder')).toBeInTheDocument();
+    });
+
+    it('sends both backup keys when saving', async () => {
+        render(<ConfigWizard {...noop} isOnboarding={false} initialSection="paths" />);
+
+        fireEvent.click(await screen.findByLabelText(/back up disc before ripping/i));
+        fireEvent.change(await screen.findByLabelText('Disc Backup Folder'), {
+            target: { value: '/mnt/backups' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+        await waitFor(() =>
+            expect((fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.some((c) => c[1]?.method === 'PUT')).toBe(true),
+        );
+        const putCall = (fetch as unknown as { mock: { calls: [string, RequestInit?][] } }).mock.calls.find(
+            (c) => c[1]?.method === 'PUT',
+        );
+        const body = JSON.parse(putCall?.[1]?.body as string);
+        expect(body.backup_before_rip).toBe(true);
+        expect(body.backup_path).toBe('/mnt/backups');
+    });
+});
+
+describe('ConfigWizard — scroll reset on step change (#725)', () => {
+    const getBody = (container: HTMLElement) => container.querySelector('.wizard-body') as HTMLElement;
+
+    it('settings: switching section via the sidebar scrolls the body back to the top', async () => {
+        const { container } = render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        const body = getBody(container);
+
+        body.scrollTop = 300;
+        fireEvent.click(within(nav).getByRole('button', { name: 'Preferences' }));
+
+        expect(await screen.findByText('Max Concurrent Matches')).toBeInTheDocument();
+        expect(body.scrollTop).toBe(0);
+    });
+
+    it('settings: every section switch resets the scroll position, not just the first', async () => {
+        const { container } = render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        const body = getBody(container);
+
+        for (const name of ['Tools & License', 'Data Sharing', 'Library Paths']) {
+            body.scrollTop = 250;
+            fireEvent.click(within(nav).getByRole('button', { name }));
+            await waitFor(() => expect(body.scrollTop).toBe(0));
+        }
+    });
+
+    it('onboarding: Next and Back both open the step at the top', async () => {
+        const { container } = render(<ConfigWizard {...noop} isOnboarding={true} />);
+        await screen.findByRole('heading', { level: 2, name: 'Setup Wizard' });
+        const body = getBody(container);
+
+        body.scrollTop = 302;
+        fireEvent.click(screen.getByRole('button', { name: /next/i }));
+        await waitFor(() => expect(screen.getByLabelText(/^Step 2: Tools \(current\)/)).toBeInTheDocument());
+        expect(body.scrollTop).toBe(0);
+
+        body.scrollTop = 180;
+        fireEvent.click(screen.getByRole('button', { name: /back/i }));
+        await waitFor(() => expect(screen.getByLabelText(/^Step 1: Paths \(current\)/)).toBeInTheDocument());
+        expect(body.scrollTop).toBe(0);
+    });
+
+    it('does not move the scroll position when the step has not changed', async () => {
+        const { container } = render(<ConfigWizard {...noop} isOnboarding={false} />);
+        const nav = await screen.findByRole('navigation', { name: /settings sections/i });
+        const body = getBody(container);
+
+        body.scrollTop = 120;
+        fireEvent.change(await screen.findByLabelText('Movies Library'), { target: { value: '/other' } });
+        expect(body.scrollTop).toBe(120);
+        expect(nav).toBeInTheDocument();
+    });
+});

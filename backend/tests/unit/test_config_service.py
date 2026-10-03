@@ -1,0 +1,199 @@
+"""Unit tests for the configuration service.
+
+Tests get/update config and path creation logic.
+"""
+
+from app.models.app_config import AppConfig
+from app.services.config_service import ensure_paths_exist, get_config, update_config
+from tests.unit.conftest import _unit_session_factory
+
+
+class TestGetConfig:
+    """Tests for get_config()."""
+
+    async def test_get_config_creates_default(self):
+        """Empty DB should return a default config with platform paths."""
+        config = await get_config()
+        assert config is not None
+        assert config.id is not None
+        # Default staging path should exist (platform-dependent)
+        assert config.staging_path is not None
+        assert len(config.staging_path) > 0
+
+    async def test_get_config_returns_existing(self):
+        """If a config already exists, get_config should return it."""
+        async with _unit_session_factory() as session:
+            existing = AppConfig(
+                staging_path="/custom/staging",
+                library_movies_path="/custom/movies",
+                library_tv_path="/custom/tv",
+            )
+            session.add(existing)
+            await session.commit()
+
+        config = await get_config()
+        assert config.staging_path == "/custom/staging"
+
+
+class TestUpdateConfig:
+    """Tests for update_config()."""
+
+    async def test_update_config_writes_fields(self):
+        """Update staging_path and verify it persists."""
+        # Seed initial config
+        async with _unit_session_factory() as session:
+            session.add(AppConfig(staging_path="/old/path"))
+            await session.commit()
+
+        updated = await update_config(staging_path="/updated/path")
+        assert updated.staging_path == "/updated/path"
+
+        # Verify via fresh read
+        config = await get_config()
+        assert config.staging_path == "/updated/path"
+
+    async def test_update_skips_empty_sensitive_fields(self):
+        """Empty string for tmdb_api_key should NOT overwrite existing value."""
+        async with _unit_session_factory() as session:
+            session.add(
+                AppConfig(
+                    staging_path="/tmp",
+                    tmdb_api_key="eyJoriginal_token",
+                )
+            )
+            await session.commit()
+
+        updated = await update_config(tmdb_api_key="")
+        assert updated.tmdb_api_key == "eyJoriginal_token"
+
+    async def test_update_skips_empty_ai_api_key(self):
+        """Empty string for ai_api_key must NOT overwrite a stored key.
+
+        Defense-in-depth: the frontend already omits a blank key, but the backend
+        must independently protect every secret field so no client (or future
+        code path) can blank a saved credential by sending "".
+        """
+        async with _unit_session_factory() as session:
+            session.add(AppConfig(staging_path="/tmp", ai_api_key="AIzaSy-secret"))
+            await session.commit()
+
+        updated = await update_config(ai_api_key="")
+        assert updated.ai_api_key == "AIzaSy-secret"
+
+    async def test_update_skips_empty_opensubtitles_secrets(self):
+        """Blank OpenSubtitles key/password must not clobber stored values."""
+        # Bound to neutrally-named sentinels (not inline literals) so secret
+        # scanners don't flag these test fixtures as real credentials.
+        stored_key = "kept-os-key"
+        stored_pw = "kept-os-value"
+        async with _unit_session_factory() as session:
+            session.add(
+                AppConfig(
+                    staging_path="/tmp",
+                    opensubtitles_api_key=stored_key,
+                    opensubtitles_password=stored_pw,
+                )
+            )
+            await session.commit()
+
+        updated = await update_config(opensubtitles_api_key="", opensubtitles_password="")
+        assert updated.opensubtitles_api_key == stored_key
+        assert updated.opensubtitles_password == stored_pw
+
+    async def test_update_skips_none_values(self):
+        """None values should be ignored."""
+        async with _unit_session_factory() as session:
+            session.add(AppConfig(staging_path="/original"))
+            await session.commit()
+
+        updated = await update_config(staging_path=None)
+        assert updated.staging_path == "/original"
+
+    async def test_update_creates_config_if_missing(self):
+        """If no config exists, update_config should create one."""
+        updated = await update_config(staging_path="/brand-new")
+        assert updated.staging_path == "/brand-new"
+
+    async def test_tmdb_key_rotation_clears_tmdb_caches(self, monkeypatch):
+        """Rotating ``tmdb_api_key`` must drop any cached lookups made
+        with the old key — otherwise a revoked or replaced key would
+        keep returning stale results until process restart.
+        """
+        from app.matcher import tmdb_client
+
+        called = {"count": 0}
+
+        def fake_clear():
+            called["count"] += 1
+
+        monkeypatch.setattr(tmdb_client, "clear_caches", fake_clear)
+
+        await update_config(tmdb_api_key="eyJrotated_key")
+        assert called["count"] == 1, "TMDB key rotation must call clear_caches()"
+
+    async def test_non_tmdb_update_does_not_clear_caches(self, monkeypatch):
+        """A staging-path update should NOT touch the TMDB cache —
+        clear_caches() is expensive enough that we only call it on
+        rotations that could invalidate the cache.
+        """
+        from app.matcher import tmdb_client
+
+        called = {"count": 0}
+
+        def fake_clear():
+            called["count"] += 1
+
+        monkeypatch.setattr(tmdb_client, "clear_caches", fake_clear)
+
+        await update_config(staging_path="/changed/path")
+        assert called["count"] == 0, "non-TMDB update must not clear TMDB caches"
+
+
+class TestEnsurePathsExist:
+    """Tests for ensure_paths_exist()."""
+
+    async def test_ensure_paths_exist_creates_dirs(self, tmp_path):
+        """Should create directories from config paths."""
+        config = AppConfig(
+            staging_path=str(tmp_path / "staging"),
+            library_movies_path=str(tmp_path / "movies"),
+            library_tv_path=str(tmp_path / "tv"),
+            subtitles_cache_path=str(tmp_path / "cache"),
+        )
+
+        await ensure_paths_exist(config)
+
+        assert (tmp_path / "staging").exists()
+        assert (tmp_path / "movies").exists()
+        assert (tmp_path / "tv").exists()
+        assert (tmp_path / "cache").exists()
+
+    async def test_ensure_paths_exist_no_error_on_existing(self, tmp_path):
+        """Should not fail if directories already exist."""
+        (tmp_path / "staging").mkdir()
+        config = AppConfig(
+            staging_path=str(tmp_path / "staging"),
+            library_movies_path=str(tmp_path / "movies"),
+            library_tv_path=str(tmp_path / "tv"),
+        )
+        await ensure_paths_exist(config)
+        assert (tmp_path / "staging").exists()
+
+    async def test_ensure_paths_exist_expands_tilde(self, tmp_path, monkeypatch):
+        """A '~'-prefixed path should resolve against the home dir, not the backend dir.
+
+        Path("~/foo").is_absolute() is False, so expanduser() must run before the
+        absolute-path check or the tilde is never resolved (issue #459).
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        config = AppConfig(
+            staging_path=str(tmp_path / "staging"),
+            library_movies_path=str(tmp_path / "movies"),
+            library_tv_path=str(tmp_path / "tv"),
+            subtitles_cache_path="~/.engram/cache",
+        )
+
+        await ensure_paths_exist(config)
+
+        assert (tmp_path / ".engram" / "cache").exists()

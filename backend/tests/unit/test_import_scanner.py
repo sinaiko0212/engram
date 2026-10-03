@@ -1,0 +1,280 @@
+"""Unit tests for the recursive manual-import scanner."""
+
+from pathlib import Path
+
+from app.core import import_scanner
+
+
+def _mkv(p: Path, size: int = 1024) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"0" * size)
+
+
+def test_show_season_disc_layout_groups_per_season(tmp_path: Path):
+    # The King of Queens case: Show / Season N / Disc N / *.mkv
+    show = tmp_path / "The King of Queens (1998)"
+    _mkv(show / "Season 1" / "Disc 1" / "t00.mkv")
+    _mkv(show / "Season 1" / "Disc 2" / "t01.mkv")
+    _mkv(show / "Season 2" / "Disc 1" / "t02.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert scan.total_files == 3
+    by_season = {u.season: u for u in scan.units}
+    assert set(by_season) == {1, 2}
+    assert len(by_season[1].files) == 2  # both disc folders rolled into season 1
+    assert len(by_season[2].files) == 1
+    assert all(u.show_name == "The King of Queens (1998)" for u in scan.units)
+
+
+def test_disc_only_layout_no_season_is_flat(tmp_path: Path):
+    show = tmp_path / "Show Title"
+    _mkv(show / "Disc 1" / "a.mkv")
+    _mkv(show / "Disc 2" / "b.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert scan.total_files == 2
+    assert len(scan.units) == 1
+    assert scan.units[0].season is None
+    assert scan.units[0].show_name == "Show Title"
+    assert len(scan.units[0].files) == 2
+
+
+def test_flat_loose_files(tmp_path: Path):
+    show = tmp_path / "Seinfeld"
+    _mkv(show / "e1.mkv")
+    _mkv(show / "e2.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert len(scan.units) == 1
+    assert scan.units[0].season is None
+    assert scan.total_files == 2
+
+
+def test_loose_files_beside_season_folders_are_reported_not_merged(tmp_path: Path):
+    show = tmp_path / "Mixed"
+    _mkv(show / "Season 1" / "ep.mkv")
+    _mkv(show / "stray.mkv")
+
+    scan = import_scanner.scan(show)
+
+    seasons = [u.season for u in scan.units]
+    assert seasons == [1]
+    assert [p.name for p in scan.loose_files] == ["stray.mkv"]
+    assert scan.total_files == 2  # totals still count the loose file
+
+
+def test_multiple_shows_under_picked_root(tmp_path: Path):
+    _mkv(tmp_path / "King of Queens" / "Season 1" / "a.mkv")
+    _mkv(tmp_path / "Seinfeld" / "Season 1" / "b.mkv")
+
+    scan = import_scanner.scan(tmp_path)
+
+    shows = {u.show_name for u in scan.units}
+    assert shows == {"King of Queens", "Seinfeld"}
+
+
+def test_single_file_target(tmp_path: Path):
+    f = tmp_path / "Some Folder" / "movie.mkv"
+    _mkv(f)
+
+    scan = import_scanner.scan(f)
+
+    assert len(scan.units) == 1
+    assert scan.units[0].season is None
+    assert scan.units[0].files == [f]
+    assert scan.units[0].show_name == "Some Folder"
+
+
+def test_season_inferred_from_nearest_ancestor(tmp_path: Path):
+    f = tmp_path / "Show" / "Season 03" / "Disc 2" / "x.mkv"
+    _mkv(f)
+
+    scan = import_scanner.scan(tmp_path / "Show")
+
+    assert scan.units[0].season == 3
+
+
+def test_underscore_show_name_is_cleaned(tmp_path: Path):
+    show = tmp_path / "KING_OF_QUEENS"
+    _mkv(show / "Season 1" / "a.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert scan.units[0].show_name == "KING OF QUEENS"
+
+
+def test_deep_tree_trips_truncation_rail(tmp_path: Path):
+    # Nest deeper than _MAX_DEPTH so the depth safety rail fires.
+    deep = tmp_path
+    for i in range(import_scanner._MAX_DEPTH + 2):
+        deep = deep / f"d{i}"
+    _mkv(deep / "x.mkv")
+
+    scan = import_scanner.scan(tmp_path)
+
+    assert scan.truncated is True
+
+
+def test_shallow_tree_is_not_truncated(tmp_path: Path):
+    show = tmp_path / "Show"
+    _mkv(show / "Season 1" / "a.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert scan.truncated is False
+
+
+def test_lowercase_season_folder_infers_season(tmp_path: Path):
+    show = tmp_path / "Show"
+    _mkv(show / "season 2" / "a.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert scan.units[0].season == 2
+
+
+def test_picked_is_show_true_for_single_show(tmp_path: Path):
+    show = tmp_path / "Seinfeld"
+    _mkv(show / "Season 1" / "a.mkv")
+
+    assert import_scanner.scan(show).picked_is_show is True
+
+
+def test_picked_is_show_false_for_parent_of_shows(tmp_path: Path):
+    _mkv(tmp_path / "Seinfeld" / "Season 1" / "a.mkv")
+    _mkv(tmp_path / "Friends" / "Season 1" / "b.mkv")
+
+    assert import_scanner.scan(tmp_path).picked_is_show is False
+
+
+def test_picked_is_show_true_for_single_file(tmp_path: Path):
+    f = tmp_path / "Some Folder" / "movie.mkv"
+    _mkv(f)
+
+    assert import_scanner.scan(f).picked_is_show is True
+
+
+def test_picked_season_folder_infers_show_from_parent(tmp_path: Path):
+    # The reported bug: user navigates INTO "Season 4" and picks it directly.
+    # Show must come from the parent ("Seinfeld"), season from the folder name.
+    season_dir = tmp_path / "Seinfeld" / "Season 4"
+    _mkv(season_dir / "e1.mkv")
+    _mkv(season_dir / "e2.mkv")
+
+    scan = import_scanner.scan(season_dir)
+
+    assert len(scan.units) == 1
+    assert scan.units[0].show_name == "Seinfeld"
+    assert scan.units[0].season == 4
+    assert scan.picked_is_season is True
+
+
+def test_picked_season_folder_with_disc_subfolders(tmp_path: Path):
+    # Files nested under Disc folders inside the picked season must still roll up
+    # into that season, with the show taken from the parent.
+    season_dir = tmp_path / "The King of Queens (1998)" / "Season 3"
+    _mkv(season_dir / "Disc 1" / "a.mkv")
+    _mkv(season_dir / "Disc 2" / "b.mkv")
+
+    scan = import_scanner.scan(season_dir)
+
+    assert len(scan.units) == 1
+    assert scan.units[0].show_name == "The King of Queens (1998)"
+    assert scan.units[0].season == 3
+    assert len(scan.units[0].files) == 2
+
+
+def test_picked_season_lowercase_padded(tmp_path: Path):
+    season_dir = tmp_path / "Show" / "season 07"
+    _mkv(season_dir / "a.mkv")
+
+    scan = import_scanner.scan(season_dir)
+
+    assert scan.units[0].show_name == "Show"
+    assert scan.units[0].season == 7
+
+
+# --- Season-suffixed show folders (#667) -------------------------------------
+# An external rip is commonly named "Psych Season 3". The folder is the show
+# folder, but its name carries the season too; taking it verbatim filed the
+# library under "TV/Psych Season 3/".
+
+
+def test_season_suffixed_show_folder_splits_show_and_season(tmp_path: Path):
+    show = tmp_path / "Psych Season 3"
+    _mkv(show / "t00.mkv")
+    _mkv(show / "t01.mkv")
+
+    scan = import_scanner.scan(show)
+
+    assert len(scan.units) == 1
+    assert scan.units[0].show_name == "Psych"
+    assert scan.units[0].season == 3
+    assert scan.picked_is_show is True
+
+
+def test_season_suffix_variants(tmp_path: Path):
+    cases = {
+        "Psych - Season 03": ("Psych", 3),
+        "Psych S3": ("Psych", 3),
+        "PSYCH_S03": ("PSYCH", 3),
+        "Psych Series 2": ("Psych", 2),
+        "Psych Season 3 Disc 1": ("Psych", 3),
+        "PSYCH_S3_D2": ("PSYCH", 3),
+        "The Office (2005) Season 4": ("The Office (2005)", 4),
+    }
+    for folder, expected in cases.items():
+        show = tmp_path / folder
+        _mkv(show / "a.mkv")
+        scan = import_scanner.scan(show)
+        assert (scan.units[0].show_name, scan.units[0].season) == expected, folder
+
+
+def test_names_that_are_not_season_suffixes_are_kept(tmp_path: Path):
+    # A trailing number with no season keyword is part of the title.
+    for folder in ("Babylon 5", "Stranger Things 4", "Blake's 7", "Class of 09"):
+        show = tmp_path / folder
+        _mkv(show / "a.mkv")
+        scan = import_scanner.scan(show)
+        assert scan.units[0].show_name == folder, folder
+        assert scan.units[0].season is None, folder
+
+
+def test_parent_of_season_suffixed_folders_groups_one_show(tmp_path: Path):
+    _mkv(tmp_path / "Psych Season 3" / "a.mkv")
+    _mkv(tmp_path / "Psych Season 4" / "b.mkv")
+
+    scan = import_scanner.scan(tmp_path)
+
+    assert [(u.show_name, u.season) for u in scan.units] == [("Psych", 3), ("Psych", 4)]
+
+
+def test_season_folder_beats_show_folder_suffix(tmp_path: Path):
+    # An explicit "Season NN" folder is the more specific signal.
+    _mkv(tmp_path / "Psych Season 3" / "Season 4" / "a.mkv")
+
+    scan = import_scanner.scan(tmp_path / "Psych Season 3")
+
+    assert scan.units[0].show_name == "Psych"
+    assert scan.units[0].season == 4
+
+
+def test_single_file_in_season_suffixed_folder(tmp_path: Path):
+    f = tmp_path / "Psych Season 3" / "t00.mkv"
+    _mkv(f)
+
+    scan = import_scanner.scan(f)
+
+    assert (scan.units[0].show_name, scan.units[0].season) == ("Psych", 3)
+
+
+def test_picked_season_folder_under_season_suffixed_parent(tmp_path: Path):
+    season_dir = tmp_path / "Psych Season 3" / "Season 3"
+    _mkv(season_dir / "a.mkv")
+
+    scan = import_scanner.scan(season_dir)
+
+    assert (scan.units[0].show_name, scan.units[0].season) == ("Psych", 3)

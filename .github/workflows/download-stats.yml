@@ -1,0 +1,55 @@
+name: Download Stats
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: download-stats
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update-stats:
+    name: Update Download Stats
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Update download stats
+        run: python scripts/update_download_stats.py
+
+      # Generated badges + chart are published to the unprotected `badges`
+      # branch rather than `main`. `main` requires status checks on every ref
+      # update, which a direct bot push can never satisfy. The README's
+      # shields.io endpoints read these files from the `badges` branch.
+      - name: Publish to badges branch
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          work="$(mktemp -d)"
+          mkdir -p "$work/docs/badges"
+          cp docs/badges/windows-downloads.json "$work/docs/badges/"
+          cp docs/badges/linux-downloads.json "$work/docs/badges/"
+          cp docs/badges/macos-downloads.json "$work/docs/badges/"
+          cp docs/downloads-chart.svg "$work/docs/"
+
+          cd "$work"
+          git init -q -b badges
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git config credential.helper '!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
+          git add docs
+          git commit -q -m "chore: update download stats"
+          git push -f origin badges

@@ -1,0 +1,1124 @@
+"""Build the precomputed subtitle-vector cache shipped with Engram.
+
+Harvests subtitles for the most-voted TV shows on TMDB, reduces each episode to a
+HASHED TF-IDF vector (no readable vocabulary -- see app/matcher/vectorizer_config),
+discards the raw SRT, and packages the vectors into a `.tar.gz` plus a manifest
+for hosting on GitHub Releases.
+
+Usage (from backend/):
+    uv run python scripts/build_subtitle_cache.py --limit 300
+    uv run python scripts/build_subtitle_cache.py --shows "The Expanse,Arrested Development"
+    uv run python scripts/build_subtitle_cache.py --show-list scripts/curated_shows.csv
+
+TMDB / OpenSubtitles credentials are read from the AppConfig DB row; in CI they
+are bootstrapped from the env vars TMDB_API_KEY, OPENSUBTITLES_API_KEY,
+OPENSUBTITLES_USERNAME, OPENSUBTITLES_PASSWORD.
+
+EXIT CODES -- a publishing wrapper MUST branch on these:
+
+    0  Success. The run finished the whole selected corpus. The tarball is
+       complete and is safe to publish.
+    1  Failure. Nothing usable was produced (no TMDB key, or no subtitles
+       harvested at all). No tarball worth publishing exists.
+    2  HALTED ON QUOTA. The OpenSubtitles budget/floor guard stopped the run
+       partway through. A tarball MAY still have been written, but it contains
+       ONLY the shows completed before the halt.
+
+       **An exit-2 artifact is PARTIAL and MUST NOT be published.** A nightly
+       `gh release upload --clobber` that ignores the exit code would replace
+       the full published cache with a truncated one after a single
+       quota-capped night, and every Engram install would silently pick up the
+       smaller cache. Re-run after the daily quota resets instead; the harvest
+       resumes from disk.
+"""
+
+import argparse
+import csv
+import datetime
+import hashlib
+import io
+import json
+import os
+import shutil
+import sys
+import tarfile
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# Idempotent — repeated importlib loads (e.g. one fixture per test file) would
+# otherwise accumulate duplicate entries in sys.path on every exec_module call.
+_backend_dir = str(Path(__file__).parent.parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
+from datetime import UTC
+
+import numpy as np
+from loguru import logger
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from scipy import sparse
+
+from app.matcher import coverage_tracker
+from app.matcher.episode_identification import SubtitleCache, _corpus_show_dir
+from app.matcher.numbering_scheme import (
+    SCHEME_UNKNOWN,
+    derive_numbering_scheme,
+)
+from app.matcher.subtitle_utils import corpus_dir_name, discover_season_srts
+from app.matcher.testing_service import (
+    RETRIEVED_STATUSES,
+    download_subtitles,
+    get_last_quota,
+    probe_os_quota,
+)
+from app.matcher.tmdb_client import (
+    fetch_season_details,
+    fetch_show_details,
+    fetch_show_id,
+    fetch_shows_by_vote_count,
+)
+from app.matcher.vectorizer_config import (
+    CACHE_FORMAT_VERSION,
+    HASHING_N_FEATURES,
+    build_hashing_vectorizer,
+    compute_idf,
+    vectorizer_config_hash,
+)
+
+
+@dataclass
+class RunTally:
+    """Running counters for the build run, surfaced in the final summary.
+
+    Mutated in place by ``_harvest_show`` so per-show progress can be
+    rendered without changing call-site semantics.
+    """
+
+    downloaded: int = 0
+    cache_hits: int = 0
+    not_found: int = 0
+    # Episodes shipped by the complete-on-disk fast path. Tracked separately
+    # from cache_hits (which counts the downloader's own local-cache hits) so
+    # cache_hit_rate stays a meaningful quota-consumption metric and the
+    # per-show banner doesn't mislabel "shipped from disk, no network" as
+    # "retrieved from download cache".
+    episodes_from_disk: int = 0
+    seasons_done: int = 0
+    seasons_from_disk: int = 0
+    seasons_skipped_below_threshold: int = 0
+    seasons_failed: int = 0
+    # Seasons where download_subtitles actually ran (i.e. neither the
+    # complete-on-disk fast path nor the skip-list bypassed it). Denominator
+    # for seasons_degraded's share of the run -- see the final-summary hint.
+    seasons_attempted: int = 0
+    # Seasons whose result was degraded (some provider never answered, season
+    # incomplete) and therefore NOT recorded to subtitle_coverage. This is a
+    # QUALIFIER on seasons_attempted, not a disposition parallel to OK /
+    # skipped / failed -- a season can be both "done" and "degraded" (it
+    # cleared the ratio threshold despite the outage) or both "unmeasured"
+    # and "degraded" (it didn't). A count near seasons_attempted usually
+    # means a misconfigured run (bad OS credentials, missing
+    # opensubtitlescom package) rather than a brief mid-run outage --
+    # surfaced in the final summary so that isn't silent.
+    seasons_degraded: int = 0
+    # Per-provider download counts (opensubtitles_api, addic7ed, tvsubtitles).
+    # Surfaces which provider served each NEW download so a quiet fallback's
+    # contribution is visible in the final summary. Cache hits are excluded --
+    # they're reported separately and carry no originating-provider info.
+    by_source: Counter[str] = field(default_factory=Counter)
+    start_time: float = field(default_factory=time.monotonic)
+
+    def elapsed_str(self) -> str:
+        secs = int(time.monotonic() - self.start_time)
+        return f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+
+    @property
+    def cache_hit_rate(self) -> float:
+        denom = self.cache_hits + self.downloaded
+        return self.cache_hits / denom if denom else 0.0
+
+
+def _ensure_utf8_output(*streams) -> None:
+    """Force the given text streams to UTF-8 so a show title cannot abort a run.
+
+    On Windows both a legacy console and a redirected pipe default to the ANSI
+    codepage (cp1252), which cannot encode titles like "Shogun" (spelled with a
+    macron) or "El Senor de los Cielos". Rich repaints the progress bar through
+    that stream, so ONE such title raised UnicodeEncodeError and killed a real
+    448-show harvest at show 179, discarding the packaging step for the 178
+    shows that had already succeeded. The harvest itself was fine; only the
+    rendering of its progress was fatal.
+
+    ``errors="replace"`` is the half that makes this permanently non-fatal: a
+    character some future stream cannot represent degrades to a placeholder
+    rather than ending a multi-hour run.
+
+    Streams with no ``reconfigure`` (a test double, a plain object) are skipped,
+    and a stream that refuses to be reconfigured (already detached) is left
+    alone. Failing to change an encoding must never be worse than the crash it
+    is preventing.
+    """
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        # Deliberately broad. A detached buffer raises ValueError and a bad
+        # descriptor raises OSError, but an object carrying a `reconfigure`
+        # attribute that is not a callable taking these kwargs raises
+        # TypeError, and anything that escapes here would defeat the whole
+        # point of this function: failing to CHANGE an encoding must never be
+        # worse than the crash it is preventing. This runs once at startup,
+        # so a broad catch costs nothing and cannot mask a later error.
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Could not force UTF-8 on {stream!r} (non-fatal): {exc}")
+
+
+class QuotaExhausted(Exception):
+    """Raised to end a run cleanly when the download budget or quota floor is hit.
+
+    Carries the human-readable reason so ``main`` can log it and exit non-zero
+    without unwinding through a bare ``Exception`` handler.
+    """
+
+
+def _stop_reason(
+    baseline: int | None,
+    remaining: int | None,
+    max_downloads: int,
+    floor: int,
+) -> str | None:
+    """Return why the run must stop, or None to continue.
+
+    Two independent limits:
+
+    * ``floor`` -- an absolute guard on remaining daily quota. Catches the
+      account that began the day partially spent, where the per-run budget
+      would never trip.
+    * ``max_downloads`` -- this run's own budget, measured as
+      ``baseline - remaining``. Leaves headroom so a scheduled build cannot
+      consume the entire daily allowance.
+
+    Assumes ``remaining <= baseline``. If the daily quota resets mid-run the
+    reading rises above the baseline, the subtraction goes negative, and the
+    budget branch stops firing for the rest of the run. The caller is
+    responsible for re-baselining when it sees the quota refill.
+
+    ``max_downloads`` of 0 or less stops immediately on the first check; it
+    does NOT mean unlimited.
+
+    ``remaining is None`` means no OpenSubtitles telemetry (no credentials, or
+    the probe failed). Scrapers carry no daily cap, so an unknown quota must
+    never halt the run -- returning a stop here would break credential-free
+    builds entirely.
+    """
+    if remaining is None:
+        return None
+
+    if remaining <= floor:
+        return (
+            f"OpenSubtitles daily quota nearly exhausted ({remaining} remaining, "
+            f"floor {floor}); stopping before failed downloads get recorded as "
+            "zero coverage"
+        )
+
+    if baseline is not None and (baseline - remaining) >= max_downloads:
+        return (
+            f"run download budget spent ({baseline - remaining}/{max_downloads}); stopping cleanly"
+        )
+
+    return None
+
+
+def _should_record_coverage(result: dict) -> bool:
+    """Return whether this season's outcome is worth persisting as coverage.
+
+    Defaults to True when the key is absent so paths that build their own
+    result dict (e.g. the precomputed-cache skip) keep their existing
+    behaviour rather than silently dropping out of the coverage record.
+    """
+    return not result.get("degraded", False)
+
+
+def _ensure_db_schema() -> None:
+    """Create and migrate the DB schema via the app's canonical ``init_db()``.
+
+    The standalone script runs without the FastAPI lifespan that normally
+    calls ``database.init_db()``. A fresh ``engram.db`` (e.g. a CI runner)
+    needs its tables created; a pre-existing dev database needs any
+    recently-added columns applied. ``create_all`` alone does the former but
+    never the latter, so an older local ``engram.db`` ends up missing newer
+    columns such as ``app_config.precomputed_cache_enabled``. Delegating to
+    ``init_db()`` runs the same create-all + ``_add_missing_columns`` +
+    Alembic migration path the running app uses on startup.
+    """
+    import asyncio
+
+    from app.database import init_db
+
+    asyncio.run(init_db())
+
+
+def _bootstrap_config_from_env() -> None:
+    """Populate the AppConfig DB row with credentials from env vars (for CI)."""
+    env_map = {
+        "tmdb_api_key": "TMDB_API_KEY",
+        "opensubtitles_api_key": "OPENSUBTITLES_API_KEY",
+        "opensubtitles_username": "OPENSUBTITLES_USERNAME",
+        "opensubtitles_password": "OPENSUBTITLES_PASSWORD",
+    }
+    updates = {field: os.environ[env] for field, env in env_map.items() if os.environ.get(env)}
+    if not updates:
+        return
+
+    from sqlmodel import Session, select
+
+    from app.models.app_config import AppConfig
+    from app.services.config_service import _get_sync_engine
+
+    with Session(_get_sync_engine()) as session:
+        config = session.exec(select(AppConfig).limit(1)).first()
+        if config is None:
+            config = AppConfig()
+            session.add(config)
+        for field, value in updates.items():
+            setattr(config, field, value)
+        session.commit()
+    logger.info(f"Bootstrapped config from env: {sorted(updates)}")
+
+
+def _read_show_list(path: str) -> list[dict]:
+    """Parse a curated show-list file into ``[{name, id}]`` candidates.
+
+    Two formats are supported:
+    - A CSV with a ``tmdb_id`` column (e.g. the curated_shows.csv produced by the
+      curation tooling). IDs are used directly, so name-collision titles like the
+      US vs UK "The Office" resolve unambiguously. A ``name`` column is kept for
+      logging; any row whose tmdb_id is missing/non-numeric falls back to a name
+      lookup via ``fetch_show_id``.
+    - A plain name list: a ``.txt`` with one show per line, or a CSV whose only
+      useful column is ``name``. Each name is resolved via ``fetch_show_id`` (the
+      same path as ``--shows``).
+
+    Blank lines and ``#`` comment lines are ignored.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"--show-list file not found: {path}")
+    text = p.read_text(encoding="utf-8-sig")
+
+    if p.suffix.lower() == ".csv":
+        rows = list(csv.DictReader(io.StringIO(text)))
+        fields = set(rows[0].keys()) if rows else set()
+        if "tmdb_id" in fields:
+            candidates = []
+            for r in rows:
+                tid = (r.get("tmdb_id") or "").strip()
+                name = (r.get("name") or "").strip()
+                if tid.isdigit():
+                    candidates.append({"name": name or tid, "id": int(tid)})
+                elif name:
+                    candidates.append({"name": name, "id": fetch_show_id(name)})
+            return candidates
+        if "name" in fields:
+            return [
+                {"name": n, "id": fetch_show_id(n)}
+                for r in rows
+                if (n := (r.get("name") or "").strip())
+            ]
+
+    names = [
+        ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    return [{"name": n, "id": fetch_show_id(n)} for n in names]
+
+
+def _select_shows(args) -> list[dict]:
+    """Return [{name, tmdb_id, seasons}] for the shows to cache."""
+    if args.show_list:
+        candidates = _read_show_list(args.show_list)
+        logger.info(f"Loaded {len(candidates)} shows from {args.show_list}")
+    elif args.shows:
+        names = [s.strip() for s in args.shows.split(",") if s.strip()]
+        candidates = [{"name": n, "id": fetch_show_id(n)} for n in names]
+    else:
+        # Discover returns shows already ranked by vote_count desc; iterating
+        # pages in order and deduping preserves that ranking (dict is ordered).
+        seen: dict[int, dict] = {}
+        for page in range(1, args.pages + 1):
+            for show in fetch_shows_by_vote_count(page):
+                if show.get("id") and show["id"] not in seen:
+                    seen[show["id"]] = show
+            time.sleep(args.sleep)
+        ranked = list(seen.values())
+        candidates = [{"name": s["name"], "id": s["id"]} for s in ranked[: args.limit]]
+
+    shows = []
+    for cand in candidates:
+        if not cand["id"]:
+            logger.warning(f"Skipping '{cand['name']}': not found on TMDB")
+            continue
+        details = fetch_show_details(cand["id"])
+        if not details:
+            logger.warning(f"Skipping '{cand['name']}': could not fetch TMDB details")
+            continue
+        shows.append(
+            {
+                "name": details.get("name", cand["name"]),
+                "tmdb_id": cand["id"],
+                "seasons": details.get("number_of_seasons", 0),
+            }
+        )
+        time.sleep(args.sleep)
+    return shows
+
+
+def _harvest_show(
+    show: dict,
+    args,
+    tally: RunTally,
+    cache_dir: Path,
+    on_season_done=None,
+) -> list[tuple[int, str, Path]]:
+    """Download subtitles for every season. Returns [(season, episode_code, srt_path)].
+
+    Mutates ``tally`` in place with per-status counts so the caller can render
+    progress without re-walking the episode lists. ``cache_dir`` is the root
+    subtitle cache (``<cache>/data/<show>/...`` holds the SRTs) used by the
+    complete-on-disk fast path. ``on_season_done``, if given, is invoked after
+    each season finishes (success, skip, or fail) so the caller can advance a
+    Progress bar without coupling to its implementation.
+    """
+    harvested: list[tuple[int, str, Path]] = []
+    canonical = show["name"]
+    # The data/ SRT scrape cache is keyed by tmdb_id (fallback: sanitized name),
+    # matching where download_subtitles writes (we pass tmdb_id below) and what
+    # the runtime matcher reads — two same-named shows never collide on disk.
+    # Filenames inside stay name-prefixed.
+    season_data_dir = cache_dir / "data" / corpus_dir_name(show["tmdb_id"], canonical)
+    for season in range(1, show["seasons"] + 1):
+        # Complete-on-disk fast path: a season that previously reached the
+        # coverage threshold is shipped straight from the SRTs already on disk
+        # — no TMDB enumeration, no OpenSubtitles search, no scraper grind, no
+        # per-season sleep. This is what keeps daily re-runs near-instant and
+        # stops re-scraping the permanently-missing tail of every covered
+        # season. --refresh forces a full re-harvest to fill gaps providers
+        # may have added since.
+        if not args.refresh:
+            done, prior = coverage_tracker.is_done(
+                show["tmdb_id"],
+                season,
+                args.min_episodes_ratio,
+            )
+            if done:
+                on_disk = discover_season_srts(season_data_dir, season)
+                expected = prior["covered_episodes"]
+                if on_disk and len(on_disk) >= expected:
+                    for code, path in on_disk:
+                        harvested.append((season, code, path))
+                    tally.episodes_from_disk += len(on_disk)
+                    tally.seasons_done += 1
+                    tally.seasons_from_disk += 1
+                    logger.info(
+                        f"  {canonical} S{season:02d}: complete on disk "
+                        f"({len(on_disk)} eps); shipping without network "
+                        f"(--refresh to re-harvest)"
+                    )
+                    if on_season_done is not None:
+                        on_season_done()
+                    continue
+                # A coverage record exists but the SRTs on disk are missing
+                # entirely, or a partial wipe/interrupted sync left fewer
+                # than the recorded count (e.g. a wiped or truncated CI
+                # cache). Either way, shipping the shortfall would silently
+                # under-deliver a season previously marked complete, so log
+                # it and fall through to harvest from scratch. No
+                # on_season_done() here: the normal harvest path below calls
+                # it exactly once for this season; a second call would
+                # over-advance the progress bar.
+                logger.info(
+                    f"  {canonical} S{season:02d}: coverage recorded "
+                    f"({expected} eps) but only {len(on_disk)}/{expected} SRTs "
+                    f"on disk; re-harvesting from scratch"
+                )
+
+        if not args.retry_low_coverage:
+            skip, prev = coverage_tracker.should_skip(
+                show["tmdb_id"],
+                season,
+                args.min_episodes_ratio,
+                args.skip_window_days,
+            )
+            if skip:
+                from datetime import datetime
+
+                ts = datetime.fromtimestamp(prev["attempted_at"], tz=UTC).strftime("%Y-%m-%d")
+                logger.info(
+                    f"  {canonical} S{season:02d}: skipping (prior coverage "
+                    f"{prev['coverage_ratio']:.0%} on {ts}; "
+                    f"pass --retry-low-coverage to retry)"
+                )
+                tally.seasons_skipped_below_threshold += 1
+                if on_season_done is not None:
+                    on_season_done()
+                continue
+
+        try:
+            # Always re-harvest when building the cache, even if a prior
+            # precomputed build already covers this season. Pass tmdb_id so the
+            # download writes under the SAME id-keyed dir as season_data_dir above
+            # (and the runtime matcher reads) — never a name-resolved divergent id.
+            result = download_subtitles(
+                canonical, season, tmdb_id=show["tmdb_id"], use_precomputed=False
+            )
+        except Exception as e:
+            # exc_info=True per CLAUDE.md: the warning string alone (often
+            # just "429 Too Many Requests") doesn't say which provider in
+            # the OS/TMDB retry chain raised — the traceback is the only
+            # signal for diagnosing flaky seasons after the fact.
+            logger.warning(f"  {canonical} S{season:02d}: harvest failed ({e})", exc_info=True)
+            tally.seasons_failed += 1
+            if on_season_done is not None:
+                on_season_done()
+            continue
+
+        # Defense in depth: the builder must never receive precomputed-status
+        # episodes. use_precomputed=False is passed above, but if that ever
+        # regresses the RETRIEVED_STATUSES filter below would silently drop every
+        # episode and write a zero-row cache. Fail loudly instead.
+        assert all(ep["status"] != "precomputed" for ep in result["episodes"]), (
+            "download_subtitles returned precomputed status to the cache builder — "
+            "use_precomputed=False must be passed when harvesting"
+        )
+        tally.seasons_attempted += 1
+
+        # Tally every episode (including failures) so the running totals
+        # match what actually happened, not what we chose to keep.
+        for ep in result["episodes"]:
+            status = ep.get("status")
+            if status == "cached":
+                tally.cache_hits += 1
+            elif status == "downloaded":
+                tally.downloaded += 1
+            elif status == "not_found":
+                tally.not_found += 1
+            source = ep.get("source")
+            if source and status == "downloaded":
+                tally.by_source[source] += 1
+
+        episodes = [
+            ep for ep in result["episodes"] if ep["status"] in RETRIEVED_STATUSES and ep.get("path")
+        ]
+        total = result.get("total_episodes", 0) or len(result["episodes"])
+        ratio = len(episodes) / total if total else 0.0
+
+        # Record EVERY season we actually MEASURED (success or genuinely
+        # below-threshold). This powers the skip-list on the next run -- without
+        # it, low-coverage seasons get re-attempted every day, burning quota on
+        # shows that simply don't have subtitles.
+        #
+        # A degraded season is NOT a measurement: some provider never answered
+        # (OpenSubtitles, or a scraper whose circuit breaker tripped) and the
+        # season is incomplete, so 0% says nothing about availability.
+        # Recording it would skip-list the season for 30 days on the strength of
+        # an outage. That defect cost 664 seasons on 2026-06-12; see the
+        # harvester-repair spec.
+        #
+        # Computed once and reused below: a degraded, below-threshold season
+        # must not ALSO be reported as a content conclusion ("below threshold;
+        # skipping season") -- that wording asserts we measured the content and
+        # found little, when in fact we couldn't measure it at all. Reporting
+        # both back to back is a more confidently wrong story than saying
+        # nothing.
+        should_record = _should_record_coverage(result)
+        if should_record:
+            coverage_tracker.record(show["tmdb_id"], season, total, len(episodes))
+        else:
+            tally.seasons_degraded += 1
+            logger.warning(
+                f"  {canonical} S{season:02d}: degraded result "
+                f"(a provider never answered and the season is incomplete); "
+                "NOT recording coverage so the season is re-measured next run"
+            )
+
+        if ratio < args.min_episodes_ratio:
+            if should_record:
+                logger.info(
+                    f"  {canonical} S{season:02d}: {len(episodes)}/{total} episodes "
+                    f"({ratio:.0%}) below threshold {args.min_episodes_ratio:.0%}; "
+                    "skipping season"
+                )
+                tally.seasons_skipped_below_threshold += 1
+            else:
+                # Not a threshold verdict -- the season wasn't measured, so it
+                # can't be "below threshold". Don't double-count it into
+                # seasons_skipped_below_threshold either; seasons_degraded
+                # already covers it, and the WARNING above already explained why.
+                logger.info(
+                    f"  {canonical} S{season:02d}: {len(episodes)}/{total} episodes "
+                    f"retrieved before degrading; not packaged this run "
+                    "(unmeasured, see WARNING above)"
+                )
+            if on_season_done is not None:
+                on_season_done()
+            continue
+
+        for ep in episodes:
+            harvested.append((season, ep["code"], Path(ep["path"])))
+        logger.info(f"  {canonical} S{season:02d}: {len(episodes)}/{total} episodes")
+        tally.seasons_done += 1
+        if on_season_done is not None:
+            on_season_done()
+        time.sleep(args.sleep)
+    return harvested
+
+
+def _render_tally(tally: "RunTally") -> str:
+    """Render the run tally block (everything that does NOT need packaging).
+
+    Split out of the final summary so it can also be printed on ``main()``'s
+    early-return paths. ``seasons_degraded`` and the misconfiguration hint are
+    the most diagnostic output a run produces, and a run that harvested nothing
+    is exactly when an operator needs them -- yet those paths return before the
+    packaging summary is ever built. Everything here reads only ``tally`` and
+    the process-wide quota snapshot, so it is safe on every path; anything
+    computed during packaging (shows, episodes, tarball size) deliberately
+    stays with the caller so no path can print a misleading zero.
+    """
+    quota = get_last_quota()
+    quota_str = f"{quota['remaining']}" if quota and quota.get("remaining") is not None else "n/a"
+    by_source = ", ".join(f"{s}={n}" for s, n in sorted(tally.by_source.items())) or "none"
+
+    # Label column computed, not hand-padded: "seasons attempted:" is the
+    # longest label, and padding it by eye is how the block's right edge
+    # drifted by a character in the first place.
+    def _row(label: str, value: str) -> str:
+        return f"  {label + ':':<19}{value}"
+
+    episodes_seen = tally.cache_hits + tally.downloaded + tally.not_found + tally.episodes_from_disk
+    lines = [
+        _row("episodes seen", str(episodes_seen)),
+        _row(
+            "from disk",
+            f"{tally.episodes_from_disk} "
+            f"({tally.seasons_from_disk} covered seasons shipped without network)",
+        ),
+        _row("cache hits", str(tally.cache_hits)),
+        _row("new downloads", str(tally.downloaded)),
+        _row("not found", str(tally.not_found)),
+        _row("cache hit rate", f"{tally.cache_hit_rate:.0%}"),
+        _row("by source", by_source),
+        _row("seasons OK", str(tally.seasons_done)),
+        _row(
+            "seasons skipped",
+            f"{tally.seasons_skipped_below_threshold} (below coverage threshold)",
+        ),
+        _row("seasons failed", str(tally.seasons_failed)),
+        _row(
+            "seasons attempted",
+            f"{tally.seasons_attempted}, of which degraded "
+            f"(coverage not recorded, re-measured next run): {tally.seasons_degraded}",
+        ),
+        _row("elapsed", tally.elapsed_str()),
+        _row("OS quota left", f"{quota_str} downloads today"),
+    ]
+
+    # Half or more of the seasons this run actually attempted came back
+    # degraded: far more likely a misconfigured run (bad OpenSubtitles
+    # credentials, or the opensubtitlescom package missing) or a scraper
+    # outage than a brief mid-run blip. Surfaced so a silently-empty
+    # skip-list gets diagnosed instead of misread as "these shows have
+    # little content".
+    if tally.seasons_attempted and tally.seasons_degraded / tally.seasons_attempted >= 0.5:
+        lines.append(
+            "  HINT: half or more of the seasons attempted this run were degraded -- "
+            "check the OpenSubtitles credentials (opensubtitles_api_key/username/password), "
+            "that the opensubtitlescom package is installed, and the 'never answered' "
+            "warnings above for a scraper outage, rather than reading this as a content "
+            "problem"
+        )
+
+    return "\n".join(lines)
+
+
+def _season_numbering_entry(tmdb_id: int | None, season: int, reference_count: int) -> dict:
+    """Describe how one harvested season is numbered, for the manifest.
+
+    The corpus is numbered by whatever the subtitle providers index; TMDB may
+    number the same season differently (a segment-format show catalogues
+    ~7-minute shorts while the providers index 22-minute broadcast half-hours).
+    Recording which one a season was harvested in is the only way a consumer can
+    tell whether a code from it is a canonical TMDB coordinate, because both
+    schemes are stored under the same canonical season key.
+
+    **This is the single implementation for both builder scripts.**
+    ``pack_subtitle_cache`` imports it and adds only its ``offline``
+    short-circuit. They publish to the same rolling release, so a pack-built and
+    a build-built artifact must be indistinguishable to a consumer, and two
+    copies of this logic would be free to drift into saying different things
+    about the same season.
+
+    A ``tmdb_id`` of None yields UNKNOWN with no ``roster_size``: there is
+    nothing to compare against, and an unknown season must stay distinguishable
+    from a genuinely divergent one. That path is unreachable from this script's
+    own loop (it resolves every show against TMDB before harvesting) but is the
+    live unresolved-show path for the pack caller.
+    """
+    if tmdb_id is None:
+        return {"scheme": SCHEME_UNKNOWN}
+    try:
+        # Persistent-cached (TTL_SEASON). Always warm when called from this
+        # script: download_subtitles fetches season details for every season it
+        # harvests. NOT necessarily warm for the pack caller, which reads SRTs
+        # already on disk, so a cold cache there means one sequential TMDB call
+        # per season. Returns 0, not None, on a missing key or a failed request;
+        # derive_numbering_scheme maps that to UNKNOWN, so a slow or failing
+        # lookup degrades the marker rather than the run.
+        roster_size = fetch_season_details(str(tmdb_id), season)
+    except Exception as e:
+        # A roster lookup must never abort a run that can cover 500 shows.
+        # Widest catch is deliberate: fetch_season_details already swallows its
+        # own network errors, so anything reaching here is unanticipated and the
+        # season simply becomes UNKNOWN.
+        logger.warning(f"  roster lookup failed for tmdb {tmdb_id} S{season:02d}: {e}")
+        roster_size = 0
+    scheme = derive_numbering_scheme(reference_count, roster_size)
+    if scheme == SCHEME_UNKNOWN:
+        return {"scheme": SCHEME_UNKNOWN}
+    return {"scheme": scheme, "roster_size": roster_size}
+
+
+def main() -> int:
+    # Before anything renders: a single non-ASCII title must not be able to
+    # kill the run through the progress bar. See _ensure_utf8_output.
+    _ensure_utf8_output(sys.stdout, sys.stderr)
+
+    parser = argparse.ArgumentParser(description="Build the Engram subtitle-vector cache")
+    parser.add_argument(
+        "--limit", type=int, default=300, help="Number of shows (top by TMDB vote count)"
+    )
+    parser.add_argument("--pages", type=int, default=15, help="TMDB discover pages to scan")
+    parser.add_argument(
+        "--shows", type=str, default="", help="Comma-separated show names (overrides popular)"
+    )
+    parser.add_argument(
+        "--show-list",
+        type=str,
+        default="",
+        help=(
+            "Path to a curated show-list file (overrides --shows and popularity). "
+            "A CSV with a tmdb_id column (e.g. scripts/curated_shows.csv) is matched "
+            "by ID for unambiguous lookup; a plain name-per-line .txt also works."
+        ),
+    )
+    parser.add_argument(
+        "--min-episodes-ratio", type=float, default=0.6, help="Min episode coverage per season"
+    )
+    parser.add_argument("--sleep", type=float, default=1.0, help="Seconds between API/scrape calls")
+    parser.add_argument(
+        "--output", type=str, default="engram-subtitle-cache.tar.gz", help="Output tarball path"
+    )
+    parser.add_argument(
+        "--content-version", type=str, default="", help="Cache content version (default: today)"
+    )
+    parser.add_argument(
+        "--clean-srt",
+        action="store_true",
+        help="Delete harvested SRTs after building (default: keep them so re-runs resume)",
+    )
+    # Deprecated: SRTs are now kept by default; --keep-srt is a no-op kept for compatibility.
+    parser.add_argument("--keep-srt", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--retry-low-coverage",
+        action="store_true",
+        help=(
+            "Bypass the skip-list and re-attempt seasons that previously fell below "
+            "the coverage threshold. Use after VIP quota refills or after enabling a "
+            "new provider."
+        ),
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help=(
+            "Re-harvest seasons already covered on disk instead of shipping them "
+            "from disk without re-downloading (the default). Use periodically to "
+            "fill in episodes providers may have added since the last build."
+        ),
+    )
+    parser.add_argument(
+        "--skip-window-days",
+        type=int,
+        default=30,
+        help=(
+            "How long a low-coverage season stays on the skip-list before it is "
+            "retried automatically (default: 30)."
+        ),
+    )
+    parser.add_argument(
+        "--max-downloads",
+        type=int,
+        default=900,
+        help=(
+            "Stop the run after this many OpenSubtitles downloads (default: 900). "
+            "Leaves headroom under the 1000/day VIP cap so a scheduled build "
+            "cannot exhaust the daily allowance and start recording false zeros."
+        ),
+    )
+    parser.add_argument(
+        "--quota-floor",
+        type=int,
+        default=10,
+        help=(
+            "Stop the run when remaining daily OpenSubtitles quota drops to this "
+            "(default: 10). Independent of --max-downloads: catches an account "
+            "that began the day partially spent."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.max_downloads <= 0:
+        parser.error("--max-downloads must be positive (0 does not mean unlimited)")
+    if args.quota_floor < 0:
+        parser.error("--quota-floor cannot be negative")
+
+    if args.keep_srt:
+        if args.clean_srt:
+            logger.warning(
+                "--keep-srt is deprecated and has no effect; SRTs will be "
+                "deleted because --clean-srt is set."
+            )
+        else:
+            logger.warning(
+                "--keep-srt is deprecated and has no effect; SRTs are kept by default. "
+                "Pass --clean-srt to delete them after the build."
+            )
+
+    _ensure_db_schema()
+    _bootstrap_config_from_env()
+
+    from app.services.config_service import get_config_sync
+
+    config = get_config_sync()
+    quota_baseline: int | None = None
+    halted_reason: str | None = None
+    if (
+        config.opensubtitles_api_key
+        and config.opensubtitles_username
+        and config.opensubtitles_password
+    ):
+        logger.info("OpenSubtitles API: ACTIVE — bulk season downloads enabled")
+        # Probe remaining daily download quota up front so the user can see
+        # whether there's budget for this run before any harvesting starts.
+        # probe_os_quota logs in and queries user_info, which does NOT consume
+        # download quota, and is best-effort (returns None on any failure).
+        remaining = probe_os_quota(config)
+        logger.info(
+            f"OpenSubtitles quota: "
+            f"{remaining if remaining is not None else 'n/a'} downloads remaining today"
+        )
+        quota_baseline = remaining
+    else:
+        logger.warning(
+            "OpenSubtitles API: INACTIVE — credentials missing; falling back to "
+            "rate-limited scrapers (slow, flaky). Set opensubtitles_api_key, "
+            "opensubtitles_username and opensubtitles_password to enable it."
+        )
+    if not config.tmdb_api_key:
+        logger.error("TMDB API key not configured — show lookups require it; aborting")
+        return 1
+
+    cache_dir = Path(config.subtitles_cache_path).expanduser()
+    precomputed_dir = cache_dir / "precomputed"
+    if precomputed_dir.exists():
+        shutil.rmtree(precomputed_dir)
+    precomputed_dir.mkdir(parents=True, exist_ok=True)
+
+    content_version = args.content_version or datetime.date.today().isoformat()
+
+    shows = _select_shows(args)
+    logger.info(f"Selected {len(shows)} shows for the cache")
+
+    # --- Harvest SRT + extract cleaned full text per episode -------------------
+    subtitle_cache = SubtitleCache()
+    # blocks: list of (tmdb_id, show_name, season, [episode_codes], count_csr)
+    blocks: list[tuple[int, str, int, list[str], object]] = []
+    hv = build_hashing_vectorizer()
+    manifest_shows: dict[str, dict] = {}
+    tally = RunTally()
+
+    # Rich Console auto-detects TTY: in a local terminal we get a live
+    # updating progress bar; under GitHub Actions (no TTY) it degrades to
+    # one log line per console.log() call and the bar updates are
+    # effectively no-ops — exactly the shape that's readable in CI logs.
+    console = Console()
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        shows_task = progress.add_task("Building cache", total=len(shows))
+        try:
+            for idx, show in enumerate(shows, 1):
+                show_start = time.monotonic()
+                tally_snapshot = (
+                    tally.cache_hits,
+                    tally.downloaded,
+                    tally.not_found,
+                    tally.episodes_from_disk,
+                )
+                # `transient` is a Progress() constructor argument that makes
+                # the whole bar vanish on exit, not a per-task option — passing
+                # it here is silently stored as task metadata and has no visual
+                # effect. The per-show task is removed cleanly by the
+                # `progress.remove_task(season_task)` call below after the
+                # show finishes.
+                season_task = progress.add_task(
+                    f"  {show['name']}",
+                    total=show["seasons"],
+                )
+
+                logger.info(f"[{idx}/{len(shows)}] {show['name']} (TMDB {show['tmdb_id']})")
+                # Bind season_task via default arg so the closure captures THIS
+                # iteration's task id, not the loop variable (B023).
+                harvested = _harvest_show(
+                    show,
+                    args,
+                    tally,
+                    cache_dir,
+                    on_season_done=lambda task=season_task: progress.advance(task),
+                )
+                progress.remove_task(season_task)
+                progress.advance(shows_task)
+
+                remaining_now = (get_last_quota() or {}).get("remaining")
+
+                # Re-baseline on a mid-run quota refill. These runs span hours and
+                # the OpenSubtitles bucket resets daily, so a run that crosses the
+                # reset sees `remaining` rise above the baseline. Without this,
+                # `baseline - remaining` goes negative, the budget branch stops
+                # firing for the rest of the run, and only the floor is left --
+                # a run started on a partially-spent account could then draw the
+                # entire fresh allowance while the operator believes
+                # --max-downloads capped it.
+                if remaining_now is not None and (
+                    quota_baseline is None or remaining_now > quota_baseline
+                ):
+                    quota_baseline = remaining_now
+
+                stop = _stop_reason(
+                    quota_baseline,
+                    remaining_now,
+                    args.max_downloads,
+                    args.quota_floor,
+                )
+                if stop:
+                    console.log(f"[yellow]STOP[/] {stop}")
+                    logger.warning(f"Halting run: {stop}")
+                    # Raised from main()'s show loop, NOT from inside
+                    # _harvest_show: that function wraps download_subtitles in a
+                    # broad `except Exception` which would swallow this halt and
+                    # log it as a per-season warning. If the guard is ever moved
+                    # to a per-season check, narrow that handler first.
+                    raise QuotaExhausted(stop)
+
+                if not harvested:
+                    # All seasons either failed or fell below the coverage
+                    # threshold — emit a yellow SKIP banner instead of the green
+                    # OK banner so the log line matches what actually happened.
+                    console.log(
+                        f"[yellow]SKIP[/] {show['name']} — no usable seasons "
+                        f"(omitted from cache) in {int(time.monotonic() - show_start)}s"
+                    )
+                    logger.warning(f"  {show['name']}: no usable seasons; omitting from cache")
+                    continue
+
+                # Per-show summary — show what we did this iteration.
+                delta_hits = tally.cache_hits - tally_snapshot[0]
+                delta_dls = tally.downloaded - tally_snapshot[1]
+                delta_nf = tally.not_found - tally_snapshot[2]
+                delta_disk = tally.episodes_from_disk - tally_snapshot[3]
+                got = delta_hits + delta_dls + delta_disk
+                console.log(
+                    f"[green]OK[/] {show['name']} — "
+                    f"{got}/{got + delta_nf} episodes "
+                    f"({delta_disk} from disk, {delta_hits} cached, {delta_dls} new, "
+                    f"{delta_nf} missing) "
+                    f"in {int(time.monotonic() - show_start)}s"
+                )
+
+                by_season: dict[int, list[tuple[str, Path]]] = {}
+                for season, code, path in harvested:
+                    by_season.setdefault(season, []).append((code, path))
+
+                show_seasons: list[int] = []
+                episode_counts: dict[str, int] = {}
+                season_numbering: dict[str, dict] = {}
+                for season in sorted(by_season):
+                    episodes = sorted(by_season[season], key=lambda x: x[0])
+                    texts, codes = [], []
+                    for code, path in episodes:
+                        text = subtitle_cache.get_full_text(str(path))
+                        if text:
+                            texts.append(text)
+                            codes.append(code)
+                    if not texts:
+                        continue
+                    counts = hv.transform(texts)  # raw hashed term counts
+                    blocks.append((show["tmdb_id"], show["name"], season, codes, counts))
+                    show_seasons.append(season)
+                    episode_counts[str(season)] = len(codes)
+                    # Written after the same `continue` as episode_counts above,
+                    # so the two dicts always carry the identical season key set.
+                    season_numbering[str(season)] = _season_numbering_entry(
+                        show["tmdb_id"], season, len(codes)
+                    )
+
+                if show_seasons:
+                    # v3: keyed by tmdb_id so same-named shows don't collide; the name
+                    # is stored so the runtime can still resolve when no id is known.
+                    manifest_shows[str(show["tmdb_id"])] = {
+                        "tmdb_id": show["tmdb_id"],
+                        "name": show["name"],
+                        "seasons": show_seasons,
+                        "episode_counts": episode_counts,
+                        # Additive: a backend predating the marker ignores this
+                        # key, which is why CACHE_FORMAT_VERSION does not move.
+                        "season_numbering": season_numbering,
+                    }
+        except QuotaExhausted as e:
+            halted_reason = str(e)
+
+    if not blocks:
+        # Print the tally BEFORE either early return. These two paths are the
+        # ones an operator most needs the degraded count and the
+        # misconfiguration hint for, and they used to skip the summary
+        # entirely. Only the tally portion is printed: nothing was packaged,
+        # so shows/episodes/tarball size do not exist and printing them as
+        # zeros would read as a content conclusion rather than "no run".
+        console.log("[bold]Final summary[/]: nothing packaged\n" + _render_tally(tally))
+
+    if halted_reason and not blocks:
+        logger.warning(
+            f"Run halted early: {halted_reason}. No shows were packaged before the "
+            "halt, so there is nothing to publish this run; re-run after the daily "
+            "quota resets to continue."
+        )
+        return 2
+
+    if not blocks:
+        logger.error("No subtitles harvested; nothing to build")
+        return 1
+
+    # --- Fit one global IDF across the whole corpus ----------------------------
+    all_counts = sparse.vstack([b[4] for b in blocks], format="csr")
+    idf = compute_idf(all_counts)
+    np.save(precomputed_dir / "idf.npy", idf)
+    logger.info(f"Global IDF fit over {all_counts.shape[0]} episodes")
+
+    # --- Write per-(show, season) raw hashed-count matrices --------------------
+    # Cache v2 stores uint16 counts on disk rather than the L2-normalized
+    # float64 TF-IDF rows v1 used. The loader applies apply_tfidf(counts, idf)
+    # at startup; the matcher sees the same matrix it always did. Integer
+    # counts cast to uint16 are ~4x smaller in nnz bytes, and DEFLATE in
+    # .npz collapses the long runs of 1s much better than it ever could on
+    # floats — measured ~85% reduction (~8 KB/episode vs. ~66 KB for v1).
+    u16_max = np.iinfo(np.uint16).max
+    for tmdb_id_b, _show_name, season, codes, counts in blocks:
+        # Write to the runtime's canonical id-keyed dir (matches the str(tmdb_id)
+        # manifest key) via the shared formula so write/read can't drift.
+        show_dir = _corpus_show_dir(cache_dir, str(tmdb_id_b))
+        show_dir.mkdir(parents=True, exist_ok=True)
+        # HashingVectorizer emits float64 counts even with alternate_sign=False;
+        # cast to uint16 (clipped defensively — real per-episode token counts
+        # are 1-10, but a pathological transcript shouldn't blow up the build).
+        counts_u16 = sparse.csr_matrix(
+            (
+                np.minimum(counts.data, u16_max).astype(np.uint16),
+                counts.indices,
+                counts.indptr,
+            ),
+            shape=counts.shape,
+        )
+        sparse.save_npz(show_dir / f"S{season:02d}.npz", counts_u16)
+        with open(show_dir / f"S{season:02d}.index.json", "w", encoding="utf-8") as fh:
+            json.dump(codes, fh)
+
+    # --- In-tarball manifest (read by the matcher) -----------------------------
+    manifest = {
+        "cache_format_version": CACHE_FORMAT_VERSION,
+        "vectorizer_config_hash": vectorizer_config_hash(),
+        "content_version": content_version,
+        "built_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "n_features": HASHING_N_FEATURES,
+        "shows": manifest_shows,
+    }
+    with open(precomputed_dir / "manifest.json", "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+
+    # --- Package + checksum ----------------------------------------------------
+    output_path = Path(args.output).resolve()
+    with tarfile.open(output_path, "w:gz") as tar:
+        tar.add(precomputed_dir, arcname="precomputed")
+
+    sha = hashlib.sha256()
+    with open(output_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            sha.update(chunk)
+
+    # Release-asset manifest = in-tar manifest + the tarball checksum.
+    release_manifest = dict(manifest, tarball_sha256=sha.hexdigest())
+    release_manifest_path = output_path.with_name("manifest.json")
+    with open(release_manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(release_manifest, fh, indent=2)
+
+    if args.clean_srt:
+        data_dir = cache_dir / "data"
+        if data_dir.exists():
+            shutil.rmtree(data_dir)
+            logger.info("Deleted harvested SRT files (--clean-srt)")
+
+    total_episodes = sum(len(c) for _, _, _, c, _ in blocks)
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        f"Built cache: {len(manifest_shows)} shows, {total_episodes} episodes, "
+        f"{size_mb:.1f} MB -> {output_path}"
+    )
+    logger.info(f"Release manifest -> {release_manifest_path}")
+
+    # --- Final summary --------------------------------------------------------
+    # Single block readable in CI logs. ``console`` was created above in the
+    # Progress context but stays usable after the ``with`` exits.
+    console.log(
+        "[bold]Final summary[/]: "
+        f"{len(manifest_shows)} shows, {total_episodes} episodes packaged "
+        f"({size_mb:.1f} MB)\n" + _render_tally(tally)
+    )
+
+    if halted_reason:
+        logger.warning(
+            f"Run halted early: {halted_reason}. Shows harvested before the halt "
+            "were still packaged; re-run after the daily quota resets to continue."
+        )
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

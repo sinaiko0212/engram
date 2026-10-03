@@ -1,0 +1,770 @@
+"""Curator - Episode Matching Integration.
+
+Integrates with the local MKV episode matcher for audio fingerprint-based episode identification.
+"""
+
+import asyncio
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+from app.matcher.llm_episode_matcher import match_episode_via_llm
+from app.matcher.subtitle_utils import REFERENCES_UNREADABLE_ERROR_CODE
+from app.models.app_config import DEFAULT_FINGERPRINT_SERVER_URL
+
+logger = logging.getLogger(__name__)
+
+
+def _unreadable_count(details: dict) -> int:
+    """How many of a refused season's references had no readable text (0 if unknown)."""
+    usable = details.get("usable_references")
+    total = details.get("total_references")
+    if isinstance(usable, int) and isinstance(total, int):
+        return max(total - usable, 0)
+    return 0
+
+
+@dataclass
+class MatchResult:
+    """Result of matching a file to an episode."""
+
+    file_path: Path
+    episode_code: str | None  # e.g., "S01E01"
+    episode_title: str | None
+    confidence: float
+    needs_review: bool
+    match_details: dict | None = None
+
+
+class EpisodeCurator:
+    """Handles episode matching using the integrated MKV episode matcher."""
+
+    # Confidence thresholds
+    HIGH_CONFIDENCE_THRESHOLD = 0.7
+    LOW_CONFIDENCE_THRESHOLD = 0.5
+    CHROMAPRINT_GATE = 0.90
+
+    def __init__(self) -> None:
+        self._matcher = None
+        self._initialized = False
+        self._cache_dir: Path | None = None
+        self._current_show: str | None = None
+        self._current_show_id: str | None = None
+        self._current_tmdb_id: int | None = None
+
+    def _ensure_initialized(self, show_name: str, tmdb_id: int | None = None) -> bool:
+        """Lazily initialize the matcher library for a specific show.
+
+        When ``tmdb_id`` is known (e.g. after the user disambiguated a same-name
+        collision), it is used directly instead of resolving by name — and it is
+        passed to EpisodeMatcher as the corpus guard's expected id.
+        """
+        # Re-initialize if show name OR known id changed.
+        if (
+            self._initialized
+            and self._current_show == show_name
+            and self._current_tmdb_id == tmdb_id
+        ):
+            return self._matcher is not None
+
+        self._current_show = show_name
+        self._current_tmdb_id = tmdb_id
+
+        try:
+            # Import from local matcher package
+            from app.matcher.episode_identification import EpisodeMatcher
+            from app.matcher.tmdb_client import fetch_show_details, fetch_show_id
+
+            # Get cache directory from config (sync version for non-async context)
+            from app.services.config_service import get_config_sync
+
+            # Resolve canonical show name. Use the caller-supplied tmdb_id directly
+            # when known (skips fetch_show_id, which resolves by NAME and can't tell
+            # two same-named shows apart); otherwise resolve by name.
+            canonical_name = show_name
+            try:
+                if tmdb_id is not None:
+                    resolved_id = tmdb_id
+                    self._current_show_id = str(tmdb_id)
+                else:
+                    resolved_id = fetch_show_id(show_name)
+                    self._current_show_id = str(resolved_id) if resolved_id else None
+                if resolved_id:
+                    details = fetch_show_details(resolved_id)
+                    if details and "name" in details:
+                        canonical_name = details["name"]
+                        logger.info(
+                            f"Resolved '{show_name}' to canonical '{canonical_name}' for matching"
+                        )
+            except Exception as e:
+                logger.warning(f"Failed to resolve canonical name for '{show_name}': {e}")
+
+            config = get_config_sync()
+            if config and config.subtitles_cache_path:
+                self._cache_dir = Path(config.subtitles_cache_path).expanduser()
+            else:
+                # Fallback to default Engram cache location
+                self._cache_dir = Path.home() / ".engram" / "cache"
+
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+            self._matcher = EpisodeMatcher(
+                cache_dir=self._cache_dir,
+                show_name=canonical_name,
+                min_confidence=self.LOW_CONFIDENCE_THRESHOLD,
+                requested_workers=(config.max_concurrent_matches if config else 1),
+                expected_tmdb_id=tmdb_id,
+            )
+            self._initialized = True
+            logger.info(
+                f"Episode matcher initialized for show: {show_name} (cache_dir={self._cache_dir})"
+            )
+            return True
+        except ImportError as e:
+            logger.warning(f"Episode matcher not available: {e}")
+            self._initialized = True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to initialize episode matcher: {e}", exc_info=True)
+            self._initialized = True
+            return False
+
+    def _fallback_result(
+        self,
+        file_path: Path,
+        *,
+        parse_filename: bool = True,
+        match_details: dict | None = None,
+    ) -> MatchResult:
+        """Build an unmatched MatchResult that always needs review.
+
+        When parse_filename is True, attempts to recover an episode code from the
+        filename (confidence 0.3 if found, else 0.0). When False, the result is
+        always fully unmatched (confidence 0.0).
+        """
+        episode_code = self._parse_episode_from_filename(file_path.name) if parse_filename else None
+        return MatchResult(
+            file_path=file_path,
+            episode_code=episode_code,
+            episode_title=None,
+            confidence=0.3 if episode_code else 0.0,
+            needs_review=True,
+            match_details=match_details,
+        )
+
+    def _candidate_seasons(self, series_name: str | None) -> list[int]:
+        """Seasons worth searching when the season is unknown.
+
+        Prefers seasons that already have reference data (precomputed cloud cache
+        or downloaded subtitles) so we don't run Whisper against seasons we cannot
+        match. Falls back to 1..N from TMDB when nothing is cached yet.
+        """
+        show = (self._matcher.show_name if self._matcher else None) or series_name
+        if not show:
+            return []
+
+        seasons: set[int] = set()
+
+        # 1. Precomputed cloud cache — the manifest lists which seasons it covers.
+        if self._cache_dir:
+            try:
+                from app.matcher.episode_identification import load_precomputed_manifest
+
+                manifest = load_precomputed_manifest(self._cache_dir)
+                entry = (manifest or {}).get("shows", {}).get(show)
+                if entry:
+                    seasons.update(int(s) for s in entry.get("seasons", []))
+            except Exception as e:  # noqa: BLE001 — best-effort enumeration
+                logger.debug(f"Precomputed manifest unavailable for '{show}': {e}")
+
+        # 2. Subtitles already downloaded to disk (cache_dir/data/<tmdb_id>/*.srt).
+        #    Keyed by the job's tmdb_id (fallback: sanitized name) to match where
+        #    download_subtitles wrote them — same-named shows must not collide.
+        if self._cache_dir:
+            try:
+                from app.matcher.subtitle_utils import (
+                    corpus_dir_name,
+                    parse_season_episode_numbers,
+                )
+
+                data_dir = self._cache_dir / "data" / corpus_dir_name(self._current_tmdb_id, show)
+                if data_dir.is_dir():
+                    for srt in list(data_dir.glob("*.srt")) + list(data_dir.glob("*.SRT")):
+                        parsed = parse_season_episode_numbers(srt.name)
+                        if parsed:
+                            seasons.add(parsed[0])
+            except Exception as e:  # noqa: BLE001 — best-effort enumeration
+                logger.debug(f"Could not enumerate downloaded subtitles for '{show}': {e}")
+
+        if seasons:
+            return sorted(seasons)
+
+        # 3. Nothing cached yet — fall back to the show's full season count.
+        try:
+            from app.matcher.tmdb_client import fetch_show_id, get_number_of_seasons
+
+            show_id = self._current_show_id or fetch_show_id(show)
+            if show_id:
+                count = get_number_of_seasons(show_id)
+                if count and count > 0:
+                    return list(range(1, count + 1))
+        except Exception as e:  # noqa: BLE001 — best-effort enumeration
+            logger.debug(f"Could not resolve season count for '{show}': {e}")
+
+        return []
+
+    async def _match_across_seasons(
+        self,
+        file_path: Path,
+        series_name: str | None,
+        progress_callback: Callable[..., None] | None = None,
+        num_points: int | None = None,
+        min_vote_count: int | None = None,
+        tmdb_id: int | None = None,
+    ) -> MatchResult:
+        """Match a file when the season is unknown by searching every candidate season.
+
+        Runs the normal single-season matcher once per candidate season and keeps the
+        most confident episode match. Returns early on a confident (no-review) match to
+        bound the per-season Whisper cost. Falls back to filename parsing when no season
+        produces a match or none have references available.
+        """
+        seasons = self._candidate_seasons(series_name)
+        if not seasons:
+            logger.warning(
+                f"No candidate seasons with references for '{series_name}'; "
+                f"cannot audio-match {file_path.name} without a season"
+            )
+            return self._fallback_result(file_path)
+
+        logger.info(
+            f"Season unknown for {file_path.name}; searching seasons {seasons} of '{series_name}'"
+        )
+
+        # A season the matcher refused (too few usable references) yields no episode.
+        # Only when EVERY candidate season refuses does that reason explain the
+        # result; if any season could be read, the reason would mislead the reviewer
+        # and wrongly stop the title from being re-matched.
+        refusal_details: dict | None = None
+        every_season_refused = True
+        best: MatchResult | None = None
+        for s in seasons:
+            result = await self.match_single_file(
+                file_path, series_name, s, progress_callback, num_points, min_vote_count, tmdb_id
+            )
+            details = result.match_details or {}
+            if details.get("error") == REFERENCES_UNREADABLE_ERROR_CODE:
+                # Report the most damaged season: its "could not be read" message
+                # explains more than a merely small season's "too few subtitles".
+                if refusal_details is None or _unreadable_count(details) > _unreadable_count(
+                    refusal_details
+                ):
+                    refusal_details = details
+            else:
+                every_season_refused = False
+            if not result.episode_code:
+                continue
+            if best is None or result.confidence > best.confidence:
+                best = result
+            if not result.needs_review:
+                # A confident match is definitive; stop burning Whisper on other seasons.
+                break
+
+        if best is None:
+            return self._fallback_result(
+                file_path, match_details=refusal_details if every_season_refused else None
+            )
+        return best
+
+    async def match_files(
+        self,
+        files: list[Path],
+        series_name: str | None = None,
+        season: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        tmdb_id: int | None = None,
+    ) -> list[MatchResult]:
+        """Match a list of MKV files to episodes.
+
+        Args:
+            files: List of MKV file paths to match
+            series_name: Series name for reference subtitle lookup
+            season: Season number for matching
+            progress_callback: Optional callback(current, total)
+
+        Returns:
+            List of match results for each file
+        """
+        results = []
+        total_files = len(files)
+
+        # Series name is required for audio fingerprint matching
+        if not series_name:
+            logger.warning("No series name provided - falling back to filename parsing")
+            for file_path in files:
+                results.append(self._fallback_result(file_path))
+            return results
+
+        if not self._ensure_initialized(series_name, tmdb_id):
+            # Return unmatched results if matcher not available
+            for i, file_path in enumerate(files):
+                if progress_callback:
+                    progress_callback(i + 1, total_files)
+                results.append(self._fallback_result(file_path, parse_filename=False))
+            return results
+
+        for i, file_path in enumerate(files):
+            try:
+                result = await self.match_single_file(
+                    file_path, series_name, season, tmdb_id=tmdb_id
+                )
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error matching {file_path}: {e}")
+                results.append(self._fallback_result(file_path, parse_filename=False))
+
+            if progress_callback:
+                progress_callback(i + 1, total_files)
+
+        return results
+
+    async def match_single_file(
+        self,
+        file_path: Path,
+        series_name: str | None,
+        season: int | None,
+        progress_callback: Callable[..., None] | None = None,
+        num_points: int | None = None,
+        min_vote_count: int | None = None,
+        tmdb_id: int | None = None,
+    ) -> MatchResult:
+        """Match a single file to an episode using audio fingerprinting.
+
+        ``num_points``/``min_vote_count`` override the matcher's scan density and
+        minimum vote gate (used by the deep re-match path); None keeps defaults.
+        """
+        logger.info(
+            f"match_single_file called: {file_path.name}, series={series_name}, season={season}"
+        )
+
+        if not file_path.exists():
+            logger.error(f"File does not exist: {file_path}")
+            # non-fatal: fallback handles it
+
+        # Ensure matcher is initialized for this show
+        if series_name:
+            initialized = self._ensure_initialized(series_name, tmdb_id)
+            logger.info(
+                f"Matcher initialized={initialized}, matcher={'available' if self._matcher else 'None'}"
+            )
+
+        if not self._matcher:
+            # Fall back to filename parsing if the matcher is unavailable
+            return self._fallback_result(file_path)
+
+        if not season:
+            # Season unknown (e.g. a flat import folder with no Season NN dir):
+            # search across every candidate season and keep the best match.
+            return await self._match_across_seasons(
+                file_path, series_name, progress_callback, num_points, min_vote_count, tmdb_id
+            )
+
+        # Phase 3 cascade: chromaprint first (no-op when the flag is off → identical to legacy ASR path).
+        # The guard above already guarantees `season` is truthy, so only `series_name` needs checking.
+        cp = None
+        if series_name:
+            try:
+                cp = await self._chromaprint_prepass(
+                    file_path=file_path, series_name=series_name, season=season, tmdb_id=tmdb_id
+                )
+            except Exception as e:  # noqa: BLE001 — never block matching
+                logger.warning(f"chromaprint prepass failed: {e}", exc_info=True)
+
+        if cp and cp.get("episode") is not None:
+            cp_conf = cp.get("confidence", 0.0)
+            cp_code = f"S{cp['season']:02d}E{cp['episode']:02d}"
+            if cp.get("tier") == "canonical" and cp_conf >= self.CHROMAPRINT_GATE:
+                details = dict(cp.get("match_details") or {})
+                details["chromaprint_accepted"] = True
+                details["match_source"] = "engram_chromaprint"
+                logger.info(
+                    f"chromaprint accepted {file_path.name} -> {cp_code} (conf {cp_conf:.2f})"
+                )
+                return MatchResult(
+                    file_path=file_path,
+                    episode_code=cp_code,
+                    episode_title=None,
+                    confidence=cp_conf,
+                    needs_review=False,
+                    match_details=details,
+                )
+
+        # Fall through to ASR (the legacy path). Pass tmdb_id by keyword so it can't be
+        # misrouted if a positional parameter is ever inserted before it.
+        asr = await self._run_asr_identify(
+            file_path,
+            series_name,
+            season,
+            progress_callback,
+            num_points,
+            min_vote_count,
+            tmdb_id=tmdb_id,
+        )
+
+        # Cross-validate when BOTH produced an episode.
+        if cp and cp.get("episode") is not None and asr.episode_code:
+            cp_code = f"S{cp['season']:02d}E{cp['episode']:02d}"
+            details = dict(asr.match_details or {})
+            if cp_code == asr.episode_code:
+                details["chromaprint_asr_agreement"] = True
+                return MatchResult(
+                    file_path=file_path,
+                    episode_code=asr.episode_code,
+                    episode_title=asr.episode_title,
+                    confidence=max(asr.confidence, cp.get("confidence", 0.0)),
+                    needs_review=False,
+                    match_details=details,
+                )
+            details["chromaprint_vs_asr_conflict"] = {
+                "chromaprint": {"episode_code": cp_code, "confidence": cp.get("confidence")},
+                "asr": {"episode_code": asr.episode_code, "confidence": asr.confidence},
+            }
+            return MatchResult(
+                file_path=file_path,
+                episode_code=asr.episode_code,
+                episode_title=asr.episode_title,
+                confidence=asr.confidence,
+                needs_review=True,
+                match_details=details,
+            )
+        return asr
+
+    async def _run_asr_identify(
+        self,
+        file_path: Path,
+        series_name: str | None,
+        season: int | None,
+        progress_callback: Callable[..., None] | None = None,
+        num_points: int | None = None,
+        min_vote_count: int | None = None,
+        tmdb_id: int | None = None,
+    ) -> MatchResult:
+        """Run the ASR/subtitle matching path — the original match_single_file try/except body.
+
+        ``tmdb_id`` is forwarded to the LLM fallback so it builds context from the
+        known show identity rather than re-resolving by name (collision-safe).
+        """
+        try:
+            # Run the matcher in a thread to not block async loop
+            logger.debug(f"[Curator] Starting identifying_episode in thread for {file_path.name}")
+            match = await asyncio.to_thread(
+                self._matcher.identify_episode,
+                file_path,
+                self._cache_dir,
+                season,
+                progress_callback,
+                num_points,
+                min_vote_count,
+            )
+            logger.debug(f"[Curator] identify_episode returned for {file_path.name}: {match}")
+
+            if match and match.get("episode") is not None:
+                episode_code = f"S{match['season']:02d}E{match['episode']:02d}"
+                confidence = match.get("confidence", 0.0)
+                needs_review = confidence < self.HIGH_CONFIDENCE_THRESHOLD
+
+                logger.info(
+                    f"Matched {file_path.name} -> {episode_code} (confidence: {confidence:.2f})"
+                )
+
+                # Include runner_ups in match_details for cascading conflict resolution
+                details = match.get("match_details") or {}
+                if match.get("runner_ups"):
+                    details = dict(details)  # Copy to avoid mutating original
+                    details["runner_ups"] = match["runner_ups"]
+
+                # LLM episode-matching fallback — only runs when the primary
+                # match needs review, config is enabled, and the season is known.
+                # Reuse the primary matcher's transcript if it took the
+                # full-file fallback path (avoids re-running Whisper).
+                if needs_review and season:
+                    existing_transcript = match.get("transcript") if match else None
+                    enriched = await self._maybe_add_llm_suggestion(
+                        file_path=file_path,
+                        series_name=series_name,
+                        season=season,
+                        match_details=details,
+                        existing_transcript=existing_transcript,
+                        tmdb_id=tmdb_id,
+                    )
+                    if enriched is not None:
+                        details = enriched
+
+                return MatchResult(
+                    file_path=file_path,
+                    episode_code=episode_code,
+                    episode_title=None,  # Could fetch from TMDB
+                    confidence=confidence,
+                    needs_review=needs_review,
+                    match_details=details,
+                )
+            else:
+                # No match found - fall back to filename, preserving stats if available
+                details = match.get("match_details") if match else None
+                fallback = self._fallback_result(file_path, match_details=details)
+                if season:
+                    existing_transcript = match.get("transcript") if match else None
+                    enriched = await self._maybe_add_llm_suggestion(
+                        file_path=file_path,
+                        series_name=series_name,
+                        season=season,
+                        match_details=fallback.match_details or {},
+                        existing_transcript=existing_transcript,
+                        tmdb_id=tmdb_id,
+                    )
+                    if enriched is not None:
+                        fallback.match_details = enriched
+                return fallback
+
+        except Exception as e:
+            logger.error(f"Matcher error for {file_path}: {e}")
+            # Fall back to filename parsing
+            return self._fallback_result(file_path)
+
+    async def _chromaprint_prepass(
+        self,
+        *,
+        file_path: Path,
+        series_name: str,
+        season: int,
+        tmdb_id: int | None = None,
+    ) -> dict | None:
+        """Run chromaprint identification; return its result dict or None if unavailable/empty.
+
+        When ``tmdb_id`` is known (e.g. the user disambiguated a same-name show), it is
+        used directly to fetch the fingerprint pack — skipping ``fetch_show_id``, which
+        resolves by NAME and cannot tell apart same-name collisions (Frasier 1993 #3452
+        vs the 2023 revival #195241).
+        """
+        from app.services.config_service import get_config
+
+        cfg = await get_config()
+        if not cfg or not getattr(cfg, "enable_fingerprint_identification", False):
+            return None
+        if self._matcher is None:
+            return None
+
+        from app.api.validation import detect_ffmpeg, detect_fpcalc
+
+        fpcalc = cfg.fpcalc_path
+        if not fpcalc:
+            detected = detect_fpcalc()
+            fpcalc = detected.path if detected.found else None
+        if not fpcalc:
+            return None
+
+        # ffmpeg backs the pre-decode fallback for codecs fpcalc can't decode.
+        ffmpeg = cfg.ffmpeg_path
+        if not ffmpeg:
+            detected_ffmpeg = detect_ffmpeg()
+            ffmpeg = detected_ffmpeg.path if detected_ffmpeg.found else None
+
+        if tmdb_id is not None:
+            show_id = tmdb_id
+        else:
+            from app.matcher.tmdb_client import fetch_show_id
+
+            show_id = await asyncio.to_thread(fetch_show_id, series_name)
+        if not show_id:
+            return None
+
+        from app.matcher.chromaprint_extractor import ChromaprintExtractor
+        from app.matcher.chromaprint_matcher import ChromaprintMatcher, identify_episode_chromaprint
+        from app.matcher.episode_identification import get_video_duration
+
+        server_url = cfg.fingerprint_server_url or DEFAULT_FINGERPRINT_SERVER_URL
+        pack_cache = getattr(self, "_pack_cache", None)
+        if pack_cache is not None:
+            try:
+                await pack_cache.ensure(int(show_id), server_url)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"pack ensure failed: {e}")
+
+        cm = ChromaprintMatcher(tmdb_id=int(show_id), server_url=server_url, pack_cache=pack_cache)
+        extractor = ChromaprintExtractor(fpcalc_path=fpcalc, ffmpeg_path=ffmpeg)
+        try:
+            video_duration = await asyncio.to_thread(get_video_duration, str(file_path))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"chromaprint prepass: could not get duration: {e}")
+            return None
+        return await identify_episode_chromaprint(
+            matcher=self._matcher,
+            video_file=str(file_path),
+            season_number=season,
+            chromaprint_matcher=cm,
+            extractor=extractor,
+            video_duration=video_duration,
+        )
+
+    async def _maybe_add_llm_suggestion(
+        self,
+        *,
+        file_path: Path,
+        series_name: str,
+        season: int,
+        match_details: dict | None = None,
+        existing_transcript: str | None = None,
+        tmdb_id: int | None = None,
+    ) -> dict | None:
+        """Run the LLM matcher when enabled and attach the suggestion to match_details.
+
+        Returns the updated match_details dict, or None to keep the caller's dict.
+
+        ``existing_transcript`` lets callers pass through a transcript the
+        primary matcher already produced (via the full-file fallback path),
+        avoiding a duplicate Whisper run when the matcher just transcribed.
+
+        ``tmdb_id``, when known, is used directly instead of ``fetch_show_id`` so the
+        LLM gets context for the correct show even when another show shares its name.
+        """
+        from app.services.config_service import get_config
+
+        config = await get_config()
+        if not config or not getattr(config, "ai_episode_matching_enabled", False):
+            return None
+        from app.core.ai_client import ai_is_configured
+
+        if not ai_is_configured(config.ai_provider, config.ai_api_key):
+            return None
+
+        # Resolve TMDB show id — prefer the known id; otherwise resolve by name.
+        if tmdb_id is not None:
+            tmdb_show_id = tmdb_id
+        else:
+            from app.matcher.tmdb_client import fetch_show_id
+
+            tmdb_show_id = await asyncio.to_thread(fetch_show_id, series_name)
+        if not tmdb_show_id:
+            logger.info(f"LLM fallback: no TMDB show_id for {series_name!r}")
+            return None
+
+        if not self._matcher:
+            return None
+
+        if existing_transcript:
+            transcript = existing_transcript
+        else:
+            transcript = await asyncio.to_thread(self._matcher.transcribe_full, file_path)
+        if not transcript:
+            return None
+
+        try:
+            suggestion = await match_episode_via_llm(
+                transcript=transcript,
+                show_name=series_name,
+                season=season,
+                tmdb_show_id=str(tmdb_show_id),
+                ai_provider=config.ai_provider,
+                ai_api_key=config.ai_api_key,
+                ai_model=getattr(config, "ai_model", "") or None,
+                ai_local_base_url=getattr(config, "ai_local_base_url", "") or "",
+                tmdb_api_key=config.tmdb_api_key,
+            )
+        except Exception as e:
+            logger.warning(f"LLM fallback raised: {e}", exc_info=True)
+            return None
+
+        if not suggestion:
+            return None
+
+        enriched = dict(match_details) if match_details else {}
+        enriched["llm_suggestion"] = {
+            "episode": suggestion.episode,
+            "confidence": suggestion.confidence,
+            "reasoning": suggestion.reasoning,
+            "runner_up": (
+                {
+                    "episode": suggestion.runner_up.episode,
+                    "confidence": suggestion.runner_up.confidence,
+                }
+                if suggestion.runner_up is not None
+                else None
+            ),
+            "model": suggestion.model,
+        }
+        return enriched
+
+    async def suggest_episode_via_llm(
+        self, *, file_path: Path, series_name: str, season: int
+    ) -> dict | None:
+        """Run only the AI episode matcher for a file — no subtitle-based matching.
+
+        This is the no-subtitles fallback: it ASR-transcribes the ripped file and
+        asks the LLM to pick the episode from the TMDB season synopsis. Reference
+        subtitles are NOT required (only the show + season), which is exactly the
+        case the normal pipeline can't handle because it gates on subtitles.
+
+        Returns ``match_details`` carrying an ``llm_suggestion`` for the Review UI,
+        or ``None`` when the matcher can't initialize or AI matching is
+        disabled/unconfigured/produces nothing (the caller then falls back to
+        plain manual review).
+        """
+        # Initialize in the event loop, NOT a worker thread: _ensure_initialized
+        # mutates singleton state (_matcher/_current_show/...) and the regular
+        # match path also calls it from the loop, so a thread dispatch could race
+        # with a concurrent job for a different show and clobber the active
+        # matcher. The blocking TMDB lookups inside are cached.
+        if not self._ensure_initialized(series_name):
+            return None
+        return await self._maybe_add_llm_suggestion(
+            file_path=file_path,
+            series_name=series_name,
+            season=season,
+        )
+
+    def _parse_episode_from_filename(self, filename: str) -> str | None:
+        """Try to parse episode code from filename.
+
+        This is a fallback when audio fingerprinting is not available.
+        """
+        import re
+
+        # Common patterns: S01E01, 1x01, etc.
+        patterns = [
+            r"S(\d+)E(\d+)",
+            r"(\d+)x(\d+)",
+            r"Season\s*(\d+)\s*Episode\s*(\d+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, filename, re.IGNORECASE)
+            if match:
+                season = int(match.group(1))
+                episode = int(match.group(2))
+                return f"S{season:02d}E{episode:02d}"
+
+        return None
+
+    def classify_results(
+        self, results: list[MatchResult]
+    ) -> tuple[list[MatchResult], list[MatchResult]]:
+        """Classify results into high-confidence and needs-review.
+
+        Returns:
+            Tuple of (high_confidence_results, needs_review_results)
+        """
+        high_confidence = []
+        needs_review = []
+
+        for result in results:
+            if result.confidence >= self.HIGH_CONFIDENCE_THRESHOLD and not result.needs_review:
+                high_confidence.append(result)
+            else:
+                needs_review.append(result)
+
+        return high_confidence, needs_review
+
+
+# Singleton instance
+curator = EpisodeCurator()

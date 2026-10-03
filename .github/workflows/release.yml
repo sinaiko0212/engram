@@ -1,0 +1,708 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.7.3)"
+        required: true
+        type: string
+      draft:
+        description: "Create as a draft release (hidden from users; for testing builds)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# See ci.yml for context on the Node 24 opt-in.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Build frontend
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # Copy frontend build into backend for bundling
+      - name: Bundle frontend
+        run: |
+          Copy-Item -Recurse frontend/dist backend/app/static
+        shell: pwsh
+
+      # Build backend executable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          uv sync --no-install-project
+          # Pin the build toolchain so release artifacts are reproducible and a
+          # PyInstaller / hooks-contrib release can't silently change what gets
+          # bundled (a hooks-contrib change is what dropped certifi from 0.14.0).
+          uv pip install "pyinstaller==6.20.0" "pyinstaller-hooks-contrib==2026.5"
+      - name: Fetch fpcalc (bundled audio fingerprinter)
+        working-directory: backend
+        run: uv run python scripts/fetch_fpcalc.py
+
+      - name: Build executable
+        working-directory: backend
+        run: uv run pyinstaller engram.spec
+
+      - name: Smoke test built executable
+        shell: pwsh
+        env:
+          PORT: "8765"
+          HOST: "127.0.0.1"
+        run: |
+          $exe = "backend/dist/engram/engram.exe"
+          if (-not (Test-Path $exe)) { throw "executable not found at $exe" }
+          $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput smoke-stdout.log -RedirectStandardError smoke-stderr.log
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:8765/api/jobs" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { $ready = $true; break }
+              } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) {
+              Write-Host "===== stdout ====="
+              Get-Content smoke-stdout.log -ErrorAction SilentlyContinue
+              Write-Host "===== stderr ====="
+              Get-Content smoke-stderr.log -ErrorAction SilentlyContinue
+              throw "executable never became ready"
+            }
+            # Fork-bomb regression guard: a healthy onedir server is ~1 process;
+            # a spawn fork-bomb produces 10+ within seconds, so >2 is a safe trigger.
+            $count = (Get-Process engram -ErrorAction SilentlyContinue | Measure-Object).Count
+            Write-Host "engram process count: $count"
+            if ($count -gt 2) { throw "too many engram processes ($count) - possible multiprocessing fork-bomb" }
+            # fpcalc must be bundled and detected — the whole point of shipping it.
+            # The endpoint shells out to ffmpeg/fpcalc subprocesses; on a fresh
+            # Windows runner the first execution of a just-extracted binary pays
+            # Defender real-time-scan + cold process-creation latency that can blow
+            # past a tight one-shot timeout (this is what flaked the v0.16.1 release).
+            # Retry with a generous per-attempt timeout — the first attempt warms the
+            # cache so a retry returns fast. The gate stays strict: it still requires
+            # fpcalc.found, it just tolerates transient first-run slowness.
+            $tools = $null
+            for ($i = 0; $i -lt 4; $i++) {
+              try {
+                $tools = Invoke-RestMethod -Uri "http://127.0.0.1:8765/api/detect-tools" -TimeoutSec 15
+                break
+              } catch {
+                Write-Host "detect-tools attempt $($i + 1) failed: $($_.Exception.Message)"
+                if ($i -lt 3) { Start-Sleep -Seconds 2 }
+              }
+            }
+            if ($null -eq $tools) { throw "detect-tools never responded after 4 attempts" }
+            if (-not $tools.fpcalc.found) { throw "bundled fpcalc was not detected: $($tools.fpcalc.error)" }
+            Write-Host "fpcalc detected: $($tools.fpcalc.path)"
+            Write-Host "smoke test passed"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify CA bundle + bundled fpcalc + TLS self-test
+        shell: pwsh
+        run: |
+          # Deterministic guard: the build MUST contain certifi's CA bundle. Its
+          # absence is what broke 0.14.0 (every HTTPS call -> FileNotFoundError).
+          $ca = "backend/dist/engram/_internal/certifi/cacert.pem"
+          if (-not (Test-Path $ca)) { throw "certifi CA bundle missing from build ($ca)" }
+          if ((Get-Item $ca).Length -lt 50000) { throw "certifi CA bundle suspiciously small" }
+          Write-Host "certifi CA bundle present: $((Get-Item $ca).Length) bytes"
+          # Deterministic guard for the bundled fpcalc, independent of server timing
+          # (the smoke test's detect-tools probe additionally proves the frozen app
+          # can execute it). engram.spec bundles it to bin/, which is _internal/bin/
+          # in the onedir layout — the same path detect_fpcalc() resolves via _MEIPASS.
+          $fp = "backend/dist/engram/_internal/bin/fpcalc.exe"
+          if (-not (Test-Path $fp)) { throw "bundled fpcalc missing from build ($fp)" }
+          Write-Host "bundled fpcalc present: $fp"
+          # Prove the frozen runtime can actually complete a TLS handshake.
+          & "backend/dist/engram/engram.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "TLS self-test failed (exit $LASTEXITCODE)" }
+
+      - name: Generate file manifest
+        shell: pwsh
+        run: |
+          # sha256sum-style manifest, paths relative to the engram/ dir. The updater
+          # verifies every listed path exists after extraction -> catches a truncated
+          # download/extract (the 181-of-825-files failure) before it can be applied.
+          $root = (Resolve-Path "backend/dist/engram").Path
+          Get-ChildItem -Recurse -File $root | ForEach-Object {
+            $rel = $_.FullName.Substring($root.Length + 1) -replace '\\','/'
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower()
+            "$hash  $rel"
+          } | Set-Content -Encoding ascii engram-windows-x64.manifest.sha256
+          Write-Host "manifest entries: $((Get-Content engram-windows-x64.manifest.sha256).Count)"
+
+      - name: Package
+        run: Compress-Archive -Path backend/dist/engram -DestinationPath engram-windows-x64.zip
+        shell: pwsh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engram-windows-x64
+          path: |
+            engram-windows-x64.zip
+            engram-windows-x64.manifest.sha256
+
+  build-linux:
+    name: Build Linux Executable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Build frontend
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # Copy frontend build into backend for bundling
+      - name: Bundle frontend
+        run: cp -r frontend/dist backend/app/static
+
+      # Build backend executable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          uv sync --no-install-project
+          # Pin the build toolchain so release artifacts are reproducible and a
+          # PyInstaller / hooks-contrib release can't silently change what gets
+          # bundled (a hooks-contrib change is what dropped certifi from 0.14.0).
+          uv pip install "pyinstaller==6.20.0" "pyinstaller-hooks-contrib==2026.5"
+      - name: Fetch fpcalc (bundled audio fingerprinter)
+        working-directory: backend
+        run: uv run python scripts/fetch_fpcalc.py
+
+      - name: Build executable
+        working-directory: backend
+        run: uv run pyinstaller engram.spec
+
+      - name: Verify binary architecture
+        run: |
+          file backend/dist/engram/engram
+          file backend/dist/engram/engram | grep -q 'x86-64' \
+            || { echo "binary is not x86-64 as expected"; exit 1; }
+
+      # Shared with ci.yml's frozen-build gate so PR-time and release-time
+      # assertions cannot drift. See backend/scripts/smoke_test_frozen.sh.
+      - name: Smoke test built executable
+        env:
+          PORT: "8765"
+          HOST: "127.0.0.1"
+        run: backend/scripts/smoke_test_frozen.sh backend/dist/engram/engram
+
+      - name: Verify CA bundle + bundled fpcalc + TLS self-test
+        run: |
+          ca="backend/dist/engram/_internal/certifi/cacert.pem"
+          test -f "$ca" || { echo "certifi CA bundle missing from build ($ca)"; exit 1; }
+          size=$(stat -c%s "$ca")
+          [ "$size" -ge 50000 ] || { echo "certifi CA bundle suspiciously small ($size)"; exit 1; }
+          echo "certifi CA bundle present: $size bytes"
+          # Deterministic guard for the bundled fpcalc (_internal/bin/, the path
+          # detect_fpcalc() resolves via _MEIPASS) — independent of server timing.
+          fpc="backend/dist/engram/_internal/bin/fpcalc"
+          test -f "$fpc" || { echo "bundled fpcalc missing from build ($fpc)"; exit 1; }
+          echo "bundled fpcalc present: $fpc"
+          ./backend/dist/engram/engram --selftest || { echo "TLS self-test failed"; exit 1; }
+
+      - name: Generate file manifest
+        run: |
+          # sha256sum-style manifest, paths relative to the engram/ dir (no leading
+          # ./). The updater verifies every listed path exists after extraction.
+          ( cd backend/dist/engram && find . -type f -printf '%P\0' | sort -z | xargs -0 sha256sum ) \
+            > engram-linux-x64.manifest.sha256
+          echo "manifest entries: $(wc -l < engram-linux-x64.manifest.sha256)"
+
+      - name: Package
+        run: tar -czf engram-linux-x64.tar.gz -C backend/dist engram
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engram-linux-x64
+          path: |
+            engram-linux-x64.tar.gz
+            engram-linux-x64.manifest.sha256
+
+  build-linux-arm64:
+    name: Build Linux Executable (arm64)
+    # GitHub-hosted aarch64 runner (free for public repos). Produces the native
+    # Linux arm64 bundle for NVIDIA Jetson and other aarch64 Linux devices. ASR
+    # is CPU-only here: the ctranslate2 aarch64 wheel on PyPI has no CUDA build,
+    # so GPU on Jetson is an opt-in on-device step (see docs/development/jetson.md).
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      # Build frontend
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # Copy frontend build into backend for bundling
+      - name: Bundle frontend
+        run: cp -r frontend/dist backend/app/static
+
+      # Build backend executable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          uv sync --no-install-project
+          # Pin the build toolchain so release artifacts are reproducible and a
+          # PyInstaller / hooks-contrib release can't silently change what gets
+          # bundled (a hooks-contrib change is what dropped certifi from 0.14.0).
+          uv pip install "pyinstaller==6.20.0" "pyinstaller-hooks-contrib==2026.5"
+      - name: Fetch fpcalc (bundled audio fingerprinter)
+        working-directory: backend
+        run: uv run python scripts/fetch_fpcalc.py
+
+      - name: Build executable
+        working-directory: backend
+        run: uv run pyinstaller engram.spec
+
+      - name: Verify binary architecture
+        run: |
+          file backend/dist/engram/engram
+          file backend/dist/engram/engram | grep -q 'aarch64' \
+            || { echo "binary is not aarch64 as expected"; exit 1; }
+
+      # Shared with ci.yml's frozen-build gate so PR-time and release-time
+      # assertions cannot drift. See backend/scripts/smoke_test_frozen.sh.
+      - name: Smoke test built executable
+        env:
+          PORT: "8765"
+          HOST: "127.0.0.1"
+        run: backend/scripts/smoke_test_frozen.sh backend/dist/engram/engram
+
+      - name: Verify CA bundle + bundled fpcalc + TLS self-test
+        run: |
+          ca="backend/dist/engram/_internal/certifi/cacert.pem"
+          test -f "$ca" || { echo "certifi CA bundle missing from build ($ca)"; exit 1; }
+          size=$(stat -c%s "$ca")
+          [ "$size" -ge 50000 ] || { echo "certifi CA bundle suspiciously small ($size)"; exit 1; }
+          echo "certifi CA bundle present: $size bytes"
+          # Deterministic guard for the bundled fpcalc (_internal/bin/, the path
+          # detect_fpcalc() resolves via _MEIPASS) — independent of server timing.
+          fpc="backend/dist/engram/_internal/bin/fpcalc"
+          test -f "$fpc" || { echo "bundled fpcalc missing from build ($fpc)"; exit 1; }
+          echo "bundled fpcalc present: $fpc"
+          ./backend/dist/engram/engram --selftest || { echo "TLS self-test failed"; exit 1; }
+
+      - name: Generate file manifest
+        run: |
+          # sha256sum-style manifest, paths relative to the engram/ dir (no leading
+          # ./). The updater verifies every listed path exists after extraction.
+          ( cd backend/dist/engram && find . -type f -printf '%P\0' | sort -z | xargs -0 sha256sum ) \
+            > engram-linux-arm64.manifest.sha256
+          echo "manifest entries: $(wc -l < engram-linux-arm64.manifest.sha256)"
+
+      - name: Package
+        run: tar -czf engram-linux-arm64.tar.gz -C backend/dist engram
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engram-linux-arm64
+          path: |
+            engram-linux-arm64.tar.gz
+            engram-linux-arm64.manifest.sha256
+
+  build-linux-headless:
+    name: Build Linux Executable (x64, headless/server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Bundle frontend
+        run: cp -r frontend/dist backend/app/static
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          uv sync --no-install-project
+          uv pip install "pyinstaller==6.20.0" "pyinstaller-hooks-contrib==2026.5"
+      - name: Fetch fpcalc (bundled audio fingerprinter)
+        working-directory: backend
+        run: uv run python scripts/fetch_fpcalc.py
+
+      - name: Build headless executable
+        working-directory: backend
+        env:
+          HEADLESS_BUILD: "1"
+        run: uv run pyinstaller engram.spec
+
+      - name: Verify binary architecture
+        run: |
+          file backend/dist/engram/engram
+          file backend/dist/engram/engram | grep -q 'x86-64' \
+            || { echo "binary is not x86-64 as expected"; exit 1; }
+
+      # Shared with ci.yml's frozen-build gate so PR-time and release-time
+      # assertions cannot drift. See backend/scripts/smoke_test_frozen.sh.
+      - name: Smoke test built executable
+        env:
+          PORT: "8765"
+        run: backend/scripts/smoke_test_frozen.sh backend/dist/engram/engram --expect-lan-access
+
+      - name: Verify CA bundle + bundled fpcalc + TLS self-test
+        run: |
+          ca="backend/dist/engram/_internal/certifi/cacert.pem"
+          test -f "$ca" || { echo "certifi CA bundle missing from build ($ca)"; exit 1; }
+          size=$(stat -c%s "$ca")
+          [ "$size" -ge 50000 ] || { echo "certifi CA bundle suspiciously small ($size)"; exit 1; }
+          echo "certifi CA bundle present: $size bytes"
+          fpc="backend/dist/engram/_internal/bin/fpcalc"
+          test -f "$fpc" || { echo "bundled fpcalc missing from build ($fpc)"; exit 1; }
+          echo "bundled fpcalc present: $fpc"
+          ./backend/dist/engram/engram --selftest || { echo "TLS self-test failed"; exit 1; }
+
+      - name: Generate file manifest
+        run: |
+          ( cd backend/dist/engram && find . -type f -printf '%P\0' | sort -z | xargs -0 sha256sum ) \
+            > engram-linux-x64-headless.manifest.sha256
+          echo "manifest entries: $(wc -l < engram-linux-x64-headless.manifest.sha256)"
+
+      - name: Package
+        run: tar -czf engram-linux-x64-headless.tar.gz -C backend/dist engram
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engram-linux-x64-headless
+          path: |
+            engram-linux-x64-headless.tar.gz
+            engram-linux-x64-headless.manifest.sha256
+
+  build-linux-arm64-headless:
+    name: Build Linux Executable (arm64, headless/server)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Bundle frontend
+        run: cp -r frontend/dist backend/app/static
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          uv sync --no-install-project
+          uv pip install "pyinstaller==6.20.0" "pyinstaller-hooks-contrib==2026.5"
+      - name: Fetch fpcalc (bundled audio fingerprinter)
+        working-directory: backend
+        run: uv run python scripts/fetch_fpcalc.py
+
+      - name: Build headless executable
+        working-directory: backend
+        env:
+          HEADLESS_BUILD: "1"
+        run: uv run pyinstaller engram.spec
+
+      - name: Verify binary architecture
+        run: |
+          file backend/dist/engram/engram
+          file backend/dist/engram/engram | grep -q 'aarch64' \
+            || { echo "binary is not aarch64 as expected"; exit 1; }
+
+      # Shared with ci.yml's frozen-build gate so PR-time and release-time
+      # assertions cannot drift. See backend/scripts/smoke_test_frozen.sh.
+      - name: Smoke test built executable
+        env:
+          PORT: "8765"
+        run: backend/scripts/smoke_test_frozen.sh backend/dist/engram/engram --expect-lan-access
+
+      - name: Verify CA bundle + bundled fpcalc + TLS self-test
+        run: |
+          ca="backend/dist/engram/_internal/certifi/cacert.pem"
+          test -f "$ca" || { echo "certifi CA bundle missing from build ($ca)"; exit 1; }
+          size=$(stat -c%s "$ca")
+          [ "$size" -ge 50000 ] || { echo "certifi CA bundle suspiciously small ($size)"; exit 1; }
+          echo "certifi CA bundle present: $size bytes"
+          fpc="backend/dist/engram/_internal/bin/fpcalc"
+          test -f "$fpc" || { echo "bundled fpcalc missing from build ($fpc)"; exit 1; }
+          echo "bundled fpcalc present: $fpc"
+          ./backend/dist/engram/engram --selftest || { echo "TLS self-test failed"; exit 1; }
+
+      - name: Generate file manifest
+        run: |
+          ( cd backend/dist/engram && find . -type f -printf '%P\0' | sort -z | xargs -0 sha256sum ) \
+            > engram-linux-arm64-headless.manifest.sha256
+          echo "manifest entries: $(wc -l < engram-linux-arm64-headless.manifest.sha256)"
+
+      - name: Package
+        run: tar -czf engram-linux-arm64-headless.tar.gz -C backend/dist engram
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engram-linux-arm64-headless
+          path: |
+            engram-linux-arm64-headless.tar.gz
+            engram-linux-arm64-headless.manifest.sha256
+
+  build-macos:
+    name: Build macOS Executable (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15 # Apple Silicon arm64 (also runs on Intel via Rosetta 2)
+            arch: arm64
+            file_arch: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      # Build frontend
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Bundle frontend
+        run: cp -r frontend/dist backend/app/static
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: brew install libsndfile ffmpeg
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          uv sync --no-install-project
+          # Pin the build toolchain so release artifacts are reproducible and a
+          # PyInstaller / hooks-contrib release can't silently change what gets
+          # bundled (a hooks-contrib change is what dropped certifi from 0.14.0).
+          uv pip install "pyinstaller==6.20.0" "pyinstaller-hooks-contrib==2026.5"
+      - name: Fetch fpcalc (bundled audio fingerprinter)
+        working-directory: backend
+        run: uv run python scripts/fetch_fpcalc.py
+
+      - name: Build executable
+        working-directory: backend
+        run: uv run pyinstaller engram.spec
+
+      - name: Verify binary architecture
+        run: |
+          file backend/dist/engram/engram
+          file backend/dist/engram/engram | grep -q '${{ matrix.file_arch }}' \
+            || { echo "binary is not ${{ matrix.file_arch }} as expected"; exit 1; }
+
+      # Shared with ci.yml's frozen-build gate so PR-time and release-time
+      # assertions cannot drift. See backend/scripts/smoke_test_frozen.sh.
+      - name: Smoke test built executable
+        env:
+          PORT: "8765"
+          HOST: "127.0.0.1"
+        run: backend/scripts/smoke_test_frozen.sh backend/dist/engram/engram
+
+      - name: Verify CA bundle + bundled fpcalc + TLS self-test
+        run: |
+          ca="backend/dist/engram/_internal/certifi/cacert.pem"
+          test -f "$ca" || { echo "certifi CA bundle missing from build ($ca)"; exit 1; }
+          size=$(stat -f%z "$ca")
+          [ "$size" -ge 50000 ] || { echo "certifi CA bundle suspiciously small ($size)"; exit 1; }
+          echo "certifi CA bundle present: $size bytes"
+          # Deterministic guard for the bundled fpcalc (_internal/bin/, the path
+          # detect_fpcalc() resolves via _MEIPASS) — independent of server timing.
+          fpc="backend/dist/engram/_internal/bin/fpcalc"
+          test -f "$fpc" || { echo "bundled fpcalc missing from build ($fpc)"; exit 1; }
+          echo "bundled fpcalc present: $fpc"
+          ./backend/dist/engram/engram --selftest || { echo "TLS self-test failed"; exit 1; }
+
+      - name: Generate file manifest
+        run: |
+          # BSD find lacks -printf; strip the leading ./ with sed. shasum on macOS.
+          ( cd backend/dist/engram && find . -type f -print0 | sort -z \
+            | xargs -0 shasum -a 256 | sed 's#  \./#  #' ) \
+            > engram-macos-${{ matrix.arch }}.manifest.sha256
+          echo "manifest entries: $(wc -l < engram-macos-${{ matrix.arch }}.manifest.sha256)"
+
+      - name: Package
+        run: tar -czf engram-macos-${{ matrix.arch }}.tar.gz -C backend/dist engram
+      - uses: actions/upload-artifact@v7
+        with:
+          name: engram-macos-${{ matrix.arch }}
+          path: |
+            engram-macos-${{ matrix.arch }}.tar.gz
+            engram-macos-${{ matrix.arch }}.manifest.sha256
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-windows, build-linux, build-linux-arm64, build-macos, build-linux-headless, build-linux-arm64-headless]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Need CHANGELOG.md for the release body and full tag history so the
+          # "Full Changelog" compare link can resolve the previous tag.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: engram-windows-x64
+      - uses: actions/download-artifact@v8
+        with:
+          name: engram-linux-x64
+      - uses: actions/download-artifact@v8
+        with:
+          name: engram-linux-arm64
+      - uses: actions/download-artifact@v8
+        with:
+          name: engram-macos-arm64
+      - uses: actions/download-artifact@v8
+        with:
+          name: engram-linux-x64-headless
+      - uses: actions/download-artifact@v8
+        with:
+          name: engram-linux-arm64-headless
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum engram-windows-x64.zip engram-linux-x64.tar.gz engram-linux-arm64.tar.gz engram-macos-arm64.tar.gz engram-linux-x64-headless.tar.gz engram-linux-arm64-headless.tar.gz > sha256sums.txt
+          cat sha256sums.txt
+      - name: Generate release notes from CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          python3 backend/scripts/extract_changelog.py \
+            --version "$VERSION" --changelog CHANGELOG.md > release-notes.md
+          # Previous tag drives both the contributors range and the compare link
+          # (both omitted for the very first release).
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            # Contributors section: external humans only, first-timers flagged.
+            # Inserted between the changelog body and the Full Changelog footer.
+            # The helper degrades to empty output on any error, so `|| true`
+            # plus the emptiness check means acknowledgment never fails a release.
+            SECTION=$(python3 backend/scripts/contributors.py \
+              --release-section --from "$PREV" --to "$TAG" \
+              --repo "${{ github.repository }}" || true)
+            if [ -n "$SECTION" ]; then
+              printf '\n\n%s\n' "$SECTION" >> release-notes.md
+            fi
+            printf '\n\n---\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "${{ github.repository }}" "$PREV" "$TAG" >> release-notes.md
+          fi
+          echo "----- release-notes.md -----"
+          cat release-notes.md
+      - uses: softprops/action-gh-release@v3
+        with:
+          # A manual workflow_dispatch can request a draft (hidden from the public
+          # releases page and from the /releases/latest endpoint the auto-updater
+          # polls) for testing a build. Tag-push releases leave inputs unset, so
+          # this resolves to false and they publish normally.
+          draft: ${{ inputs.draft || false }}
+          # Release body is the curated CHANGELOG section (built in the step above)
+          # plus a compare-link footer — not GitHub's flat auto-generated PR list.
+          generate_release_notes: false
+          body_path: release-notes.md
+          name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            engram-windows-x64.zip
+            engram-windows-x64.manifest.sha256
+            engram-linux-x64.tar.gz
+            engram-linux-x64.manifest.sha256
+            engram-linux-arm64.tar.gz
+            engram-linux-arm64.manifest.sha256
+            engram-macos-arm64.tar.gz
+            engram-macos-arm64.manifest.sha256
+            engram-linux-x64-headless.tar.gz
+            engram-linux-x64-headless.manifest.sha256
+            engram-linux-arm64-headless.tar.gz
+            engram-linux-arm64-headless.manifest.sha256
+            sha256sums.txt

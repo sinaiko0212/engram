@@ -1,0 +1,1072 @@
+import { useState, useEffect, useRef } from "react";
+import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "motion/react";
+import { AlertTriangle, Trash2, LayoutGrid, List, Info, X } from "lucide-react";
+import { DiscCard, type DiscData } from "./components/DiscCard";
+import { CompactList } from "./components/CompactList";
+import { useJobManagement } from "./hooks/useJobManagement";
+import { useDiscFilters } from "./hooks/useDiscFilters";
+import { useMediaQuery } from "./hooks/useMediaQuery";
+import { useNotifications } from "./hooks/useNotifications";
+import { useUpdateSuccessToast } from "./hooks/useUpdateSuccessToast";
+import { useWhatsNewModal } from "./hooks/useWhatsNewModal";
+import { useBackgroundEffectsEnabled } from "./hooks/useBackgroundEffectsEnabled";
+import ReviewQueue from "../components/ReviewQueue";
+import ConfigWizard from "../components/ConfigWizard";
+import NamePromptModal from "../components/NamePromptModal";
+import ImportModal from "../components/ImportModal";
+import SeasonPromptModal from "../components/SeasonPromptModal";
+import ReIdentifyModal from "../components/ReIdentifyModal";
+import ArmDiscModal from "../components/ArmDiscModal";
+import ArmedDriveCard from "./components/ArmedDriveCard";
+import BugReportModal from "../components/BugReportModal";
+import UpdateModal from "../components/UpdateModal";
+import { FingerprintDisclosureModal } from "../components/FingerprintDisclosureModal";
+import HistoryPage from "../components/HistoryPage";
+import ContributePage from "../components/ContributePage";
+import { FEATURES } from "../config/constants";
+import { ROUTES, reviewPath } from "../config/routes";
+import { buildNavItems } from "./navigation";
+import { PROMPT_CTA_LABELS, classifyPromptJob, pruneDismissedIds, selectPromptJobs, shouldAutoOpenPrompt } from "./promptSelection";
+import type { Job } from "../types";
+import { skipRipTitle, unskipRipTitle, disarmDrive as disarmDriveRequest } from "../api/client";
+import { toast } from "sonner";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { ParkedDiscBanner } from "./components/ParkedDiscBanner";
+import { AsrStatusBadge } from "./components/AsrStatusBadge";
+import {
+  Splash,
+  SvAtmosphere,
+  SvTopBar,
+  SvStatusBar,
+  sv,
+} from "./components/synapse";
+import { DashboardSideRail } from "./components/DashboardSideRail";
+
+type ViewMode = "expanded" | "compact";
+
+/**
+ * Shared sv-token button base — mono uppercase typography with pointer cursor.
+ * Spread first so call-site overrides (padding, colors, fontSize) win.
+ */
+const svButtonBase: React.CSSProperties = {
+  fontFamily: sv.mono,
+  letterSpacing: "0.20em",
+  textTransform: "uppercase",
+  cursor: "pointer",
+};
+
+/** Empty-state copy keyed by the active dashboard filter. */
+const emptyHeading: Record<"all" | "active" | "completed", string> = {
+  active: "› No active operations",
+  completed: "› No completed archives",
+  all: "› No discs detected",
+};
+
+const emptyBody: Record<"all" | "active" | "completed", string> = {
+  active: "All operations complete. Insert a disc to start a new job.",
+  completed: "No archived media yet. Completed jobs will appear here.",
+  all: "Insert a disc into your optical drive to begin archiving.",
+};
+
+function MainDashboard() {
+  const navigate = useNavigate();
+  const [showSettings, setShowSettings] = useState(false);
+  // Deep-link target for the settings modal (e.g. "gpu" from the ASR badge).
+  // undefined opens the default first section.
+  const [settingsSection, setSettingsSection] = useState<string | undefined>(undefined);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [namePromptJob, setNamePromptJob] = useState<Job | null>(null);
+  const [showImport, setShowImport] = useState(false);
+  const [importDefaultPath, setImportDefaultPath] = useState("");
+  const [importDefaultMode, setImportDefaultMode] = useState<"library" | "in_place">("library");
+  const [seasonPromptJob, setSeasonPromptJob] = useState<Job | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("expanded");
+  const [platform, setPlatform] = useState<string | null>(null);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+  const [tmdbConfigured, setTmdbConfigured] = useState(true);
+  const [tmdbBannerDismissed, setTmdbBannerDismissed] = useState(false);
+  const [contributionPending, setContributionPending] = useState(0);
+  // null = not yet known. The what's-new hook must not decide anything until the
+  // config fetch resolves, because "setup incomplete" and "still loading" imply
+  // opposite behaviour for an install with no lastSeenVersion key.
+  const [setupComplete, setSetupComplete] = useState<boolean | null>(null);
+
+  // Check for development mock mode
+  const DEV_MODE = window.location.search.includes('mock=true');
+
+  // Single entry point for opening Settings so every caller declares its target
+  // section (or resets to the default) — otherwise the deep-link state goes stale.
+  const openSettings = (section?: string) => {
+    setSettingsSection(section);
+    setShowSettings(true);
+  };
+
+  // Check if first-run setup is needed + fetch contribution badge count
+  const checkSetup = async () => {
+    try {
+      const response = await fetch('/api/config');
+      if (!response.ok) return;
+      const data = await response.json();
+      setSetupComplete(!!data.setup_complete);
+      if (!data.setup_complete) {
+        setShowOnboarding(true);
+      }
+      // Drive the health banner from the explicit backend boolean, not the
+      // redacted ("***"/"") key value, so it can't be fooled by a change to the
+      // redaction sentinel (#243).
+      setTmdbConfigured(data.tmdb_configured ?? !!data.tmdb_api_key);
+      // Fetch contribution stats for nav badge
+      if (FEATURES.DISCDB_CONTRIBUTE && data.discdb_contributions_enabled) {
+        try {
+          const statsRes = await fetch('/api/contributions/stats');
+          if (statsRes.ok) {
+            const stats = await statsRes.json();
+            setContributionPending(stats.pending);
+          }
+        } catch {
+          // Non-critical
+        }
+      }
+    } catch {
+      // Backend not reachable — don't block the UI
+    }
+  };
+  useEffect(() => { checkSetup(); }, []);
+
+  // Detect platform for non-Windows guidance banner
+  useEffect(() => {
+    const detectPlatform = async () => {
+      try {
+        const response = await fetch('/api/detect-tools');
+        if (!response.ok) return;
+        const data = await response.json();
+        if (data.platform) {
+          setPlatform(data.platform);
+        }
+      } catch {
+        // Backend not reachable — don't show banner
+      }
+    };
+    detectPlatform();
+  }, []);
+
+  useEffect(() => {
+    // Re-read the last-used import path/destination each time the modal opens
+    // (the import-start endpoint persists them). Gate on open so closing the
+    // modal doesn't fire a wasted request, and route through apiFetch for
+    // uniform error handling.
+    if (!showImport) return;
+    import("../api/client").then(({ apiFetch }) =>
+      apiFetch<{ import_watch_path?: string; import_destination_mode?: string }>("/api/config")
+        .then((cfg) => {
+          setImportDefaultPath(cfg.import_watch_path || "");
+          setImportDefaultMode(cfg.import_destination_mode === "in_place" ? "in_place" : "library");
+        })
+        .catch(() => {}),
+    );
+  }, [showImport]);
+
+  // Job management with WebSocket
+  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, cancelJob, advanceJob, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
+  useUpdateSuccessToast(updateStatus);
+  const whatsNew = useWhatsNewModal(updateStatus, setupComplete);
+  const [reIdentifyTarget, setReIdentifyTarget] = useState<Job | null>(null);
+  const [bugReportJobId, setBugReportJobId] = useState<number | null>(null);
+  const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  // Manual disc identity (#520): arms a drive so the next disc it sees adopts
+  // a user-asserted identity. The modal opens from the top-bar MANUAL button;
+  // armed drives themselves are tracked by useJobManagement (WS-driven).
+  const [showArmModal, setShowArmModal] = useState(false);
+
+  // Best-effort target for the arm modal: prefer a drive that's already
+  // armed (re-opening to edit), else the drive of the first active job, else
+  // fall back to "E:" — the common single-optical-drive case. Multi-drive
+  // setups can retype the drive id in a future iteration; this keeps the
+  // common path working without a drive picker.
+  const defaultDriveId =
+    Object.keys(armedDrives)[0] ?? jobs.find((j) => j.drive_id)?.drive_id ?? "E:";
+
+  const disarmDrive = async (driveId: string) => {
+    try {
+      await disarmDriveRequest(driveId);
+      // The drive_armed(identity: null) broadcast is the source of truth for
+      // clearing the card — no optimistic local mutation needed here.
+    } catch {
+      // Non-critical — worst case the card lingers until the user retries.
+    }
+  };
+
+  // Show the full-screen Splash with a "RECONNECTING…" label when the
+  // WebSocket has been down for >2.5s. The grace period absorbs momentary
+  // reconnect blips — without it, every brief WS hiccup would flash the
+  // splash. Backend-truly-down stays surfaced via the top-bar pill until
+  // the grace fires, then the splash takes over.
+  const [showOfflineSplash, setShowOfflineSplash] = useState(false);
+  useEffect(() => {
+    if (isConnected) {
+      setShowOfflineSplash(false);
+      return;
+    }
+    const t = window.setTimeout(() => setShowOfflineSplash(true), 2500);
+    return () => window.clearTimeout(t);
+  }, [isConnected]);
+
+  // Disc filtering and transformation
+  const { filter, setFilter, discsData, filteredDiscs, activeCount, completedCount, failedCount } = useDiscFilters(jobs, titlesMap, DEV_MODE);
+
+  // Browser notifications for job state changes
+  useNotifications(jobs);
+
+  // Show name prompt modal for unreadable labels or TV shows where TMDB lookup failed,
+  // the season prompt (#370) when the show is known but the season isn't, and the
+  // re-identify prompt for an ambiguous same-name identity. Walk-away Phase B: these
+  // prompts now also surface on RIPPING jobs (identity_prompt_json) — answering
+  // mid-rip updates metadata while the rip carries on. Dismissed prompts (Escape /
+  // backdrop click) are remembered so the next jobs refresh doesn't immediately
+  // re-open them — dismissal leaves the job alone (parked review job stays parked,
+  // ripping job keeps ripping), it does NOT cancel it.
+  //
+  // P13: the modal only AUTO-opens when the candidate is the only active job, so
+  // it never steals focus from a disc the user is watching rip/match. Otherwise
+  // the prompt waits behind the on-card CTA (see the DiscCard `onIdentify` wiring
+  // below). We never auto-CLOSE a modal here just because another job became
+  // active — only a vanished candidate (resolved / dismissed / removed) closes
+  // it — so a manually opened prompt is never yanked shut by a jobs refresh.
+  //
+  // B7 race suppression: dismissal is per-PROMPT, not per-job. Submit/cancel
+  // suppress THIS question only. The effect below re-arms for a DIFFERENT
+  // non-empty identity_prompt_json on the same job (e.g. name prompt answered,
+  // then a reidentify prompt appears later).
+  const dismissedPromptIdsRef = useRef<Set<number>>(new Set());
+  // Tracks the last-seen non-empty identity_prompt_json per job id so we can
+  // detect when a new/different prompt arrives and un-dismiss that job.
+  const lastSeenPromptJsonRef = useRef<Map<number, string>>(new Map());
+  useEffect(() => {
+    pruneDismissedIds(dismissedPromptIdsRef.current, jobs);
+
+    // Content-change un-dismiss: if a job now carries a DIFFERENT non-empty
+    // identity_prompt_json than the last time we saw it, the backend has issued
+    // a new question — the old dismissal no longer applies. Remove the id from
+    // the dismissed set so the new prompt can auto-open if eligible.
+    // When the prompt clears ("" / null), just update the tracking map without
+    // un-dismissing — the job resolved, it wasn't re-prompted.
+    for (const job of jobs) {
+      const current = job.identity_prompt_json || '';
+      const last = lastSeenPromptJsonRef.current.get(job.id) ?? '';
+      if (current !== last) {
+        if (current) {
+          // A new/different non-empty prompt arrived — un-dismiss so it can fire.
+          dismissedPromptIdsRef.current.delete(job.id);
+        }
+        lastSeenPromptJsonRef.current.set(job.id, current);
+      }
+    }
+
+    const {
+      namePromptJob: needsName,
+      seasonPromptJob: needsSeason,
+      reidentifyPromptJob: needsReidentify,
+    } = selectPromptJobs(jobs, dismissedPromptIdsRef.current);
+    if (!needsName) setNamePromptJob(null);
+    else if (shouldAutoOpenPrompt(needsName, jobs)) setNamePromptJob(needsName);
+
+    if (!needsSeason) setSeasonPromptJob(null);
+    else if (shouldAutoOpenPrompt(needsSeason, jobs)) setSeasonPromptJob(needsSeason);
+
+    // Reidentify prompts (walk-away Phase B: ambiguous same-name identity,
+    // ripping carries on) share modal state with the manual "Wrong title?"
+    // flow, which opens for jobs that carry NO identity prompt — so unlike
+    // name/season we never auto-CLOSE here: a vanished prompt must not yank a
+    // manually opened modal shut. Auto-open only; submit/cancel close it.
+    if (needsReidentify && shouldAutoOpenPrompt(needsReidentify, jobs)) {
+      setReIdentifyTarget(needsReidentify);
+    }
+  }, [jobs]);
+
+  // Side-rail collapse breakpoint: below ~1100px (snapped half-monitor windows)
+  // the 320px rail crushes the card column, so it folds away entirely.
+  const railFits = useMediaQuery("(min-width: 1100px)");
+  const showSideRail = filteredDiscs.length > 0 && viewMode === "expanded" && railFits;
+  const [backgroundEffectsEnabled] = useBackgroundEffectsEnabled();
+
+  const reviewJobs = jobs.filter((j) => j.state === 'review_needed');
+  const navItems = buildNavItems({
+    firstReviewJobId: reviewJobs[0]?.id,
+    reviewCount: reviewJobs.length,
+    contributionPending,
+  });
+
+  // Open a disc's identify prompt on demand (the card / compact-row CTA). Routes
+  // to the name / season / re-identify modal by the same matcher the auto-open
+  // path uses, so the manual and automatic openings can never disagree.
+  const openIdentifyPrompt = (id: string) => {
+    const job = jobs.find((j) => String(j.id) === id);
+    if (!job) return;
+    // A CTA click is an explicit "show me the prompt again" — forget any
+    // earlier dismissal. Without this, the effect above (which closes modals
+    // whose selected candidate vanished) would re-close the reopened modal on
+    // the next jobs refresh — sub-second while a rip is streaming progress.
+    dismissedPromptIdsRef.current.delete(job.id);
+    const kind = classifyPromptJob(job);
+    if (kind === 'reidentify') setReIdentifyTarget(job);
+    else if (kind === 'season') setSeasonPromptJob(job);
+    else setNamePromptJob(job);
+  };
+
+  return (
+    <SvAtmosphere ripActive={backgroundEffectsEnabled && discsData.some((d) => d.state === "ripping")}>
+      {/* Full-screen overlay when WS has been down past the grace period.
+          Stays on top of all chrome (z-index 100 inside Splash). */}
+      {showOfflineSplash && (
+        <Splash
+          label="RECONNECTING"
+          captionRight={`v${__APP_VERSION__}`}
+          atmosphere={false}
+        />
+      )}
+      <SvTopBar
+        isConnected={isConnected}
+        version={__APP_VERSION__}
+        onVersionClick={whatsNew.show}
+        devMode={DEV_MODE}
+        navItems={navItems}
+        onSettingsClick={() => openSettings()}
+        onImportClick={() => setShowImport(true)}
+        onManualClick={() => setShowArmModal(true)}
+      />
+
+      {/* Filter + view-mode strip */}
+      <div
+        style={{
+          padding: "10px 28px",
+          borderBottom: `1px solid ${sv.line}`,
+          background: "rgba(10,14,24,0.45)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 16,
+        }}
+        data-testid="sv-filter-strip"
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {(() => {
+            const counts = { all: discsData.length, active: activeCount, completed: completedCount };
+            const labels = { all: "ALL", active: "ACTIVE", completed: "DONE" };
+            return (["all", "active", "completed"] as const).map((f) => {
+              const active = filter === f;
+              return (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  data-testid={`sv-filter-${f}`}
+                  data-active={active ? "true" : "false"}
+                  style={{
+                    ...svButtonBase,
+                    padding: "6px 14px",
+                    fontSize: 10,
+                    fontWeight: 600,
+                    color: active ? sv.cyanHi : sv.inkDim,
+                    background: active ? "rgba(94,234,212,0.10)" : "transparent",
+                    border: `1px solid ${active ? sv.lineHi : sv.line}`,
+                    transition: "all 0.18s",
+                  }}
+                >
+                  {labels[f]} [{counts[f]}]
+                </button>
+              );
+            });
+          })()}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <AsrStatusBadge onOpenSettings={() => openSettings("gpu")} />
+          {/* View mode toggle */}
+          <div style={{ display: "inline-flex", border: `1px solid ${sv.line}` }}>
+            <button
+              onClick={() => setViewMode("expanded")}
+              title="Expanded view"
+              data-testid="sv-view-expanded"
+              style={{
+                padding: 6,
+                background: viewMode === "expanded" ? "rgba(94,234,212,0.10)" : "transparent",
+                color: viewMode === "expanded" ? sv.cyanHi : sv.inkFaint,
+                border: "none",
+                cursor: "pointer",
+                display: "flex",
+              }}
+            >
+              <LayoutGrid size={16} />
+            </button>
+            <button
+              onClick={() => setViewMode("compact")}
+              title="Compact view"
+              data-testid="sv-view-compact"
+              style={{
+                padding: 6,
+                background: viewMode === "compact" ? "rgba(94,234,212,0.10)" : "transparent",
+                color: viewMode === "compact" ? sv.cyanHi : sv.inkFaint,
+                border: "none",
+                cursor: "pointer",
+                display: "flex",
+              }}
+            >
+              <List size={16} />
+            </button>
+          </div>
+
+          {completedCount + failedCount > 0 && (
+            <button
+              onClick={clearFinished}
+              data-testid="sv-clear-btn"
+              title="Clear Finished"
+              style={{
+                ...svButtonBase,
+                padding: "6px 12px",
+                fontSize: 10,
+                fontWeight: 600,
+                color: sv.red,
+                background: "transparent",
+                border: `1px solid ${sv.red}55`,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              <Trash2 size={12} />
+              <span>CLEAR</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Auto-update banner */}
+      {!updateDismissed && (
+        <UpdateBanner
+          updateStatus={updateStatus}
+          onShowNotes={() => setShowUpdateModal(true)}
+          onDismiss={() => setUpdateDismissed(true)}
+        />
+      )}
+
+      {/* Parked-disc banner — disc inserted before first-run setup completed (P12).
+          The backend holds the pipeline; completing setup releases the disc
+          automatically, so this clears itself (no dismiss). Rendered conditionally
+          as the direct AnimatePresence child — a child that merely returns null
+          internally never triggers the exit animation. */}
+      <AnimatePresence>
+        {parkedDiscs.length > 0 && (
+          <ParkedDiscBanner
+            discs={parkedDiscs}
+            onFinishSetup={() => setShowOnboarding(true)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Armed-drive cards — a drive holds a user-asserted identity (manual
+          disc metadata entry, #520) and is waiting for a disc. Not real jobs,
+          so they render outside the job list/filter machinery; disarming
+          removes the card via the drive_armed(identity:null) broadcast. */}
+      {Object.keys(armedDrives).length > 0 && (
+        <div
+          className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 mt-4"
+          style={{ display: "flex", flexDirection: "column", gap: 12 }}
+        >
+          <AnimatePresence>
+            {Object.entries(armedDrives).map(([driveId, identity]) => (
+              <ArmedDriveCard key={driveId} driveId={driveId} identity={identity} onDisarm={disarmDrive} />
+            ))}
+          </AnimatePresence>
+        </div>
+      )}
+
+      {/* Platform guidance banner for Linux/macOS users */}
+      <AnimatePresence>
+        {platform && platform !== "win32" && jobs.length === 0 && !bannerDismissed && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 mt-4"
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 12,
+                padding: "12px 16px",
+                background: `${sv.cyan}10`,
+                border: `1px solid ${sv.cyan}55`,
+                boxShadow: `0 0 12px ${sv.cyan}22`,
+              }}
+            >
+              <Info size={18} color={sv.cyan} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div
+                style={{
+                  flex: 1,
+                  fontFamily: sv.mono,
+                  fontSize: 12,
+                  letterSpacing: "0.06em",
+                  color: sv.cyanHi,
+                  lineHeight: 1.45,
+                }}
+              >
+                <span>No optical drives detected. Drop MKV folders into your staging directory or </span>
+                <button
+                  onClick={() => openSettings("paths")}
+                  style={{
+                    fontFamily: "inherit",
+                    fontSize: "inherit",
+                    color: sv.cyan,
+                    textDecoration: "underline",
+                    textUnderlineOffset: 2,
+                    background: "none",
+                    border: 0,
+                    padding: 0,
+                    cursor: "pointer",
+                  }}
+                >
+                  configure staging import
+                </button>
+                <span>.</span>
+              </div>
+              <button
+                onClick={() => setBannerDismissed(true)}
+                title="Dismiss"
+                aria-label="Dismiss banner"
+                style={{
+                  flexShrink: 0,
+                  width: 24,
+                  height: 24,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "transparent",
+                  border: 0,
+                  color: `${sv.cyan}99`,
+                  cursor: "pointer",
+                  transition: "color 120ms",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = sv.cyanHi; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = `${sv.cyan}99`; }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* TMDB health banner */}
+      <AnimatePresence>
+        {!tmdbConfigured && !tmdbBannerDismissed && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 mt-4"
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 12,
+                padding: "12px 16px",
+                background: `${sv.amber}10`,
+                border: `1px solid ${sv.amber}55`,
+                boxShadow: `0 0 12px ${sv.amber}22`,
+              }}
+            >
+              <AlertTriangle size={18} color={sv.amber} style={{ flexShrink: 0, marginTop: 1 }} />
+              <div
+                style={{
+                  flex: 1,
+                  fontFamily: sv.mono,
+                  fontSize: 12,
+                  letterSpacing: "0.06em",
+                  color: sv.amber,
+                  lineHeight: 1.45,
+                }}
+              >
+                <span>TMDB not configured — classification is running in heuristic-only mode. </span>
+                <button
+                  onClick={() => openSettings("tmdb")}
+                  style={{
+                    fontFamily: "inherit",
+                    fontSize: "inherit",
+                    color: sv.amber,
+                    textDecoration: "underline",
+                    textUnderlineOffset: 2,
+                    background: "none",
+                    border: 0,
+                    padding: 0,
+                    cursor: "pointer",
+                  }}
+                >
+                  Configure token
+                </button>
+              </div>
+              <button
+                onClick={() => setTmdbBannerDismissed(true)}
+                title="Dismiss"
+                aria-label="Dismiss TMDB warning"
+                style={{
+                  flexShrink: 0,
+                  width: 24,
+                  height: 24,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "transparent",
+                  border: 0,
+                  color: `${sv.amber}99`,
+                  cursor: "pointer",
+                  transition: "color 120ms",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = sv.amber; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = `${sv.amber}99`; }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Main Content — `w-full` is load-bearing: inside SvAtmosphere's flex
+          column, `mx-auto` alone makes the box shrink-wrap to its content
+          (auto cross-axis margins defeat align-items: stretch), so without an
+          explicit width the 1600px cap never engages. */}
+      <div className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 py-6 sm:py-8 pb-24 sm:pb-28 relative z-0">
+        <div
+          data-testid="sv-dashboard-grid"
+          style={{
+            display: "grid",
+            gridTemplateColumns: showSideRail ? "minmax(0, 1.4fr) 320px" : "1fr",
+            gap: 14,
+            // `stretch` lets the right rail's grid cell match the disc-card
+            // column's height. The Activity log panel already has `flex: 1`,
+            // so it consumes the slack and bottom-aligns with the card.
+            alignItems: "stretch",
+          }}
+        >
+        <div style={{ minWidth: 0 }}>
+        {filteredDiscs.length === 0 ? (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "80px 0",
+              textAlign: "center",
+            }}
+            data-testid="sv-empty-state"
+          >
+            <motion.div
+              animate={{
+                filter: [
+                  `drop-shadow(0 0 12px ${sv.cyan}4d)`,
+                  `drop-shadow(0 0 24px ${sv.cyan}80)`,
+                  `drop-shadow(0 0 12px ${sv.cyan}4d)`,
+                ],
+              }}
+              transition={{ duration: 3, repeat: Infinity }}
+              style={{ marginBottom: 24 }}
+            >
+              {/* Synapse beacon — concentric rings + rotating sweep + chapter ticks. Same
+                  visual language as SvDiscInsert but simplified for "no signal yet" semantics. */}
+              <svg
+                width={140}
+                height={140}
+                viewBox="0 0 200 200"
+                aria-label="Engram beacon — awaiting input"
+              >
+                <defs>
+                  <radialGradient id="sv-empty-bg" cx="50%" cy="50%" r="50%">
+                    <stop offset="0%" stopColor={sv.cyan} stopOpacity="0.18" />
+                    <stop offset="60%" stopColor={sv.cyan} stopOpacity="0.04" />
+                    <stop offset="100%" stopColor={sv.cyan} stopOpacity="0" />
+                  </radialGradient>
+                  <linearGradient id="sv-empty-sweep" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0%" stopColor={sv.cyan} stopOpacity="0" />
+                    <stop offset="100%" stopColor={sv.cyan} stopOpacity="0.55" />
+                  </linearGradient>
+                </defs>
+                <circle cx="100" cy="100" r="92" fill="url(#sv-empty-bg)" />
+                {[88, 72, 56, 40, 22].map((r, i) => (
+                  <circle
+                    key={r}
+                    cx="100"
+                    cy="100"
+                    r={r}
+                    fill="none"
+                    stroke={sv.cyan}
+                    strokeWidth="0.6"
+                    opacity={0.18 + i * 0.06}
+                  />
+                ))}
+                <line x1="100" y1="6" x2="100" y2="194" stroke={sv.cyan} strokeWidth="0.4" opacity="0.22" />
+                <line x1="6" y1="100" x2="194" y2="100" stroke={sv.cyan} strokeWidth="0.4" opacity="0.22" />
+                <g style={{ transformOrigin: "100px 100px", animation: "svSpin 4s linear infinite" }}>
+                  <path
+                    d="M 100 100 L 188 100 A 88 88 0 0 0 100 12 Z"
+                    fill="url(#sv-empty-sweep)"
+                    opacity="0.55"
+                  />
+                </g>
+                {Array.from({ length: 24 }, (_, i) => {
+                  const ang = (i / 24) * Math.PI * 2;
+                  return (
+                    <line
+                      key={i}
+                      x1={100 + Math.cos(ang) * 92}
+                      y1={100 + Math.sin(ang) * 92}
+                      x2={100 + Math.cos(ang) * 84}
+                      y2={100 + Math.sin(ang) * 84}
+                      stroke={sv.inkGhost}
+                      strokeWidth="1"
+                    />
+                  );
+                })}
+                <circle cx="100" cy="100" r="4" fill={sv.cyan} />
+                <circle cx="100" cy="100" r="1.5" fill={sv.bg0} />
+              </svg>
+            </motion.div>
+            <h2
+              data-testid="sv-empty-heading"
+              style={{
+                fontFamily: sv.display,
+                fontWeight: 700,
+                fontSize: 22,
+                letterSpacing: "0.2em",
+                textTransform: "uppercase",
+                color: sv.cyanHi,
+                textShadow: `0 0 12px ${sv.cyan}99`,
+                marginBottom: 10,
+              }}
+            >
+              {emptyHeading[filter]}
+            </h2>
+            <p
+              style={{
+                fontFamily: sv.mono,
+                fontSize: 11,
+                letterSpacing: "0.18em",
+                textTransform: "uppercase",
+                color: sv.inkDim,
+                maxWidth: 480,
+                lineHeight: 1.6,
+              }}
+            >
+              {emptyBody[filter]}
+            </p>
+          </motion.div>
+        ) : viewMode === "compact" ? (
+          /* Compact view — sv-token row layout */
+          <CompactList
+            discs={filteredDiscs}
+            onReview={(id) => navigate(reviewPath(id))}
+            onCancel={(id) => cancelJob(id)}
+            onReIdentify={(id) => {
+              const job = jobs.find((j) => String(j.id) === id);
+              if (job) setReIdentifyTarget(job);
+            }}
+            onIdentify={openIdentifyPrompt}
+          />
+        ) : (
+          /* Expanded view */
+          <div className="space-y-6">
+            <AnimatePresence mode="popLayout">
+              {filteredDiscs.map((disc: DiscData) => (
+                <DiscCard
+                  key={disc.id}
+                  disc={disc}
+                  onCancel={disc.state !== 'completed' && disc.state !== 'error' ? () => cancelJob(disc.id) : undefined}
+                  onSkipTrack={(titleId) => { void skipRipTitle(Number(disc.id), titleId); }}
+                  onUnskipTrack={(titleId) => { void unskipRipTitle(Number(disc.id), titleId); }}
+                  onAdvance={disc.state !== 'completed' && disc.state !== 'error' ? () => advanceJob(disc.id) : undefined}
+                  onEject={() => ejectJob(disc.id)}
+                  onReview={disc.needsReview && !disc.identityReview && (disc.tracks?.length ?? 0) > 0 ? () => navigate(reviewPath(disc.id)) : undefined}
+                  // Always-on identity control (#520): available while ripping or
+                  // parked in review, not only in review. Deliberately EXCLUDES
+                  // 'scanning' (IDENTIFYING) — the identify_disc task is still in
+                  // flight then, and re-identifying would race a second rip against
+                  // the drive (see routes.py re_identify guard). Also excludes
+                  // matching/organizing (work in flight) and completed (History's
+                  // AmendTitleModal owns it).
+                  onReIdentify={
+                    disc.title && ['ripping', 'review_needed'].includes(disc.state)
+                      ? () => {
+                          const job = jobs.find(j => String(j.id) === disc.id);
+                          if (job) setReIdentifyTarget(job);
+                        }
+                      : undefined
+                  }
+                  // P13 + walk-away Phase B: jobs needing a name/season/identity —
+                  // parked in review OR still ripping — get a card CTA that opens
+                  // the prompt on demand (it no longer auto-opens over the dashboard
+                  // while other jobs are active). promptKind comes from the adapter.
+                  onIdentify={disc.promptKind ? () => openIdentifyPrompt(disc.id) : undefined}
+                  identifyLabel={disc.promptKind ? PROMPT_CTA_LABELS[disc.promptKind] : undefined}
+                  onReportBug={() => setBugReportJobId(Number(disc.id))}
+                  onOpenSettings={() => openSettings("tmdb")}
+                />
+              ))}
+            </AnimatePresence>
+          </div>
+        )}
+        </div>
+        {showSideRail && (
+          <DashboardSideRail jobs={jobs} titlesMap={titlesMap} />
+        )}
+        </div>
+      </div>
+
+      {/* Name Prompt Modal — appears when disc label is unreadable */}
+      <AnimatePresence>
+        {namePromptJob && (
+          <NamePromptModal
+            job={namePromptJob}
+            initialTitle={namePromptJob.detected_title ?? ''}
+            onSubmit={(name, contentType, season) => {
+              // B7: dismiss before closing so a progress tick inside the POST
+              // round-trip window can't re-select this job and re-open the modal.
+              // Dismissal is per-prompt — content-change un-dismiss (above) will
+              // re-arm the job if the backend issues a different prompt later.
+              dismissedPromptIdsRef.current.add(namePromptJob.id);
+              setJobName(namePromptJob.id, name, contentType, season);
+              setNamePromptJob(null);
+            }}
+            onDismiss={() => {
+              dismissedPromptIdsRef.current.add(namePromptJob.id);
+              setNamePromptJob(null);
+            }}
+            onCancelJob={() => {
+              cancelJob(String(namePromptJob.id));
+              setNamePromptJob(null);
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Season Prompt Modal — show identified but the disc label has no season (#370) */}
+      <AnimatePresence>
+        {seasonPromptJob && !namePromptJob && (
+          <SeasonPromptModal
+            job={seasonPromptJob}
+            onSubmit={(season) => {
+              // B7: dismiss before closing to block re-open during POST round-trip.
+              dismissedPromptIdsRef.current.add(seasonPromptJob.id);
+              setJobName(
+                seasonPromptJob.id,
+                seasonPromptJob.detected_title ?? seasonPromptJob.volume_label,
+                'tv',
+                season,
+              );
+              setSeasonPromptJob(null);
+            }}
+            onDismiss={() => {
+              dismissedPromptIdsRef.current.add(seasonPromptJob.id);
+              setSeasonPromptJob(null);
+            }}
+            onCancelJob={() => {
+              cancelJob(String(seasonPromptJob.id));
+              setSeasonPromptJob(null);
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showImport && (
+          <ImportModal
+            onClose={() => setShowImport(false)}
+            defaultPath={importDefaultPath}
+            defaultDestinationMode={importDefaultMode}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Re-Identify Modal — appears when user clicks "Wrong title?" */}
+      <AnimatePresence>
+        {reIdentifyTarget && (
+          <ReIdentifyModal
+            job={reIdentifyTarget}
+            onSubmit={(title, contentType, season, tmdbId) => {
+              // B7: dismiss before closing. The reidentify modal never auto-closes
+              // (see note below), so without this a stale identity_prompt_json on
+              // the next progress tick would re-open the modal the user just
+              // answered and double-POST on a confused re-submit.
+              dismissedPromptIdsRef.current.add(reIdentifyTarget.id);
+              reIdentifyJob(reIdentifyTarget.id, title, contentType, season, tmdbId);
+              setReIdentifyTarget(null);
+            }}
+            onCancel={() => {
+              // Remember the dismissal like the name/season prompts do —
+              // without it, an auto-opened reidentify prompt (walk-away Phase
+              // B) would re-open on the next jobs refresh. Harmless for the
+              // manual "Wrong title?" flow (the id is only consulted by
+              // prompt selection, and the CTA un-dismisses on click).
+              dismissedPromptIdsRef.current.add(reIdentifyTarget.id);
+              setReIdentifyTarget(null);
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Arm Disc Modal — opened from the top-bar MANUAL button; arms a drive
+          with a user-asserted identity ahead of the next disc insert. */}
+      <AnimatePresence>
+        {showArmModal && (
+          <ArmDiscModal
+            driveId={defaultDriveId}
+            onClose={() => setShowArmModal(false)}
+            onArmed={() => setShowArmModal(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Fingerprint Disclosure Modal — JIT consent before any contribution upload */}
+      <AnimatePresence>
+        {disclosure && (
+          <FingerprintDisclosureModal
+            pendingCount={disclosure.pending_count}
+            pseudonym={disclosure.pseudonym}
+            serverUrl={disclosure.server_url}
+            onAccept={async () => {
+              // Only dismiss once the choice is actually persisted — fetch does
+              // not throw on non-2xx, so a swallowed failure here would silently
+              // start (or fail to authorize) uploads.
+              const resp = await fetch('/api/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fingerprint_disclosure_accepted: true }),
+              });
+              if (!resp.ok) {
+                toast.error('Could not save your choice — please try again.');
+                return;
+              }
+              clearDisclosure();
+            }}
+            onDecline={async () => {
+              const resp = await fetch('/api/config', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enable_fingerprint_contributions: false }),
+              });
+              if (!resp.ok) {
+                toast.error('Could not save your choice — please try again.');
+                return;
+              }
+              clearDisclosure();
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Bug Report Modal — appears when user reports a bug for an active job */}
+      <BugReportModal
+        open={bugReportJobId != null}
+        jobId={bugReportJobId ?? undefined}
+        onClose={() => setBugReportJobId(null)}
+      />
+
+      {/* Update Modal — release notes opened from UpdateBanner */}
+      <UpdateModal
+        open={showUpdateModal}
+        updateStatus={updateStatus}
+        onClose={() => setShowUpdateModal(false)}
+        onDismiss={() => {
+          setUpdateDismissed(true);
+          setShowUpdateModal(false);
+        }}
+      />
+
+      {/* What's new: release notes for the version currently running, shown once
+          per version and re-openable from the top-bar version string. */}
+      <UpdateModal
+        open={whatsNew.open}
+        variant="whatsNew"
+        updateStatus={updateStatus}
+        onClose={whatsNew.close}
+      />
+
+      {/* Onboarding Wizard (first run) */}
+      {showOnboarding && (
+        <ModalScrim>
+          <ConfigWizard
+            onClose={() => setShowOnboarding(false)}
+            onComplete={() => { setShowOnboarding(false); checkSetup(); }}
+            isOnboarding={true}
+          />
+        </ModalScrim>
+      )}
+
+      {/* Config Wizard Modal (settings) */}
+      {showSettings && !showOnboarding && (
+        <ModalScrim>
+          <ConfigWizard
+            onClose={() => setShowSettings(false)}
+            onComplete={() => {
+              setShowSettings(false);
+              checkSetup();
+            }}
+            isOnboarding={false}
+            initialSection={settingsSection}
+          />
+        </ModalScrim>
+      )}
+
+      <SvStatusBar
+        activeCount={activeCount}
+        completedCount={completedCount}
+        isConnected={isConnected}
+        version={__APP_VERSION__}
+        driveLabel={platform === "win32" ? "DRIVE READY" : "STAGING IMPORT"}
+      />
+    </SvAtmosphere>
+  );
+}
+
+/** Modal backdrop with sv-token blur + sv.bg0 alpha overlay. */
+function ModalScrim({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 50,
+        background: "rgba(5, 7, 12, 0.78)",
+        backdropFilter: "blur(8px)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 16,
+      }}
+    >
+      <div style={{ width: "100%", maxWidth: 960, maxHeight: "90vh", overflow: "auto" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <Routes>
+      <Route path={ROUTES.HOME} element={<MainDashboard />} />
+      <Route path={ROUTES.HISTORY} element={<HistoryPage />} />
+      <Route path={ROUTES.HISTORY_DETAIL} element={<HistoryPage />} />
+      {FEATURES.DISCDB_CONTRIBUTE && <Route path={ROUTES.CONTRIBUTE} element={<ContributePage />} />}
+      <Route path="/library" element={<Navigate to={ROUTES.HISTORY} replace />} />
+      <Route path={ROUTES.REVIEW} element={<Navigate to={ROUTES.HOME} replace />} />
+      <Route path={ROUTES.REVIEW_DETAIL} element={<ReviewQueue />} />
+    </Routes>
+  );
+}
+
+export default App;

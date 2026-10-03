@@ -1,0 +1,210 @@
+"""Persistent record of subtitle-harvest coverage per (show, season).
+
+The build script's per-season coverage threshold (``--min-episodes-ratio``,
+default 0.6) historically only gated which seasons make it into the
+precomputed tarball — every daily re-run re-attempted the same dead
+seasons, burning the OpenSubtitles VIP quota and Addic7ed/TVsubtitles
+rate-limit budget on shows that simply don't have subtitles.
+
+This module persists "(show, season) → (attempted_at, coverage_ratio)"
+in the same SQLite file as the TMDB cache, so the build script can skip
+seasons whose prior attempt fell below threshold within the configured
+window. ``--retry-low-coverage`` bypasses the skip when the user wants
+to re-attempt after adding a provider or after VIP quota refills.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from app.matcher import tmdb_persistent_cache
+
+
+def _any_age_record(tmdb_id: int, season: int) -> dict[str, Any] | None:
+    """Return the coverage row for ``(tmdb_id, season)`` regardless of age.
+
+    States the row shape (columns and dict keys) once; ``_fresh_record``
+    composes on top of this to add its own age policy.
+    """
+    conn = tmdb_persistent_cache.get_conn()
+    row = conn.execute(
+        "SELECT attempted_at, total_episodes, covered_episodes, coverage_ratio "
+        "FROM subtitle_coverage WHERE tmdb_id = ? AND season = ?",
+        (tmdb_id, season),
+    ).fetchone()
+    if row is None:
+        return None
+
+    attempted_at, total, covered, ratio = row
+    return {
+        "attempted_at": attempted_at,
+        "total_episodes": total,
+        "covered_episodes": covered,
+        "coverage_ratio": ratio,
+    }
+
+
+def _fresh_record(
+    tmdb_id: int,
+    season: int,
+    window_days: int,
+) -> dict[str, Any] | None:
+    """Return the coverage row for ``(tmdb_id, season)`` iff it was recorded
+    within ``window_days``, else None (no row, or stale).
+
+    Used by ``should_skip``: a failed season deserves a retry eventually,
+    so its skip decision is age-gated. ``is_done`` deliberately does NOT
+    use this -- it reads via ``_any_age_record`` instead, because a season
+    whose SRTs are on disk does not become un-harvested by the passage of
+    time. The two now deliberately disagree on what "recent enough to
+    trust" means.
+    """
+    row = _any_age_record(tmdb_id, season)
+    if row is None or time.time() - row["attempted_at"] > window_days * 86400:
+        return None
+    return row
+
+
+def should_skip(
+    tmdb_id: int,
+    season: int,
+    min_ratio: float,
+    skip_window_days: int = 30,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Return ``(skip, prior_row)``.
+
+    ``skip`` is True iff a prior attempt was recorded within
+    ``skip_window_days`` AND its coverage_ratio was below ``min_ratio``.
+    The caller logs ``prior_row`` so the user sees why a season was
+    skipped without having to inspect the DB by hand.
+    """
+    row = _fresh_record(tmdb_id, season, skip_window_days)
+    if row is None or row["coverage_ratio"] >= min_ratio:
+        return False, None
+    return True, row
+
+
+def is_done(
+    tmdb_id: int,
+    season: int,
+    min_ratio: float,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Return ``(done, prior_row)``.
+
+    ``done`` is True iff a recorded attempt reached ``min_ratio`` -- i.e. the
+    season already hit the coverage threshold and can be shipped from the SRTs
+    already on disk without re-hitting TMDB/OpenSubtitles/scrapers.
+
+    Deliberately age-independent: success does not decay. Expiring it forced
+    a full re-harvest of the whole corpus every 30 days, which exhausted the
+    daily OpenSubtitles quota and caused every subsequent season to be
+    recorded as zero-coverage. Pass ``--refresh`` to the build script to
+    re-harvest deliberately.
+
+    The caller is responsible for comparing ``prior_row["covered_episodes"]``
+    against what ``discover_season_srts`` actually finds on disk. This
+    function only reports what the coverage record claims; it does not check
+    the filesystem, so a season that lost some (not all) of its SRTs to a
+    partial wipe still reports ``done`` here -- the caller must catch a
+    partial shortfall itself and fall through to a normal harvest. A fully
+    wiped season self-heals because ``discover_season_srts`` then returns
+    nothing at all.
+    """
+    row = _any_age_record(tmdb_id, season)
+    if row is None or row["coverage_ratio"] < min_ratio:
+        return False, None
+    return True, row
+
+
+def get_show_coverage(tmdb_id: int) -> list[dict[str, Any]]:
+    """Return every recorded coverage row for a show, oldest season first.
+
+    Read-only; returns ``[]`` when the cache DB doesn't exist. Used by the
+    diagnostics bundle to surface why subtitle matching may have come up
+    short for a series (e.g. a season recorded at 10% coverage that the
+    skip window subsequently suppressed).
+    """
+    if not tmdb_persistent_cache.CACHE_DB_PATH.exists():
+        return []
+    conn = tmdb_persistent_cache.get_conn()
+    rows = conn.execute(
+        "SELECT season, attempted_at, total_episodes, covered_episodes, coverage_ratio "
+        "FROM subtitle_coverage WHERE tmdb_id = ? ORDER BY season",
+        (tmdb_id,),
+    ).fetchall()
+    return [
+        {
+            "season": season,
+            "attempted_at": attempted_at,
+            "total_episodes": total,
+            "covered_episodes": covered,
+            "coverage_ratio": ratio,
+        }
+        for season, attempted_at, total, covered, ratio in rows
+    ]
+
+
+def get_cache_status(tmdb_id: int | None, season: int | None = None) -> dict[str, Any]:
+    """Summarise cache state for a job's series, for the diagnostics bundle.
+
+    Returns subtitle-coverage rows for the show plus whether TMDB show and
+    season metadata are currently cached. Empty/False when ``tmdb_id`` is
+    unknown (movies, unidentified discs). All reads are read-only.
+    """
+    if tmdb_id is None:
+        return {"coverage": [], "tmdb_show_cached": False, "tmdb_season_cached": False}
+    return {
+        "coverage": get_show_coverage(tmdb_id),
+        "tmdb_show_cached": tmdb_persistent_cache.is_cached(f"show_details:{tmdb_id}"),
+        "tmdb_season_cached": (
+            tmdb_persistent_cache.is_cached(f"season:{tmdb_id}:{season}")
+            if season is not None
+            else False
+        ),
+    }
+
+
+def record(tmdb_id: int, season: int, total: int, covered: int) -> None:
+    """Insert or replace the coverage row for ``(tmdb_id, season)``.
+
+    ``total`` may be 0 in pathological cases (TMDB returned an empty
+    season). Storing the zero is useful so the skip window kicks in
+    even for seasons TMDB couldn't enumerate — re-asking TMDB every
+    day for an empty season is the same kind of waste this whole
+    workstream is trying to eliminate.
+    """
+    ratio = (covered / total) if total > 0 else 0.0
+    conn = tmdb_persistent_cache.get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO subtitle_coverage "
+        "(tmdb_id, season, attempted_at, total_episodes, covered_episodes, coverage_ratio) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (tmdb_id, season, time.time(), total, covered, ratio),
+    )
+    conn.commit()
+
+
+def clear(tmdb_id: int | None = None, season: int | None = None) -> None:
+    """Delete coverage rows.
+
+    No args: drop everything. ``tmdb_id``: drop every season of that show.
+    ``tmdb_id`` + ``season``: drop the single row. ``season`` without
+    ``tmdb_id`` raises (no scenario for "every show's season 3").
+    """
+    if season is not None and tmdb_id is None:
+        raise ValueError("clear(season=...) requires tmdb_id")
+    if not tmdb_persistent_cache.CACHE_DB_PATH.exists():
+        return
+
+    conn = tmdb_persistent_cache.get_conn()
+    if tmdb_id is None:
+        conn.execute("DELETE FROM subtitle_coverage")
+    elif season is None:
+        conn.execute("DELETE FROM subtitle_coverage WHERE tmdb_id = ?", (tmdb_id,))
+    else:
+        conn.execute(
+            "DELETE FROM subtitle_coverage WHERE tmdb_id = ? AND season = ?",
+            (tmdb_id, season),
+        )
+    conn.commit()

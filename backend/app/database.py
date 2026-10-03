@@ -1,0 +1,460 @@
+"""Database setup with SQLModel and async SQLite."""
+
+import logging
+import os
+from collections.abc import AsyncGenerator
+from pathlib import Path
+
+import sqlalchemy
+from sqlalchemy import text as sa_text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlmodel import SQLModel
+
+from app.config import settings
+
+# Import all models so their tables are registered with SQLModel.metadata
+from app.models import AppConfig, DiscJob  # noqa: F401
+
+logger = logging.getLogger(__name__)
+
+# Path to Alembic config (relative to backend/)
+_ALEMBIC_INI = Path(__file__).parent.parent / "alembic.ini"
+
+# Create async engine. echo is gated on the dedicated db_echo setting, NOT
+# debug — see Settings.db_echo for the rationale. Pool sizing is lifted above
+# SQLAlchemy's async default (5 + 10 = 15) because a multi-season import fans out
+# 100+ concurrent DB-touching coroutines; see Settings.db_pool_size for the full
+# rationale on why a larger pool is safe for WAL SQLite.
+engine = create_async_engine(
+    settings.database_url,
+    echo=settings.db_echo,
+    future=True,
+    connect_args={"check_same_thread": False},  # Needed for SQLite
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_timeout=settings.db_pool_timeout,
+)
+
+
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    """Apply per-connection SQLite pragmas (registered as the engine 'connect' hook).
+
+    WAL + synchronous=NORMAL is the standard high-concurrency SQLite setup. The
+    busy_timeout is essential now that the pool allows many concurrent
+    connections: SQLite still permits only ONE writer at a time, so concurrent
+    committers (e.g. 7 seasons matching at once, plus a rip) contend for the
+    single write lock. With the default busy_timeout of 0, a writer that can't
+    immediately acquire the lock fails fast with "database is locked"; 30s makes
+    it WAIT and retry instead, turning the larger pool's write contention into
+    polite queueing rather than errors. Module-level (not a decorator closure) so
+    it can be unit-tested against a throwaway connection.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        # Close even if a PRAGMA raises (e.g. journal_mode=WAL on a read-only
+        # path) so the cursor never leaks.
+        cursor.close()
+
+
+sqlalchemy.event.listens_for(engine.sync_engine, "connect")(set_sqlite_pragma)
+
+
+# Async session factory
+async_session = sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+async def init_db() -> None:
+    """Initialize the database, creating all tables and running migrations."""
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    # Add any missing columns to existing tables (handles schema upgrades
+    # when Alembic is unavailable, e.g., frozen/PyInstaller builds)
+    await _add_missing_columns()
+
+    # Drop columns the model no longer defines (handles destructive schema
+    # changes when Alembic is unavailable, e.g., frozen/PyInstaller builds)
+    await _drop_extra_columns()
+
+    # Run Alembic migrations and stamp version if needed
+    _run_alembic_upgrade()
+
+    # Legacy migration for app_config data preservation (Alembic handles schema,
+    # but this preserves API keys/settings across breaking schema changes)
+    await _migrate_app_config(engine)
+
+    await _seed_headless_defaults()
+
+    logger.info("Database initialized successfully")
+
+
+# Attribute _upgrade_to_head_self_healing sets on an exception it re-raises,
+# carrying which revision is stuck, so _run_alembic_upgrade logs the failure
+# once (as an error, with the traceback) rather than twice.
+_STUCK_REVISION_ATTR = "engram_stuck_revision"
+
+
+def _run_alembic_upgrade() -> None:
+    """Run Alembic upgrade to head, stamping if this is a fresh database."""
+    if not _ALEMBIC_INI.exists():
+        logger.debug("Alembic config not found (frozen build?), skipping migrations")
+        return
+
+    try:
+        from alembic import command
+        from alembic.config import Config
+
+        alembic_cfg = Config(str(_ALEMBIC_INI))
+
+        # Check if alembic_version table exists (i.e., Alembic has been initialized)
+        from sqlalchemy import create_engine, inspect
+
+        sync_url = settings.database_url.replace("+aiosqlite", "")
+        sync_engine = create_engine(sync_url)
+        with sync_engine.connect() as conn:
+            inspector = inspect(conn)
+            has_version_table = "alembic_version" in inspector.get_table_names()
+
+        if not has_version_table:
+            # First time: stamp as current (tables already created by create_all)
+            command.stamp(alembic_cfg, "head")
+            logger.info("Alembic: stamped existing database at head")
+        else:
+            # Run any pending migrations
+            _upgrade_to_head_self_healing(alembic_cfg, sync_engine)
+            logger.info("Alembic: migrations up to date")
+
+        sync_engine.dispose()
+    except Exception as e:
+        stuck = getattr(e, _STUCK_REVISION_ATTR, None)
+        if stuck:
+            # Startup continues, but this is not a one-off: the stamp is frozen
+            # and every later revision stays unapplied until it is fixed.
+            logger.error(f"Alembic migration failed: {stuck}", exc_info=True)
+        else:
+            logger.warning(f"Alembic migration failed (non-fatal): {e}", exc_info=True)
+
+
+def _upgrade_to_head_self_healing(alembic_cfg, sync_engine) -> None:
+    """Apply pending Alembic migrations, healing revisions whose only failure
+    is a column that already exists.
+
+    _add_missing_columns() (the frozen-build fallback) and Alembic both run on
+    every startup and converge the schema toward the same SQLModel metadata.
+    If a column a pending migration wants to add was already added out-of-band,
+    its ADD COLUMN fails with "duplicate column name" and, left unhandled,
+    that leaves alembic_version stuck one revision behind forever — silently
+    blocking every later migration on every subsequent startup (issue #459).
+    Since the schema already matches what that revision would produce, treat
+    the failure as "already applied": stamp past just that one revision and
+    keep going.
+
+    This is a backstop. Revisions are written to be idempotent against the
+    out-of-band writers (see app/migration_guards.py), so a correctly guarded
+    revision never reaches this path. Stamping a revision "done" on a
+    duplicate-column error assumes the whole revision is a no-op, so any other
+    DDL or data work in an unguarded revision would be silently skipped here.
+
+    Any other failure is re-raised and leaves alembic_version where it is, so
+    that revision AND every later one stay unapplied on each startup until the
+    revision is fixed. The exception carries a message naming the stuck
+    revision and the blocked count, which _run_alembic_upgrade logs as an error
+    rather than as a one-off "non-fatal" warning.
+    """
+    from alembic import command
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy.exc import OperationalError
+
+    script = ScriptDirectory.from_config(alembic_cfg)
+    # Upper bound on steps needed to walk from any revision to head — derived
+    # from the actual chain length rather than a fixed constant, so it never
+    # needs manual bumping as migrations accumulate.
+    max_steps = len(list(script.walk_revisions())) + 1
+
+    for _ in range(max_steps):
+        with sync_engine.connect() as conn:
+            current = MigrationContext.configure(conn).get_current_revision()
+
+        if current == script.get_current_head():
+            return
+
+        next_revs = script.get_revision(current).nextrev if current else None
+        next_rev = next(iter(next_revs)) if next_revs else None
+        try:
+            command.upgrade(alembic_cfg, "+1")
+        except Exception as e:
+            healable = (
+                isinstance(e, OperationalError)
+                and "duplicate column name" in str(e).lower()
+                and next_rev is not None
+            )
+            if not healable:
+                # iterate_revisions includes its lower bound; the current
+                # revision is already applied, so it is not pending.
+                pending = list(script.iterate_revisions("heads", current or "base"))
+                blocked = len(pending) - (1 if current else 0)
+                setattr(
+                    e,
+                    _STUCK_REVISION_ATTR,
+                    f"revision {next_rev or '(first)'} failed; alembic_version stays at "
+                    f"{current or 'base'} and {blocked} pending revision(s) will not "
+                    f"apply until it is fixed: {e!r}",
+                )
+                raise
+            logger.warning(
+                f"Alembic: revision {next_rev} adds a column that already exists "
+                "(added out-of-band); stamping as applied and continuing"
+            )
+            command.stamp(alembic_cfg, next_rev)
+
+    raise RuntimeError("Alembic upgrade did not reach head after self-healing retries")
+
+
+def _get_expected_columns(table_name: str) -> set[str]:
+    """Get expected column names from the SQLModel metadata for a table."""
+    table = SQLModel.metadata.tables.get(table_name)
+    if table is None:
+        return set()
+    return {col.name for col in table.columns}
+
+
+async def _get_actual_columns(conn, table_name: str) -> set[str]:
+    """Get actual column names from the database for a table."""
+    result = await conn.execute(sa_text(f"PRAGMA table_info('{table_name}')"))
+    rows = result.fetchall()
+    return {row[1] for row in rows}  # column name is at index 1
+
+
+def _model_default_literal(col) -> str | None:
+    """Render a column's declared Python default as a SQL literal, or None.
+
+    Used to backfill existing rows when adding a column on upgrade. Only scalar
+    (non-callable) defaults are rendered — callables like ``datetime.utcnow`` and
+    the sentinel ``None`` fall through to the type-based logic in the caller.
+
+    This is what keeps non-Optional ``str = ""`` columns from landing as NULL:
+    their type is SQLModel's ``AutoString`` (a ``TypeDecorator``), which the
+    caller's ``isinstance(col.type, String)`` check does not match.
+    """
+    default = col.default
+    if default is None or not getattr(default, "is_scalar", False):
+        return None
+
+    value = default.arg
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    return None
+
+
+async def _add_missing_columns() -> None:
+    """Add missing columns to existing tables via ALTER TABLE.
+
+    SQLModel's create_all() only creates new tables — it won't add columns
+    to existing ones. Alembic handles this in dev, but frozen builds skip
+    Alembic (no alembic.ini). This function bridges the gap by comparing
+    the model metadata against the live schema and issuing ALTER TABLE
+    ADD COLUMN for any gaps.
+    """
+    async with engine.begin() as conn:
+        result = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table'"))
+        existing_tables = {row[0] for row in result.fetchall()}
+
+        for table_name, table in SQLModel.metadata.tables.items():
+            if table_name not in existing_tables:
+                continue
+
+            actual = await _get_actual_columns(conn, table_name)
+            expected = _get_expected_columns(table_name)
+            missing = expected - actual
+
+            if not missing:
+                continue
+
+            for col_name in missing:
+                col = table.c[col_name]
+                col_type = col.type.compile(dialect=engine.dialect)
+                # Build DEFAULT clause. Prefer an explicit server_default, then the
+                # model's declared Python default (so existing rows backfill with the
+                # value the model would insert), then a type-based fallback.
+                model_default = _model_default_literal(col)
+                if col.server_default is not None:
+                    default_clause = f" DEFAULT {col.server_default.arg}"
+                elif model_default is not None:
+                    # Honors non-Optional str = "" columns whose type is SQLModel's
+                    # AutoString (a TypeDecorator, NOT a String subclass) — the
+                    # isinstance checks below miss those and would leave existing
+                    # rows NULL, 500ing GET /api/config for upgrading users.
+                    default_clause = f" DEFAULT {model_default}"
+                elif col.nullable:
+                    default_clause = " DEFAULT NULL"
+                elif isinstance(col.type, sqlalchemy.types.String):
+                    default_clause = " DEFAULT ''"
+                elif isinstance(col.type, (sqlalchemy.types.Integer, sqlalchemy.types.Float)):
+                    default_clause = " DEFAULT 0"
+                elif isinstance(col.type, sqlalchemy.types.Boolean):
+                    default_clause = " DEFAULT 0"
+                else:
+                    default_clause = ""
+
+                sql = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}{default_clause}"
+                await conn.execute(sa_text(sql))
+                logger.info(f"Added missing column: {table_name}.{col_name} ({col_type})")
+
+
+async def _drop_extra_columns() -> None:
+    """Drop columns that exist in the database but not in the model.
+
+    The removal counterpart to _add_missing_columns. Frozen/PyInstaller builds
+    ship no alembic.ini, so destructive Alembic migrations (DROP COLUMN) never
+    run there. A column removed from the model therefore lingers in the live
+    schema; if it is NOT NULL with no default, every ORM INSERT omits it and
+    SQLite raises IntegrityError (this is the is_transcoding_enabled crash on
+    disc insert). Converging the schema to the model discards the stale column's
+    data — the same source-of-truth philosophy as _migrate_app_config.
+
+    SQLite DROP COLUMN requires 3.35.0+. Each drop is best-effort: a failure
+    (e.g., the column participates in an index) is logged and skipped, never fatal.
+    """
+    async with engine.begin() as conn:
+        result = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table'"))
+        existing_tables = {row[0] for row in result.fetchall()}
+
+        for table_name in SQLModel.metadata.tables:
+            if table_name not in existing_tables:
+                continue
+
+            actual = await _get_actual_columns(conn, table_name)
+            expected = _get_expected_columns(table_name)
+            extra = actual - expected
+
+            for col_name in extra:
+                try:
+                    await conn.execute(
+                        sa_text(f'ALTER TABLE {table_name} DROP COLUMN "{col_name}"')
+                    )
+                    logger.info(f"Dropped obsolete column: {table_name}.{col_name}")
+                except sqlalchemy.exc.OperationalError as e:
+                    logger.warning(
+                        f"Could not drop obsolete column {table_name}.{col_name}: {e}",
+                        exc_info=True,
+                    )
+
+
+async def _migrate_app_config(target_engine: AsyncEngine | None = None) -> None:
+    """Preserve app_config data across schema changes.
+
+    Reads existing config rows, drops/recreates the table with the correct
+    schema, and restores values by column name. This ensures users never
+    lose API keys or settings when the AppConfig model changes.
+
+    Idempotent: no-op when schema already matches.
+    """
+    eng = target_engine or engine
+
+    async with eng.begin() as conn:
+        # Check which tables exist
+        result = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table'"))
+        existing_tables = {row[0] for row in result.fetchall()}
+
+        if "app_config" not in existing_tables:
+            return
+
+        actual_cols = await _get_actual_columns(conn, "app_config")
+        expected_cols = _get_expected_columns("app_config")
+
+        if actual_cols == expected_cols:
+            return
+
+        extra = actual_cols - expected_cols
+        missing = expected_cols - actual_cols
+        logger.info(
+            f"Schema mismatch in app_config — "
+            f"extra: {extra or 'none'}, missing: {missing or 'none'}"
+        )
+
+        # 1. Read existing config data
+        rows = (await conn.execute(sa_text("SELECT * FROM app_config"))).fetchall()
+        col_result = await conn.execute(sa_text("PRAGMA table_info('app_config')"))
+        old_col_names = [row[1] for row in col_result.fetchall()]
+
+        # 2. Drop old table
+        await conn.execute(sa_text("DROP TABLE app_config"))
+
+        # 3. Recreate with correct schema
+        await conn.run_sync(
+            lambda sync_conn: AppConfig.__table__.create(sync_conn, checkfirst=True)
+        )
+
+        # 4. Restore data using ORM to pick up column defaults
+        if rows:
+            new_fields = set(AppConfig.model_fields.keys())
+            for row in rows:
+                old_data = dict(zip(old_col_names, row, strict=False))
+                config = AppConfig()
+                for key, value in old_data.items():
+                    if key == "id":
+                        continue
+                    if key in new_fields and value is not None:
+                        setattr(config, key, value)
+                insert_data = {}
+                for field_name in new_fields:
+                    if field_name == "id":
+                        continue
+                    insert_data[field_name] = getattr(config, field_name)
+                cols_str = ", ".join(insert_data.keys())
+                placeholders = ", ".join(f":{k}" for k in insert_data.keys())
+                await conn.execute(
+                    sa_text(f"INSERT INTO app_config ({cols_str}) VALUES ({placeholders})"),
+                    insert_data,
+                )
+                logger.info(f"Restored app_config row with {len(insert_data)} fields")
+
+
+async def _seed_headless_defaults() -> None:
+    """Seed allow_lan_access=True on first headless install.
+
+    Runs after init_db() creates the app_config table. Only acts when
+    ENGRAM_HEADLESS=1 and no app_config row exists yet. Existing installs
+    (row already present) are untouched, so a user who explicitly disabled
+    LAN access via the settings UI keeps their preference.
+    """
+    if os.environ.get("ENGRAM_HEADLESS") != "1":
+        return
+
+    async with async_session() as session:
+        row = (await session.execute(sa_text("SELECT id FROM app_config LIMIT 1"))).first()
+        if row is not None:
+            return  # config already exists, don't override
+
+        session.add(AppConfig(allow_lan_access=True))
+        await session.commit()
+        logger.info("Headless first-run: seeded app_config with allow_lan_access=True")
+
+
+async def reset_db() -> None:
+    """Drop all tables and recreate them. Development only."""
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+        await conn.run_sync(SQLModel.metadata.create_all)
+    logger.info("Database reset complete")
+
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """Dependency to get database session."""
+    async with async_session() as session:
+        yield session

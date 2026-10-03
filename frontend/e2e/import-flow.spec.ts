@@ -1,0 +1,188 @@
+import { test, expect } from '@playwright/test';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+/**
+ * E2E for manual media import: the top-bar IMPORT button opens a two-pane modal
+ * that browses the server filesystem, previews a Show / Season / Disc tree
+ * (rolling the Disc folder up into its season), and starts one import job per
+ * season.
+ *
+ * The seeded tree lives in the OS temp dir on the same host the E2E backend runs
+ * on, so the backend's browse/preview/start endpoints can read it directly. The
+ * import endpoints do not require DEBUG, but the E2E backend runs with DEBUG=true
+ * so reset-all-jobs is available for test isolation.
+ */
+
+/** Seeded trees are torn down in afterAll so runs don't litter the OS temp dir. */
+const seededRoots: string[] = [];
+
+function seedShowTree(): string {
+    const root = mkdtempSync(join(tmpdir(), 'engram-import-'));
+    seededRoots.push(root);
+    const disc = join(root, 'Demo Show', 'Season 1', 'Disc 1');
+    mkdirSync(disc, { recursive: true });
+    writeFileSync(join(disc, 't00.mkv'), Buffer.alloc(1024));
+    writeFileSync(join(disc, 't01.mkv'), Buffer.alloc(1024));
+    return root;
+}
+
+/** A directory with enough children to overflow any viewport, plus one real show. */
+function seedManyDirs(count = 400): string {
+    const root = mkdtempSync(join(tmpdir(), 'engram-import-big-'));
+    seededRoots.push(root);
+    for (let i = 0; i < count; i++) {
+        mkdirSync(join(root, `Show ${String(i).padStart(3, '0')}`), { recursive: true });
+    }
+    const season = join(root, 'Zulu Show', 'Season 1');
+    mkdirSync(season, { recursive: true });
+    writeFileSync(join(season, 't00.mkv'), Buffer.alloc(1024));
+    return root;
+}
+
+test.describe('Manual media import', () => {
+    // These tests point the app's import_watch_path at a temp tree. That setting
+    // lives in the shared app_config table and outlives the process, so restore
+    // it: otherwise it is left dangling at a directory afterAll just deleted.
+    let originalWatchPath = '';
+
+    test.beforeAll(async ({ request }) => {
+        const cfg = await (await request.get('/api/config')).json();
+        originalWatchPath = cfg.import_watch_path ?? '';
+    });
+
+    test.afterAll(async ({ request }) => {
+        await request.put('/api/config', { data: { import_watch_path: originalWatchPath } });
+        for (const root of seededRoots) rmSync(root, { recursive: true, force: true });
+        seededRoots.length = 0;
+    });
+
+    test.beforeEach(async ({ request }) => {
+        await request.delete('/api/simulate/reset-all-jobs');
+    });
+
+    test('browse, preview, and start an import', async ({ page, request }) => {
+        const root = seedShowTree();
+
+        // Point the import default at the seeded root so the modal opens there.
+        await request.put('/api/config', { data: { import_watch_path: root } });
+
+        await page.goto('/');
+        await expect(page.locator('text=/LIVE/i')).toBeVisible({ timeout: 10000 });
+
+        // Open the import modal from the top bar.
+        await page.getByTestId('sv-import-btn').click();
+        await expect(page.getByText('IMPORT MEDIA')).toBeVisible();
+
+        // The modal opens browsing the seeded root; click the show folder. This
+        // navigates into it AND previews it (the right pane shows the per-season
+        // breakdown, with the nested Disc folder rolled into Season 1).
+        await page.getByText('Demo Show', { exact: true }).first().click();
+        await expect(page.getByText(/SEASON 1/)).toBeVisible({ timeout: 5000 });
+
+        // Start the import; the modal closes.
+        await page.getByTestId('import-start-btn').click();
+        await expect(page.getByTestId('import-start-btn')).toBeHidden({ timeout: 5000 });
+
+        // One import job for the show should now exist on the backend
+        // (filter-independent: assert on the API rather than a dashboard card,
+        // since a fake-MKV job may reach a terminal state quickly).
+        await expect
+            .poll(
+                async () => {
+                    const res = await request.get('/api/jobs');
+                    const jobs = (await res.json()) as Array<{
+                        drive_id: string;
+                        detected_title: string | null;
+                    }>;
+                    return jobs.some(
+                        (j) =>
+                            j.drive_id === 'import' &&
+                            (j.detected_title || '').includes('Demo Show'),
+                    );
+                },
+                { timeout: 15000 },
+            )
+            .toBe(true);
+    });
+
+    test('a blocked unit keeps the modal open and can be re-imported', async ({ page, request }) => {
+        const root = seedShowTree();
+        await request.put('/api/config', { data: { import_watch_path: root } });
+
+        // The pipeline cannot be driven to COMPLETED reliably with fake MKVs, so the
+        // conflict response is served directly. What is under test here is the UI
+        // wiring in a real browser; the contract itself is covered by
+        // backend/tests/integration/test_import_endpoints.py.
+        const startBodies: string[] = [];
+        let call = 0;
+        await page.route('**/api/import/start', async (route) => {
+            startBodies.push(route.request().postData() ?? '');
+            call += 1;
+            const body =
+                call === 1
+                    ? {
+                          job_ids: [],
+                          blocked: [
+                              {
+                                  unit_key: 'key-s1',
+                                  show_name: 'Demo Show',
+                                  season: 1,
+                                  display_path: `${root}/Demo Show/Season 1`,
+                                  reason: 'already_imported',
+                                  job_ids: [7],
+                              },
+                          ],
+                      }
+                    : { job_ids: [42], blocked: [] };
+            await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+        });
+
+        await page.goto('/');
+        await expect(page.locator('text=/LIVE/i')).toBeVisible({ timeout: 10000 });
+        await page.getByTestId('sv-import-btn').click();
+        await page.getByText('Demo Show', { exact: true }).first().click();
+        await expect(page.getByText(/SEASON 1/)).toBeVisible({ timeout: 5000 });
+
+        await page.getByTestId('import-start-btn').click();
+
+        // The modal must stay open and explain itself, not close on a silent skip.
+        await expect(page.getByTestId('import-conflict-panel')).toBeVisible();
+        await expect(page.getByTestId('import-start-btn')).toBeVisible();
+
+        await page.getByTestId('import-force-btn').click();
+
+        // The modal closes once the forced retry succeeds.
+        await expect(page.getByTestId('import-start-btn')).toBeHidden({ timeout: 5000 });
+
+        expect(JSON.parse(startBodies[0]).force_keys).toEqual([]);
+        expect(JSON.parse(startBodies[1]).force_keys).toEqual(['key-s1']);
+    });
+
+    test('folder browser stays within the viewport and scrolls', async ({ page, request }) => {
+        const root = seedManyDirs();
+        await request.put('/api/config', { data: { import_watch_path: root } });
+
+        await page.goto('/');
+        await expect(page.locator('text=/LIVE/i')).toBeVisible({ timeout: 10000 });
+        await page.getByTestId('sv-import-btn').click();
+        await expect(page.getByText('IMPORT MEDIA')).toBeVisible();
+
+        const list = page.getByTestId('import-nav-list');
+        await expect(list.getByText('Show 000', { exact: true })).toBeVisible({ timeout: 15000 });
+
+        // The panel must not exceed the viewport.
+        const viewport = page.viewportSize()!;
+        const panel = await page.getByTestId('import-panel').boundingBox();
+        expect(panel!.height).toBeLessThanOrEqual(viewport.height);
+
+        // Header, the up-a-level row, and the footer button all stay reachable.
+        await expect(page.getByText('..', { exact: true })).toBeVisible();
+        await expect(page.getByTestId('import-start-btn')).toBeInViewport();
+
+        // The list itself is the scroll container.
+        const scrolls = await list.evaluate((el) => el.scrollHeight > el.clientHeight + 1);
+        expect(scrolls).toBe(true);
+    });
+});

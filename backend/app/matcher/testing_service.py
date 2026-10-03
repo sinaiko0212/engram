@@ -1,0 +1,1210 @@
+"""Shared service layer for standalone testing of subtitle download, transcription, and matching.
+
+Provides three independent operations that can be called from CLI or API:
+1. download_subtitles - Download SRT files for a show/season via Addic7ed + TMDB
+2. transcribe_chunk - Extract audio from an MKV and transcribe with Whisper
+3. match_episodes - Match MKV file(s) against cached subtitles
+"""
+
+import re
+import tempfile
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+
+from loguru import logger
+
+from app import __version__
+from app.matcher.addic7ed_client import Addic7edClient
+from app.matcher.asr_provider import get_asr_provider
+from app.matcher.os_api_retry import _RETRYABLE_EXCEPTIONS, os_api_call, os_download_temp_name
+from app.matcher.provider_scheduler import EpisodeJob, run_jobs
+from app.matcher.srt_utils import extract_audio_chunk, get_video_duration
+from app.matcher.subtitle_provider import LocalSubtitleProvider
+from app.matcher.subtitle_utils import (
+    corpus_dir_name,
+    find_duplicate_episode_srts,
+    is_valid_srt_file,
+    sanitize_filename,
+)
+from app.matcher.tmdb_client import (
+    fetch_season_details,
+    fetch_season_episodes,
+    fetch_show_details,
+    fetch_show_id,
+)
+from app.matcher.tvsubtitles_client import TVSubtitlesClient
+
+# OpenSubtitles best-practices require the User-Agent be in the form
+# "AppName vX.Y.Z". A bare "Engram" (or worse, the upstream library default)
+# misidentifies us to OS and risks being lumped in with unidentified clients
+# for rate-limit purposes. __version__ is sourced from app/__init__.py.
+_USER_AGENT = f"Engram v{__version__}"
+
+# Episode statuses that mean "this episode's subtitle was actually retrieved"
+# (as opposed to "not_found" or a precomputed-cache hit, which the builder
+# never sees -- see the defense-in-depth assert in build_subtitle_cache.py).
+# Single definition shared with scripts/build_subtitle_cache.py (which
+# imports it under this same name) so producer and consumer of "retrieved"
+# can't drift -- a future third status added to only one side would silently
+# change coverage semantics without failing anything.
+RETRIEVED_STATUSES = frozenset({"cached", "downloaded"})
+
+
+# --- Cached OpenSubtitles API client + quota state -------------------------
+# The OpenSubtitles bearer token is valid ~24h and is meant to be reused.
+# `download_subtitles()` is called once per season; logging in each time
+# hammers the `/login` endpoint (throttled harder than data endpoints) and
+# triggers 429s long before the daily download quota is touched. We log in
+# once per process and reuse the client. Quota tracking lives alongside
+# because the library updates ``client.user_downloads_remaining`` as a side
+# effect of ``login()``, ``user_info()``, and ``download()`` — reading the
+# attribute is free, no extra API call.
+#
+# All this state lives on a single ``_OS`` dataclass instance instead of
+# loose module globals. ``global`` declarations confuse static analyzers
+# (CodeQL flagged the writes as "unused global variable" because it does
+# not track read-then-write-across-calls through the ``global`` keyword);
+# attribute access on a single object reads as a plain "is referenced" and
+# also reduces top-of-module noise.
+_OS_TOKEN_MAX_AGE: float = 12 * 60 * 60  # re-login after 12h, well within 24h
+# How long a spent daily quota disables OpenSubtitles before the next season
+# re-probes it. Without an expiry `failed` outlives the quota reset for as long
+# as the server runs, so a job told "retry once the quota resets" would keep
+# failing until Engram restarted.
+_OS_QUOTA_RETRY_SECONDS: float = 60 * 60
+# Cap on an OpenSubtitles error quoted into a job's subtitle message.
+_OS_ERROR_MAX_CHARS = 300
+
+
+@dataclass
+class _OSState:
+    """Process-wide OpenSubtitles API client + quota state."""
+
+    client: object | None = None
+    login_time: float = 0.0
+    failed: bool = False
+    # Why `failed` was set, for the job's subtitle message; None while healthy.
+    failure_reason: str | None = None
+    # Monotonic time after which a `failed` state may be retried. None keeps the
+    # failure sticky for the process (login/credential/package failures).
+    retry_at: float | None = None
+    last_quota: dict | None = None
+    last_logged_remaining: int | None = None
+
+
+_OS = _OSState()
+# Guards _get_os_client's check-then-login window. Two coroutines on the
+# FastAPI side (or two threads via asyncio.to_thread) can otherwise both
+# observe _OS.client is None and both call client.login(), consuming two
+# /login quota slots and racing on the assignment to _OS.client.
+# threading.Lock works in both sync and asyncio.to_thread contexts; we
+# don't need an asyncio.Lock because the login itself is sync.
+_OS_LOGIN_LOCK = threading.Lock()
+
+
+def _snapshot_os_quota(client) -> None:
+    """Read ``client.user_downloads_remaining`` and stash it for later display.
+
+    Called after each season's API download block. Non-fatal on any error —
+    the quota counter is informational only.
+    """
+    try:
+        remaining = getattr(client, "user_downloads_remaining", None)
+        if remaining is None:
+            return
+        remaining_int = int(remaining)
+        _OS.last_quota = {"remaining": remaining_int, "as_of": time.monotonic()}
+        # Log on first read, on a drop of >= 10 from the last LOGGED value
+        # (not the previous snapshot — slow drips of 5-per-season would
+        # never cross a snapshot-to-snapshot threshold), AND on any refill.
+        # The refill branch matters at midnight: when the daily quota
+        # resets (e.g. 50 -> 1000), the "drop" check sees 50 - 1000 = -950,
+        # never >= 10, so without it the log line would go silent for the
+        # rest of the run even though the counter is healthy.
+        if (
+            _OS.last_logged_remaining is None
+            or _OS.last_logged_remaining - remaining_int >= 10
+            or remaining_int > _OS.last_logged_remaining
+        ):
+            logger.info(f"OS API quota: {remaining_int} downloads remaining today")
+            _OS.last_logged_remaining = remaining_int
+    except Exception as exc:
+        # exc_info=True per CLAUDE.md. The quota path is best-effort, so
+        # this stays at DEBUG (won't spam production logs), but if a
+        # programming error sneaks in (e.g., an unexpected client shape →
+        # AttributeError) the traceback is the only thing that lets us
+        # diagnose it.
+        logger.debug(f"Could not snapshot OS quota (non-fatal): {exc}", exc_info=True)
+
+
+def get_last_quota() -> dict | None:
+    """Public read-only accessor for the most recent OS download-quota snapshot.
+
+    Returns a dict ``{"remaining": int, "as_of": float}`` or None if no API
+    call has succeeded yet this process. Used by the build script's final
+    summary so the user sees "downloads remaining today" at the end of a run.
+    """
+    return _OS.last_quota
+
+
+def _is_degraded(os_failed: bool, episodes: list[dict], *, providers_failed: bool = False) -> bool:
+    """Return True when this season's result is NOT a trustworthy measurement.
+
+    Degraded means some part of the cascade did not serve AND the season is not
+    fully retrieved. Two independent failure signals feed the first half:
+    ``os_failed`` (OpenSubtitles exhausted its quota, failed to log in, or hard
+    errored -- at login time OR mid-run) and ``providers_failed`` (a scraper
+    went down hard enough to trip its circuit breaker; see
+    ``provider_scheduler.ProviderHealth.failed``).
+
+    Both doors lead to the same defect. A dead scraper and an unsubtitled
+    episode both surface as ``not_found``, so without the second signal a
+    season whose scrapers were ALL down records as a genuine 0% and is
+    skip-listed for 30 days -- exactly what a June 2026 OpenSubtitles outage
+    did to 664 seasons through the first door. Quota exhaustion does not respect season boundaries: it
+    can land mid-loop with a few episodes already downloaded, so requiring
+    "nothing at all" would let a partial season (e.g. 3/13) get recorded as a
+    real 23% coverage measurement and skip-listed for 30 days on the strength
+    of an infrastructure failure that happened to land inside that season.
+    Recording NO coverage for such a season instead just costs a retry on the
+    next run -- cheap and self-correcting, versus a month-long blind spot.
+
+    Conservative by design in the other direction: a fully retrieved season is
+    a real measurement whichever provider went down afterwards, because there
+    is no gap left for the outage to have hidden. So is a season where every
+    provider answered and simply had nothing -- that one SHOULD be recorded, so
+    genuinely dead seasons stop consuming quota. One dead scraper plus one
+    healthy one is judged on the same rule: complete records, incomplete
+    degrades, because a partial season cannot distinguish "genuinely absent"
+    from "was behind the dead provider".
+    """
+    if not (os_failed or providers_failed):
+        return False
+    if not episodes:
+        return True
+    return any(ep.get("status") not in RETRIEVED_STATUSES for ep in episodes)
+
+
+def probe_os_quota(config) -> int | None:
+    """Log in (cached) and return remaining daily OpenSubtitles downloads.
+
+    Public wrapper over ``_get_os_client`` for callers that only want to
+    display quota up front (e.g. the cache build script's startup banner).
+    Returns the remaining download count, or None when OpenSubtitles is
+    unavailable — missing package/credentials, login failure, or quota
+    already exhausted. The login + ``/infos/user`` probe does NOT consume
+    download quota, and this is best-effort: it never raises.
+    """
+    if _get_os_client(config) is None:
+        return None
+    quota = get_last_quota()
+    return quota.get("remaining") if quota else None
+
+
+def _describe_os_error(exc: BaseException) -> str:
+    """One-line, length-capped text of an OpenSubtitles failure for a job message."""
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    if len(text) > _OS_ERROR_MAX_CHARS:
+        text = text[: _OS_ERROR_MAX_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _mark_os_failed(reason: str, *, retry_after: float | None = None) -> None:
+    """Disable the API for this process, recording why and (optionally) until when."""
+    _OS.failed = True
+    _OS.failure_reason = reason
+    _OS.retry_at = None if retry_after is None else time.monotonic() + retry_after
+
+
+def _os_disabled() -> bool:
+    """True while a recorded failure still disables the API.
+
+    A failure with a ``retry_at`` (a spent daily quota) expires; clearing it here
+    lets the caller log in again and re-read the quota.
+    """
+    if not _OS.failed:
+        return False
+    if _OS.retry_at is None or time.monotonic() < _OS.retry_at:
+        return True
+    logger.info("OpenSubtitles API: quota lockout expired; re-checking the download quota")
+    _OS.failed = False
+    _OS.failure_reason = None
+    _OS.retry_at = None
+    return False
+
+
+def _get_os_client(config) -> object | None:
+    """Return a logged-in OpenSubtitles client, or None when it is unavailable.
+
+    See ``_os_client_and_reason``, which also says why it is unavailable.
+    """
+    return _os_client_and_reason(config)[0]
+
+
+def _os_client_and_reason(config) -> tuple[object | None, str | None]:
+    """Return ``(client, None)`` for a logged-in OpenSubtitles client, cached for
+    the process, or ``(None, reason)`` when the API is unavailable.
+
+    Logs in once (with 429-aware backoff) and reuses the token across all
+    seasons/shows; callers fall back to scrapers on None. Thread-safe via
+    ``_OS_LOGIN_LOCK``: concurrent callers wait on the lock and observe the
+    resulting client on the second check. The reason is taken under the same
+    lock that sets it, so a concurrent job recording or expiring a failure
+    cannot hand this caller a reason that doesn't match its None.
+    """
+    # Fast path (no lock): a logged-in client with a fresh token. A failure goes
+    # through the lock so its reason is read consistently.
+    if (
+        not _OS.failed
+        and _OS.client is not None
+        and (time.monotonic() - _OS.login_time) < _OS_TOKEN_MAX_AGE
+    ):
+        return _OS.client, None
+
+    with _OS_LOGIN_LOCK:
+        # Double-check after acquiring the lock — another thread may have
+        # completed the login (or flipped `failed`) while we were waiting.
+        if _os_disabled():
+            return None, _OS.failure_reason
+        if _OS.client is not None and (time.monotonic() - _OS.login_time) < _OS_TOKEN_MAX_AGE:
+            return _OS.client, None
+
+        try:
+            from opensubtitlescom import OpenSubtitles as _OSApi
+        except ImportError:
+            logger.warning("opensubtitlescom package not installed — skipping API path")
+            reason = "the opensubtitlescom package is not installed"
+            _mark_os_failed(reason)
+            return None, reason
+
+        # Construct AND login inside the same try so a malformed config
+        # (e.g., missing opensubtitles_api_key attribute → AttributeError)
+        # is caught and gracefully degraded to scrapers, matching the
+        # original pre-refactor contract. Constructing outside the try
+        # would propagate that AttributeError to the caller unhandled.
+        try:
+            client = _OSApi(_USER_AGENT, config.opensubtitles_api_key)
+            os_api_call(
+                client.login,
+                config.opensubtitles_username,
+                config.opensubtitles_password,
+            )
+        except Exception as e:
+            logger.warning(
+                f"OpenSubtitles API login failed after retries ({e}); "
+                "using scrapers for the rest of this run",
+                exc_info=True,
+            )
+            reason = f"login failed: {_describe_os_error(e)}"
+            _mark_os_failed(reason)
+            return None, reason
+
+        # The login response only carries ``allowed_downloads`` — the daily
+        # CAP (e.g. 1000 for VIP), NOT how many remain. Trusting it makes the
+        # build believe quota is full when it may already be exhausted, then
+        # 406 ("quota exceeded") on every per-season download while logging a
+        # reassuring "1000 remaining". One ``/infos/user`` call up front (it
+        # does NOT consume download quota) yields the true ``remaining_downloads``
+        # and, as a side effect, updates ``client.user_downloads_remaining``.
+        try:
+            os_api_call(client.user_info)
+        except _RETRYABLE_EXCEPTIONS as e:
+            # Non-fatal: if the probe itself fails we proceed with whatever
+            # the library seeded (the cap) rather than blocking the run.
+            logger.debug(f"OS user-info probe failed (non-fatal): {e}", exc_info=True)
+        remaining = getattr(client, "user_downloads_remaining", None)
+
+        if remaining is not None and remaining <= 0:
+            # Quota is spent for today. Skip OpenSubtitles for the next hour
+            # instead of paying a search + 406 + retry on every season —
+            # the daily bucket won't refill for hours. Falls straight through
+            # to the scrapers (Addic7ed / TVsubtitles).
+            logger.warning(
+                f"OpenSubtitles API: daily download quota exhausted "
+                f"({remaining} remaining); skipping OpenSubtitles for the next hour, "
+                "falling back to scrapers (Addic7ed/TVsubtitles)"
+            )
+            # Expires so a long-running server picks OpenSubtitles back up once
+            # the daily bucket refills, instead of only after a restart.
+            reason = "daily download quota exhausted"
+            _mark_os_failed(reason, retry_after=_OS_QUOTA_RETRY_SECONDS)
+            _snapshot_os_quota(client)
+            return None, reason
+
+        if remaining is not None:
+            logger.info(f"OpenSubtitles API login OK — {remaining} downloads remaining today")
+        else:
+            logger.info("OpenSubtitles API login OK")
+        _OS.client = client
+        _OS.login_time = time.monotonic()
+        # Seed the quota snapshot from the (now accurate) client attribute —
+        # gives the build script's final summary a starting baseline even if
+        # no downloads happen this run (e.g., the whole cache is already populated).
+        _snapshot_os_quota(client)
+        return client, None
+
+
+def _precomputed_skip_result(
+    cache_path: Path, show_name: str, season: int, expected_tmdb_id: int | None = None
+) -> dict | None:
+    """Build a 'skip download' result when the precomputed cache covers the season.
+
+    Returns None when the cache doesn't cover ``show_name`` S``season``. The result
+    is sized from the cache's own episode index (no TMDB call), so it works even
+    when TMDB is unreachable — the whole point of the precomputed cache.
+
+    ``expected_tmdb_id`` applies the corpus guard: a precomputed corpus whose
+    manifest id contradicts the job's id is for a different same-named show, so
+    we must NOT skip the download against it.
+    """
+    from app.matcher.episode_identification import (
+        precomputed_covers_season,
+        precomputed_episode_codes,
+    )
+
+    # Corpus guard first — returns False on an id mismatch (different same-named show).
+    if not precomputed_covers_season(
+        cache_path, show_name, season, expected_tmdb_id=expected_tmdb_id
+    ):
+        return None
+
+    codes = precomputed_episode_codes(
+        cache_path, show_name, season, expected_tmdb_id=expected_tmdb_id
+    )
+    if not codes:
+        return None
+
+    logger.info(
+        f"{show_name} S{season:02d}: covered by precomputed vector cache; "
+        f"skipping subtitle download"
+    )
+    # Keyed by tmdb_id (fallback: sanitized name) to match the runtime SRT cache,
+    # so two same-named shows never collide. Informational here — precomputed mode
+    # reads vectors, not these SRTs — but kept consistent with the live cache key.
+    series_cache_dir = cache_path / "data" / corpus_dir_name(expected_tmdb_id, show_name)
+    return {
+        "show_name": show_name,
+        "season": season,
+        "total_episodes": len(codes),
+        "episodes": [
+            {"code": code, "status": "precomputed", "source": "precomputed"} for code in codes
+        ],
+        "cache_dir": str(series_cache_dir),
+        # A precomputed-covered season is by definition not a degraded
+        # measurement -- explicit so the dict shape stays total even though
+        # "precomputed" isn't in _is_degraded's retrieved-status allowlist.
+        # _heal_precomputed_gaps copies this dict forward (dict(skip) /
+        # unchanged `return skip`), so this single site covers both.
+        "degraded": False,
+    }
+
+
+def _fetch_episodes(
+    show_id, show_name: str, season: int, episode_numbers, series_cache_dir: Path, config
+) -> dict[int, dict]:
+    """Download SRTs for a specific set of episode numbers into ``series_cache_dir``.
+
+    Used by the completeness-aware heal to fetch ONLY the precomputed-cache gaps,
+    so a missing episode (e.g. Mad Men S02E05) is repaired without re-downloading
+    — and re-burning the scarce OpenSubtitles daily quota on — the episodes the
+    cache already covers. Per-episode work fans out across the same
+    addic7ed/tvsubtitles scheduler the full season download uses for its residual.
+
+    Returns ``({episode_number: result_dict}, failed_providers)``. The results
+    share the full download's per-episode shape
+    (``code``/``status``/``path``/``source``); ``failed_providers`` names any
+    scraper that never answered, because a dead provider and an episode nobody
+    has both surface as ``not_found`` and the caller must not record the first
+    as if it were the second.
+    """
+    from app.matcher.subtitle_utils import find_existing_subtitle
+
+    safe_show_name = sanitize_filename(show_name)
+    series_cache_dir.mkdir(parents=True, exist_ok=True)
+    wanted = sorted({int(ep) for ep in episode_numbers})
+
+    results: dict[int, dict] = {}
+    residual_jobs: list[EpisodeJob] = []
+    for episode in wanted:
+        episode_code = f"S{season:02d}E{episode:02d}"
+        existing = find_existing_subtitle(str(series_cache_dir), safe_show_name, season, episode)
+        if existing and is_valid_srt_file(existing):
+            results[episode] = {
+                "code": episode_code,
+                "status": "cached",
+                "path": str(existing),
+                "source": "cache",
+            }
+            continue
+        residual_jobs.append(
+            EpisodeJob(
+                tmdb_id=int(show_id),
+                show_name=show_name,
+                season=season,
+                episode=episode,
+                episode_code=episode_code,
+                srt_target=series_cache_dir / f"{safe_show_name} - {episode_code}.srt",
+                pending_providers=deque(["addic7ed", "tvsubtitles"]),
+            )
+        )
+
+    failed_providers: list[str] = []
+    if residual_jobs:
+        workers = {"addic7ed": Addic7edClient(), "tvsubtitles": TVSubtitlesClient()}
+        scheduler_run = run_jobs(residual_jobs, workers)
+        failed_providers = scheduler_run.failed_providers
+        for episode in wanted:
+            if episode in results:
+                continue
+            episode_code = f"S{season:02d}E{episode:02d}"
+            results[episode] = scheduler_run.results.get(
+                episode_code,
+                {"code": episode_code, "status": "not_found", "path": None, "source": None},
+            )
+    return results, failed_providers
+
+
+def _heal_precomputed_gaps(
+    skip: dict, show_name: str, season: int, *, tmdb_id: int | None, cache_path: Path, config
+) -> dict:
+    """Fill precomputed-cache gaps when the shipped index misses roster episodes.
+
+    The precomputed coverage gate is presence-based, so a season whose index is
+    missing an episode (Mad Men S02 shipped without S02E05) silently skips the
+    download AND matches against the incomplete set. Here we diff the cache's
+    episode codes against the canonical TMDB roster and fetch ONLY the missing
+    episodes into ``data/<id>/``, where the matcher's runtime augmentation grafts
+    them into the reference matrix.
+
+    Best-effort by design: the precomputed fast path is meant to work offline, so
+    any TMDB failure returns ``skip`` unchanged (the job still matches against the
+    cache) instead of raising. An episode no provider can supply is logged as a
+    hard gap and surfaced to the review UI via reference_coverage().
+    """
+    precomputed_codes = {ep["code"] for ep in skip.get("episodes", [])}
+    try:
+        resolved_id = str(tmdb_id) if tmdb_id is not None else fetch_show_id(show_name)
+        if not resolved_id:
+            return skip
+        episode_count = fetch_season_details(resolved_id, season)
+    except Exception as e:  # noqa: BLE001 — offline/failed TMDB must not fail the job
+        logger.debug(
+            f"Precomputed completeness check skipped for {show_name} "
+            f"S{season:02d} (TMDB unavailable: {e})"
+        )
+        return skip
+    if not episode_count:
+        return skip
+
+    gap_eps = [
+        ep
+        for ep in range(1, episode_count + 1)
+        if f"S{season:02d}E{ep:02d}" not in precomputed_codes
+    ]
+    if not gap_eps:
+        return skip
+
+    gap_codes = [f"S{season:02d}E{ep:02d}" for ep in gap_eps]
+    logger.info(
+        f"Precomputed cache for {show_name} S{season:02d} missing "
+        f"{len(gap_eps)} of {episode_count} episode(s): {', '.join(gap_codes)}; fetching"
+    )
+    series_cache_dir = cache_path / "data" / corpus_dir_name(tmdb_id, show_name)
+    fetched, failed_providers = _fetch_episodes(
+        resolved_id, show_name, season, gap_eps, series_cache_dir, config
+    )
+
+    still_missing = [
+        fetched[ep]["code"] for ep in gap_eps if fetched.get(ep, {}).get("status") == "not_found"
+    ]
+    if still_missing:
+        logger.warning(
+            f"No reference subtitle obtainable for {show_name} S{season:02d}: "
+            f"{', '.join(still_missing)} — flagged for manual review"
+        )
+
+    healed = dict(skip)
+    healed_episodes = list(skip.get("episodes", []))
+    healed_episodes.extend(
+        fetched.get(
+            ep,
+            {
+                "code": f"S{season:02d}E{ep:02d}",
+                "status": "not_found",
+                "path": None,
+                "source": None,
+            },
+        )
+        for ep in gap_eps
+    )
+    healed["episodes"] = healed_episodes
+    healed["total_episodes"] = len(healed_episodes)
+    # The skip dict this copies is unconditionally `degraded: False`, which is
+    # right for a complete precomputed season and wrong for one whose gaps we
+    # just failed to fill because the scrapers were down. Same rule as the full
+    # download: a provider went dark AND something is still missing means the
+    # season was not measured, so the cache builder must not record it.
+    if failed_providers and still_missing:
+        logger.warning(
+            f"{show_name} S{season:02d}: scraper(s) {', '.join(failed_providers)} never "
+            f"answered while healing {len(still_missing)} gap(s); marking degraded so the "
+            "season is re-measured rather than recorded short"
+        )
+        healed["degraded"] = True
+    return healed
+
+
+def _release_matches_episode(release: str | None, expected_title: str, *, season: int) -> bool:
+    """Return False when an OpenSubtitles ``release`` clearly names a DIFFERENT
+    episode than the one requested; True when it's consistent or uninformative.
+
+    OpenSubtitles mislabels some shows' episodes — e.g. it returns DS9 Season 2
+    subtitles tagged ``season_number=1`` ("Episode 6 - Melora" for a request that
+    should be S01E06 "Q-Less"). The declared season/episode can't be trusted, but
+    the ``release`` string carries the true title, so we reject on positive
+    mismatch evidence only (never on mere absence of a title, to avoid rejecting
+    valid releases that are bare filenames/hashes):
+
+    1. An explicit ``SxxEyy`` whose season differs from ``season``.
+    2. An explicit title after an episode marker ("Episode N - Title", "SxxEyy: Title",
+       "NxNN - Title") that shares no word — and is no substring — with ``expected_title``.
+    """
+    if not release or not expected_title:
+        return True
+    sxx = re.search(r"s(\d{1,2})e\d{1,3}", release, re.IGNORECASE)
+    if sxx and int(sxx.group(1)) != season:
+        return False
+    marker = re.search(
+        r"(?:episode\s+\d+|s\d{1,2}e\d{1,3}|\d{1,2}x\d{1,3})\s*[-–:]\s*(.+)$",
+        release,
+        re.IGNORECASE,
+    )
+    if marker and _titles_conflict(marker.group(1), expected_title):
+        return False
+    return True
+
+
+def _titles_conflict(a: str, b: str) -> bool:
+    """True when two episode titles share no word and neither is a substring of
+    the other (after stripping punctuation) — i.e. they're clearly different."""
+    aw = re.findall(r"[a-z0-9]+", a.lower())
+    bw = re.findall(r"[a-z0-9]+", b.lower())
+    if not aw or not bw:
+        return False
+    if set(aw) & set(bw):
+        return False
+    aj, bj = "".join(aw), "".join(bw)
+    if aj in bj or bj in aj:
+        return False
+    return True
+
+
+def _reject_content_duplicates(series_cache_dir: str | Path, episodes: list[dict]) -> list[dict]:
+    """Drop episodes whose subtitle dialogue is identical to a *different*
+    episode's already on disk (a provider mislabeled one episode's SRT as
+    another). The contaminant file is deleted and its result rewritten to
+    not_found so coverage tracking stays honest and the slot can be re-attempted.
+
+    The cache builder harvests seasons in ascending order, so the lexicographically
+    larger code (e.g. S02E05 when it duplicates S01E05) is the late-arriving
+    contaminant; ``find_duplicate_episode_srts`` keeps the smaller code and flags
+    the rest, which is what this season's ``episodes`` list contains.
+    """
+    dups = find_duplicate_episode_srts(series_cache_dir)
+    if not dups:
+        return episodes
+    for ep in episodes:
+        # Every episode dict carries "code" by construction; index (not .get) so a
+        # broken invariant surfaces as a KeyError instead of looking like "no dup".
+        match = dups.get(ep["code"])
+        if match is None:
+            continue
+        canonical_code, dup_path = match
+        Path(dup_path).unlink(missing_ok=True)
+        logger.warning(
+            f"Rejecting {ep['code']}: subtitle dialogue is identical to {canonical_code}'s "
+            f"(mislabeled cross-episode duplicate) — deleting {dup_path.name} and marking not_found"
+        )
+        ep["status"] = "not_found"
+        ep["path"] = None
+        ep["source"] = None
+    return episodes
+
+
+def download_subtitles(
+    show_name: str, season: int, *, tmdb_id: int | None = None, use_precomputed: bool = True
+) -> dict:
+    """Download SRT subtitle files for a show/season.
+
+    Strategy:
+    1. Bulk-fetch the season via the OpenSubtitles.com REST API when credentials
+       are configured (fast path).
+    2. For episodes still missing, fan out across the threaded provider scheduler
+       (Addic7ed + TVsubtitles) so providers' rate-limit cooldowns
+       overlap instead of serializing.
+
+    Args:
+        show_name: Name of the TV show (e.g. "Breaking Bad")
+        season: Season number
+        use_precomputed: When True (default), skip downloading entirely if the
+            precomputed vector cache already covers this show+season — matching
+            reads those vectors directly, so the SRTs would be unused. The cache
+            builder passes False so rebuilds always re-harvest.
+
+    Returns:
+        Dict with show_name, season, total_episodes, episodes list, and cache_dir.
+        Each episode dict includes 'source' field: "precomputed", "cache",
+        "opensubtitles_api", "addic7ed", "tvsubtitles", or None.
+    """
+    # Resolve the cache path up front so the precomputed fast path needs no network.
+    from app.services.config_service import get_config_sync
+
+    config = get_config_sync()
+    cache_path = Path(config.subtitles_cache_path).expanduser()
+    if not cache_path.is_absolute():
+        cache_path = Path(__file__).parent.parent.parent / config.subtitles_cache_path
+
+    # Fast path (no network): the precomputed vector cache already covers this
+    # season. Tried BEFORE any TMDB call so an offline or failed TMDB lookup can't
+    # fail a job the cache would have matched (matching reads the vectors directly
+    # and ignores SRTs). The raw name is tried first, mirroring the matcher's own
+    # offline fallback — manifest keys are canonical names, so a hit means this
+    # name *is* the canonical key the cache was built under.
+    if use_precomputed:
+        skip = _precomputed_skip_result(cache_path, show_name, season, expected_tmdb_id=tmdb_id)
+        if skip is not None:
+            return _heal_precomputed_gaps(
+                skip, show_name, season, tmdb_id=tmdb_id, cache_path=cache_path, config=config
+            )
+
+    # Resolve the TMDB show id. When the caller already knows it (e.g. after the
+    # user disambiguated a same-name collision), use it directly — fetch_show_id
+    # resolves by NAME and cannot tell two same-named shows apart.
+    if tmdb_id is not None:
+        show_id = str(tmdb_id)
+    else:
+        show_id = fetch_show_id(show_name)
+        if not show_id:
+            raise ValueError(f"Could not find show '{show_name}' on TMDB")
+
+    # Fetch canonical details to get the correct show name (e.g., "Southpark6" -> "South Park")
+    show_details = fetch_show_details(show_id)
+    canonical_show_name = show_details.get("name") if show_details else show_name
+
+    if canonical_show_name != show_name:
+        logger.info(f"Using canonical show name '{canonical_show_name}' instead of '{show_name}'")
+        # Retry the precomputed fast path under the canonical name, for discs whose
+        # label differs from the cache's canonical key.
+        if use_precomputed:
+            skip = _precomputed_skip_result(
+                cache_path, canonical_show_name, season, expected_tmdb_id=tmdb_id
+            )
+            if skip is not None:
+                return _heal_precomputed_gaps(
+                    skip,
+                    canonical_show_name,
+                    season,
+                    tmdb_id=tmdb_id,
+                    cache_path=cache_path,
+                    config=config,
+                )
+
+    episode_count = fetch_season_details(show_id, season)
+    if episode_count == 0:
+        raise ValueError(f"No episodes found for {canonical_show_name} Season {season} on TMDB")
+
+    # Cache DIR is keyed by tmdb_id (fallback: sanitized canonical name) so two
+    # same-named shows (e.g. Frasier 1993 #3452 vs the 2023 revival #195241) never
+    # collide. Key by the SUPPLIED tmdb_id, not the internally-resolved show_id:
+    # the matcher reads back via corpus_dir_name(expected_tmdb_id, ...) with the
+    # same id, and an unresolved (None) id must map both sides to the name. The
+    # filenames stay name-prefixed (safe_show_name) so find_existing_subtitle and
+    # human inspection still work inside the id-keyed dir.
+    safe_show_name = sanitize_filename(canonical_show_name)
+    series_cache_dir = cache_path / "data" / corpus_dir_name(tmdb_id, canonical_show_name)
+    series_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Downloading subtitles for '{canonical_show_name}' to: {series_cache_dir}")
+
+    # --- OpenSubtitles.com REST API (preferred when credentials are configured) ---
+    # Pre-download the whole season at once; falls back to scrapers per-episode on failure.
+    api_srt_map: dict[int, Path] = {}
+    # Episodes DOWNLOADED from the API this run, as opposed to ones api_srt_map
+    # merely points at because the file already existed. Without this split the
+    # triage loop below sees the freshly-moved file on disk and misreports the
+    # download as a cache hit, so by_source under-reports OpenSubtitles usage by
+    # ~99% and a quota wall is invisible in the run summary.
+    api_fresh_eps: set[int] = set()
+    # `_OS.failed` only records unavailability discovered at LOGIN time and is
+    # sticky for the rest of the process (a spent quota for _OS_QUOTA_RETRY_SECONDS;
+    # re-login only every _OS_TOKEN_MAX_AGE, 12h) -- it never re-evaluates once a login succeeds. A season whose
+    # search/download call fails mid-run (e.g. quota exhausted between logins)
+    # falls through to the `except Exception` below without ever touching
+    # `_OS.failed`. This season-local flag captures that case; it is
+    # deliberately NOT written back into `_OS.failed`, which stays a
+    # process-wide signal so a single season's transient failure doesn't
+    # disable OpenSubtitles for every remaining show in the run.
+    os_failed_this_season = False
+    # Why OpenSubtitles did not serve this season (login-time or mid-run), so the
+    # job's message can name the cause instead of asking for an API key.
+    os_error: str | None = None
+
+    # Skip the API entirely if every episode for this season is already cached on
+    # disk — otherwise the unconditional `search()` below burns API rate limit on
+    # resumed runs even when there's nothing left to download.
+    from app.matcher.subtitle_utils import find_existing_subtitle
+
+    cached_count = sum(
+        1
+        for ep in range(1, episode_count + 1)
+        if find_existing_subtitle(str(series_cache_dir), safe_show_name, season, ep)
+    )
+    season_fully_cached = cached_count >= episode_count
+
+    if season_fully_cached:
+        logger.info(
+            f"{canonical_show_name} S{season:02d}: all {episode_count} episodes "
+            f"cached; skipping API"
+        )
+
+    if not season_fully_cached and (
+        config.opensubtitles_api_key
+        and config.opensubtitles_username
+        and config.opensubtitles_password
+    ):
+        _os_client, os_error = _os_client_and_reason(config)
+        if _os_client is not None:
+            try:
+                import shutil
+
+                # Route search/download through os_api_call so a transient
+                # 429 anywhere in the bulk-download path retries with the
+                # same backoff used by subtitle_provider.py — without this
+                # wrapping, the 12+ hour build script would fall through to
+                # the legacy scrapers on the very first rate-limit response
+                # at any of ~1800 season call sites.
+                response = os_api_call(
+                    _os_client.search,
+                    parent_tmdb_id=show_id,
+                    season_number=season,
+                    languages="en",
+                    type="episode",
+                    max_attempts=4,
+                    base_delay=1.0,
+                )
+                # TMDB episode titles for this season — the ground truth the OS
+                # metadata is validated against. Empty (e.g. no TMDB key / lookup
+                # failure) degrades validation to a no-op rather than rejecting
+                # everything.
+                episode_titles = {
+                    e["episode_number"]: e["name"]
+                    for e in fetch_season_episodes(show_id, season, config.tmdb_api_key)
+                    if e.get("episode_number") is not None
+                }
+                seen_api_eps: set[int] = set()
+                for subtitle in response.data or []:
+                    ep_num = getattr(subtitle, "episode_number", None)
+                    api_ep_season = getattr(subtitle, "season_number", None)
+                    if not ep_num or api_ep_season != season or ep_num in seen_api_eps:
+                        continue
+                    # OpenSubtitles mislabels some shows (e.g. it returns DS9
+                    # Season 2 subtitles tagged season_number=1). Reject results
+                    # whose episode number is outside the season's real range, or
+                    # whose `release` title names a different episode, before they
+                    # get saved under the wrong code and poison the cache.
+                    if episode_titles and ep_num not in episode_titles:
+                        logger.warning(
+                            f"OpenSubtitles returned S{season:02d}E{ep_num:02d} for "
+                            f"{canonical_show_name}, which has no episode {ep_num} in "
+                            f"season {season} (mislabeled); skipping"
+                        )
+                        continue
+                    if not _release_matches_episode(
+                        getattr(subtitle, "release", None),
+                        episode_titles.get(ep_num, ""),
+                        season=season,
+                    ):
+                        logger.warning(
+                            f"OpenSubtitles S{season:02d}E{ep_num:02d} release "
+                            f"{getattr(subtitle, 'release', None)!r} doesn't match expected "
+                            f"episode '{episode_titles.get(ep_num, '')}' (mislabeled); skipping"
+                        )
+                        continue
+                    episode_code_api = f"S{season:02d}E{ep_num:02d}"
+                    srt_target = series_cache_dir / f"{safe_show_name} - {episode_code_api}.srt"
+                    if not srt_target.exists():
+                        # Shorter cadence on download than on search — a
+                        # 429 on download usually means the daily quota
+                        # is exhausted (not the per-minute limit), and
+                        # retrying same-day for 90s+ doesn't help; we'd
+                        # rather fall back to scrapers and move on.
+                        srt_file = os_api_call(
+                            _os_client.download_and_save,
+                            subtitle,
+                            filename=os_download_temp_name(),
+                            max_attempts=2,
+                            base_delay=5.0,
+                        )
+                        if srt_file and is_valid_srt_file(Path(srt_file)):
+                            shutil.move(str(srt_file), srt_target)
+                            api_srt_map[ep_num] = srt_target
+                            api_fresh_eps.add(ep_num)
+                            seen_api_eps.add(ep_num)
+                        elif srt_file:
+                            Path(srt_file).unlink(missing_ok=True)
+                    else:
+                        api_srt_map[ep_num] = srt_target
+                        seen_api_eps.add(ep_num)
+                logger.info(
+                    f"OpenSubtitles API: {len(api_srt_map)}/{episode_count} subtitles "
+                    f"for {canonical_show_name} S{season:02d}"
+                )
+                # Snapshot the daily download quota — the library has updated
+                # `user_downloads_remaining` for free as a side effect of the
+                # download_and_save() calls above.
+                _snapshot_os_quota(_os_client)
+            except Exception as e:
+                os_failed_this_season = True
+                os_error = _describe_os_error(e)
+                logger.warning(
+                    f"OpenSubtitles API failed ({e}), falling back to scrapers",
+                    exc_info=True,
+                )
+                # Refresh the quota reading on the FAILURE path too. The
+                # snapshot at the end of the try block never runs when a
+                # download raises partway through, so _OS.last_quota would
+                # keep its last healthy value and the build script's quota
+                # guard would never fire -- the run grinds through the whole
+                # corpus on scrapers for hours, exits 0, and reports a
+                # >50% degraded rate whose hint blames the OpenSubtitles
+                # credentials or a missing opensubtitlescom package. That is
+                # the wrong diagnosis for what is really quota exhaustion,
+                # and mid-run exhaustion is the LIKELIER path once a run is
+                # already logged in (the login-time check only runs at
+                # startup or after the 12h re-login). Do not delete this as
+                # redundant with the snapshot above.
+                #
+                # Re-probe user_info first: it does NOT consume download
+                # quota, and the library may not have updated
+                # user_downloads_remaining from a call that failed.
+                try:
+                    os_api_call(_os_client.user_info)
+                except Exception as probe_exc:
+                    logger.debug(
+                        f"OS quota re-probe failed (non-fatal): {probe_exc}", exc_info=True
+                    )
+                # Snapshot regardless: even an un-refreshed attribute may
+                # have been updated by the failing call itself. Failing to
+                # MEASURE the quota must never fail the harvest.
+                _snapshot_os_quota(_os_client)
+
+    # Per-episode triage: separate cache hits + API hits from the residual
+    # work the scheduler will fan out across scrapers.
+    from app.matcher.subtitle_utils import find_existing_subtitle
+
+    pre_resolved: dict[int, dict] = {}
+    residual_jobs: list[EpisodeJob] = []
+
+    for episode in range(1, episode_count + 1):
+        episode_code = f"S{season:02d}E{episode:02d}"
+        srt_path = series_cache_dir / f"{safe_show_name} - {episode_code}.srt"
+
+        if episode in api_fresh_eps:
+            pre_resolved[episode] = {
+                "code": episode_code,
+                "status": "downloaded",
+                "path": str(api_srt_map[episode]),
+                "source": "opensubtitles_api",
+            }
+            continue
+
+        existing_subtitle = find_existing_subtitle(
+            str(series_cache_dir), safe_show_name, season, episode
+        )
+        if existing_subtitle:
+            if is_valid_srt_file(existing_subtitle):
+                pre_resolved[episode] = {
+                    "code": episode_code,
+                    "status": "cached",
+                    "path": str(existing_subtitle),
+                    "source": "cache",
+                }
+                continue
+            logger.warning(
+                f"Cached file {existing_subtitle.name} is invalid (HTML or no readable cues), "
+                "deleting and re-downloading"
+            )
+            existing_subtitle.unlink(missing_ok=True)
+
+        if episode in api_srt_map:
+            pre_resolved[episode] = {
+                "code": episode_code,
+                "status": "downloaded",
+                "path": str(api_srt_map[episode]),
+                "source": "opensubtitles_api",
+            }
+            continue
+
+        residual_jobs.append(
+            EpisodeJob(
+                tmdb_id=int(show_id),
+                show_name=canonical_show_name,
+                season=season,
+                episode=episode,
+                episode_code=episode_code,
+                srt_target=srt_path,
+                pending_providers=deque(["addic7ed", "tvsubtitles"]),
+            )
+        )
+
+    # Fan out the residual work across provider workers. While Addic7ed
+    # sits in its 3s cooldown, the TVsubtitles worker can be mid-flight on
+    # a different episode — total wall-time falls from the sum of
+    # per-provider times toward their max.
+    scheduler_results: dict[str, dict] = {}
+    # Whether any scraper went down hard during this season, as opposed to
+    # merely having nothing. Both look like `not_found` per episode, so this
+    # flag is the only thing that separates them; see _is_degraded.
+    scrapers_failed = False
+    if residual_jobs:
+        workers = {
+            "addic7ed": Addic7edClient(),
+            "tvsubtitles": TVSubtitlesClient(),
+        }
+        scheduler_run = run_jobs(residual_jobs, workers)
+        scheduler_results = scheduler_run.results
+        failed = scheduler_run.failed_providers
+        scrapers_failed = bool(failed)
+        if failed:
+            logger.warning(
+                f"{canonical_show_name} S{season:02d}: scraper(s) {', '.join(failed)} "
+                "never answered; this season's coverage may not be measurable"
+            )
+
+    # Re-assemble episode results in episode order.
+    episodes = []
+    for episode in range(1, episode_count + 1):
+        episode_code = f"S{season:02d}E{episode:02d}"
+        if episode in pre_resolved:
+            episodes.append(pre_resolved[episode])
+        else:
+            episodes.append(
+                scheduler_results.get(
+                    episode_code,
+                    {
+                        "code": episode_code,
+                        "status": "not_found",
+                        "path": None,
+                        "source": None,
+                    },
+                )
+            )
+
+    # Reject episodes whose subtitle content duplicates a different episode's
+    # (provider mislabel) before they reach the cache builder and corrupt matching.
+    episodes = _reject_content_duplicates(series_cache_dir, episodes)
+
+    return {
+        "show_name": canonical_show_name,
+        "season": season,
+        "total_episodes": episode_count,
+        "episodes": episodes,
+        "cache_dir": str(series_cache_dir),
+        # Text of the OpenSubtitles failure behind this season, or None when it
+        # served (or was never tried: no credentials, or everything cached).
+        "os_error": os_error,
+        # True when this result is not a trustworthy measurement -- see
+        # _is_degraded. Combines the sticky process-wide login-failure flag
+        # with the season-local mid-run failure flag, since either one means
+        # OpenSubtitles did not serve this season, plus the scraper cascade's
+        # own reachability verdict. The cache builder skips coverage recording
+        # for these.
+        "degraded": _is_degraded(
+            _OS.failed or os_failed_this_season,
+            episodes,
+            providers_failed=scrapers_failed,
+        ),
+    }
+
+
+def transcribe_chunk(
+    video_path: str | Path,
+    start_time: float | None = None,
+    duration: float = 30,
+) -> dict:
+    """Extract an audio chunk from a video and transcribe it with Whisper.
+
+    Args:
+        video_path: Path to the MKV/video file
+        start_time: Start time in seconds (default: 50% of video duration)
+        duration: Length of chunk in seconds (default: 30)
+
+    Returns:
+        Dict with video info, transcription text, segments, and language.
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    video_duration = get_video_duration(video_path)
+    if video_duration <= 0:
+        raise ValueError(f"Could not determine video duration for: {video_path}")
+
+    if start_time is None:
+        start_time = video_duration * 0.50
+
+    # Clamp start_time so the chunk doesn't exceed video length
+    if start_time + duration > video_duration:
+        start_time = max(0, video_duration - duration)
+
+    # Extract audio chunk to a temp file
+    temp_dir = Path(tempfile.gettempdir()) / "engram_test_chunks"
+    temp_dir.mkdir(exist_ok=True, parents=True)
+    chunk_path = temp_dir / f"{video_path.stem}_{start_time:.0f}.wav"
+
+    try:
+        extract_audio_chunk(video_path, start_time, duration, chunk_path)
+
+        # Get ASR provider and transcribe directly via the underlying model
+        asr = get_asr_provider()
+        asr.load()
+
+        # Access the underlying FasterWhisperModel for full transcription output
+        model = asr._model
+        result = model.transcribe(chunk_path)
+
+        return {
+            "video_path": str(video_path),
+            "video_duration": round(video_duration, 2),
+            "chunk_start": round(start_time, 2),
+            "duration": duration,
+            "raw_text": result.get("raw_text", ""),
+            "cleaned_text": result.get("text", ""),
+            "language": result.get("language", "en"),
+            "segments": result.get("segments", []),
+        }
+    finally:
+        if chunk_path.exists():
+            chunk_path.unlink()
+
+
+def match_episodes(
+    video_paths: list[str | Path],
+    show_name: str,
+    season: int,
+) -> list[dict]:
+    """Match MKV files against cached subtitle files.
+
+    Requires subtitles to already be downloaded in the cache directory.
+
+    Args:
+        video_paths: List of paths to MKV/video files
+        show_name: Name of the TV show
+        season: Season number
+
+    Returns:
+        List of dicts, one per video file, with match results and candidates.
+    """
+    from app.matcher.core.matcher import MultiSegmentMatcher
+    from app.services.config_service import get_config_sync
+
+    config = get_config_sync()
+
+    # Use config.subtitles_cache_path from DB
+    cache_path = Path(config.subtitles_cache_path).expanduser()
+    if not cache_path.is_absolute():
+        cache_path = Path(__file__).parent.parent.parent / config.subtitles_cache_path
+
+    # RESOLVE CANONICAL NAME:
+    # "Southpark6" subtitles are saved under "South Park".
+    # We must resolve the name to find them.
+    from app.matcher.tmdb_client import fetch_show_details, fetch_show_id
+
+    canonical_show_name = show_name
+    try:
+        show_id = fetch_show_id(show_name)
+        if show_id:
+            details = fetch_show_details(show_id)
+            if details:
+                canonical_show_name = details.get("name", show_name)
+                logger.info(
+                    f"Resolved '{show_name}' to canonical '{canonical_show_name}' for matching"
+                )
+    except Exception as e:
+        logger.warning(f"Failed to resolve canonical name for '{show_name}': {e}")
+
+    safe_show_name = sanitize_filename(canonical_show_name)
+
+    # Load cached subtitles via LocalSubtitleProvider
+    provider = LocalSubtitleProvider(cache_dir=cache_path)
+    reference_subs = provider.get_subtitles(safe_show_name, season)
+
+    if not reference_subs:
+        raise ValueError(
+            f"No cached subtitles found for '{show_name}' season {season}. "
+            f"Run subtitle download first."
+        )
+
+    # Build matcher with ASR provider
+    asr = get_asr_provider()
+    asr.load()
+    matcher = MultiSegmentMatcher(asr_provider=asr)
+
+    results = []
+    for vp in video_paths:
+        vp = Path(vp)
+        if not vp.exists():
+            results.append(
+                {
+                    "video_path": str(vp),
+                    "error": "File not found",
+                    "matched_episode": None,
+                    "confidence": 0.0,
+                    "candidates": [],
+                    "subtitles_used": len(reference_subs),
+                }
+            )
+            continue
+
+        try:
+            match_result = matcher.match(vp, reference_subs)
+
+            if match_result:
+                # Collect all candidate info by re-examining — we use the match result
+                results.append(
+                    {
+                        "video_path": str(vp),
+                        "matched_episode": match_result.episode_info.s_e_format,
+                        "confidence": round(match_result.confidence, 4),
+                        "series_name": match_result.episode_info.series_name or show_name,
+                        "candidates": [],
+                        "subtitles_used": len(reference_subs),
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "video_path": str(vp),
+                        "matched_episode": None,
+                        "confidence": 0.0,
+                        "candidates": [],
+                        "subtitles_used": len(reference_subs),
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Matching failed for {vp}: {e}")
+            results.append(
+                {
+                    "video_path": str(vp),
+                    "error": str(e),
+                    "matched_episode": None,
+                    "confidence": 0.0,
+                    "candidates": [],
+                    "subtitles_used": len(reference_subs),
+                }
+            )
+
+    return results

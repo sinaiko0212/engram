@@ -1,0 +1,2513 @@
+import hashlib
+import json
+import re
+import subprocess
+import tempfile
+import threading
+import time
+from functools import lru_cache
+from pathlib import Path
+
+import chardet
+import numpy as np
+from loguru import logger
+from rich.console import Console
+from scipy.sparse import load_npz as scipy_load_npz
+from scipy.sparse import vstack as scipy_vstack
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
+
+from app.matcher import transcript_store
+from app.matcher.asr_models import detect_asr_device, get_cached_model, model_output_key
+from app.matcher.multi_episode import decompose_vote_runs
+from app.matcher.numbering_scheme import SCHEME_UNKNOWN, VALID_SCHEMES, usable_count
+from app.matcher.srt_utils import decode_utf16_bom, iter_srt_cues
+from app.matcher.srt_utils import is_watermark_block as _is_watermark_block
+from app.matcher.subtitle_utils import (
+    REFERENCES_UNREADABLE_ERROR_CODE,
+    corpus_dir_name,
+    sanitize_filename,
+)
+from app.matcher.utils import extract_season_episode
+from app.matcher.vectorizer_config import apply_tfidf
+
+console = Console()
+
+# Nested scan-point lattice levels: n_k = 9 * 2**k + 1. Level k+1 inserts the
+# midpoint of every level-k gap, so each level is a strict subset of all deeper ones.
+_SCAN_LATTICE_LEVELS = (10, 19, 37, 73, 145)
+
+
+def snap_to_lattice_level(num_points) -> int:
+    """Smallest lattice level >= ``num_points``, capped at the deepest (145).
+
+    The single source of truth for how a requested scan depth realizes on the
+    lattice: ``canonical_scan_points`` snaps through here, and depth constants
+    elsewhere (deep re-match, conflict-escalation ladder) are validated against
+    it so requested and realized depths can't drift. ``None`` or < 2 means the
+    default shallow scan (10).
+    """
+    if not num_points or num_points < 2:
+        num_points = 10
+    return next(
+        (lvl for lvl in _SCAN_LATTICE_LEVELS if lvl >= num_points), _SCAN_LATTICE_LEVELS[-1]
+    )
+
+
+def floor_to_lattice_level(num_points) -> int:
+    """Largest lattice level <= ``num_points``, never below the base level (10).
+
+    The cost-ceiling counterpart of :func:`snap_to_lattice_level`: use it when a
+    depth budget (e.g. "enough points for ~full coverage") must not be overshot —
+    snapping UP past the budget would transcribe overlapping audio for no new
+    evidence. Below the base level the matcher can't scan any shallower, so 10 is
+    returned (``canonical_scan_points`` dedups colliding points on short files).
+
+    Unlike :func:`snap_to_lattice_level`, ``num_points`` must be an ``int``; passing
+    ``None`` raises ``TypeError``.  The sole caller feeds ``_full_coverage_points``,
+    which always returns an int, so this is never an issue in practice.
+    """
+    for lvl in reversed(_SCAN_LATTICE_LEVELS):
+        if lvl <= num_points:
+            return lvl
+    return _SCAN_LATTICE_LEVELS[0]
+
+
+def canonical_scan_points(
+    video_duration,
+    *,
+    skip_initial,
+    skip_final=120,
+    chunk_len=30,
+    num_points=10,
+) -> list[int]:
+    """Evenly-spaced scan offsets on a nested lattice, stable across scan depths.
+
+    Levels follow ``n_k = 9 * 2**k + 1`` (10, 19, 37, 73, 145); a shallow scan's
+    offsets are a strict subset of every deeper scan's, so a transcript cache
+    keyed by (file, offset, duration) gets full reuse when a deep re-match
+    revisits a file. ``num_points`` snaps UP to the smallest level that covers
+    it (capped at 145); ``None`` or < 2 means the default 10.
+
+    Integer arithmetic (multiply before floor-divide) is mandatory for subset
+    exactness: level-k point i equals level-(k+1) point 2i because
+    ``n_{k+1} - 1 == 2 * (n_k - 1)``; per-level float intervals can differ in
+    the last ulp and break the equality after truncation.
+
+    Returns ``[]`` when no usable window remains (duration <= skips); offsets
+    are never negative, and adjacent lattice points that collide after floor
+    division on short files are deduplicated.
+    """
+    n = snap_to_lattice_level(num_points)
+
+    skip_initial = max(int(skip_initial), 0)
+    available = int(video_duration) - skip_initial - int(skip_final)
+    if available <= 0:
+        return []
+
+    points: list[int] = []
+    for i in range(n):
+        point = skip_initial + (i * available) // (n - 1)
+        if point >= video_duration - chunk_len:
+            continue
+        if points and points[-1] == point:
+            continue
+        points.append(point)
+    return points
+
+
+def stamp_numbering(match_stats: dict, numbering: dict | None) -> None:
+    """Record the pack's statement about this season's numbering on a result.
+
+    ``numbering`` is what ``EpisodeMatcher.precomputed_numbering`` returned, so
+    None means "the pack made no usable statement" (a scraped season, a pack
+    predating the marker, or an explicitly unknown one) and nothing is stamped.
+    Consumers then fall back to comparing ``reference_count`` against the
+    match-time ``roster_size``, which is the pre-marker behaviour.
+
+    ``pack_roster_size`` is deliberately named apart from the ``roster_size``
+    that the duration pre-filter writes at match time: this one was measured at
+    BUILD time against the canonical roster, and conflating the two would
+    reintroduce the confusion the marker exists to remove.
+
+    A module-level function rather than an inline block so a test can pin this
+    exact code path. Driving ``identify_episode`` needs audio, ffmpeg and a real
+    vector corpus, and a test that re-implemented the branch would be free to
+    drift from it.
+    """
+    if not numbering:
+        return
+    match_stats["numbering_scheme"] = numbering["scheme"]
+    # usable_count, not a local isinstance check: bool is an int subclass in
+    # Python, and the shared predicate already excludes it.
+    if usable_count(numbering.get("roster_size")):
+        match_stats["pack_roster_size"] = numbering["roster_size"]
+
+
+def load_precomputed_manifest(cache_dir) -> dict | None:
+    """Load and validate the precomputed-cache manifest. Returns the dict or None.
+
+    A missing, unreadable, or version/config-mismatched manifest is treated as
+    "no cache" so callers fall back to subtitle scraping. Shared by the matcher's
+    load path and the download-skip check so both agree on what counts as valid.
+    """
+    from app.matcher.vectorizer_config import (
+        CACHE_FORMAT_VERSION,
+        vectorizer_config_hash,
+    )
+
+    manifest_path = Path(cache_dir) / "precomputed" / "manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Precomputed cache manifest unreadable ({e}); using scraping")
+        return None
+
+    if manifest.get("cache_format_version") != CACHE_FORMAT_VERSION:
+        logger.warning(
+            f"Precomputed cache format mismatch "
+            f"(manifest={manifest.get('cache_format_version')}, code={CACHE_FORMAT_VERSION}); "
+            f"ignoring cache"
+        )
+        return None
+    if manifest.get("vectorizer_config_hash") != vectorizer_config_hash():
+        logger.warning("Precomputed cache vectorizer-config mismatch; ignoring cache")
+        return None
+
+    return manifest
+
+
+def _tmdb_id_mismatch(expected, entry_id) -> bool:
+    """True when both ids are known and disagree (string-compared).
+
+    A safety rail for the name-resolution fallback in ``_resolve_corpus_entry``:
+    when a corpus entry is found by NAME (tmdb_id unknown at lookup) but its id
+    contradicts a later-known expected id, refuse it. Returns False when either id
+    is unknown — backward-compatible with name-only matching.
+    """
+    return expected is not None and entry_id is not None and str(entry_id) != str(expected)
+
+
+def _resolve_corpus_entry(manifest, show_name: str, tmdb_id):
+    """Return ``(key, entry)`` for a show in a v3 id-keyed manifest, else ``(None, None)``.
+
+    Prefers an exact ``tmdb_id`` match (the manifest is keyed by ``str(tmdb_id)``),
+    falling back to the first entry whose stored ``name`` matches when the id is
+    unknown (e.g. a flat import that never resolved a TMDB id). ``key`` is also the
+    on-disk corpus dir name (see ``corpus_dir_name``).
+    """
+    shows = (manifest or {}).get("shows", {})
+    if not shows:
+        return None, None
+    if tmdb_id is not None and str(tmdb_id) in shows:
+        return str(tmdb_id), shows[str(tmdb_id)]
+    # No (or unknown) tmdb_id: fall back to matching the stored name. A v3 corpus
+    # can legitimately hold two same-named shows (Frasier 1993 + 2023 revival), so
+    # warn when the name is ambiguous — we can only return the first match.
+    name_matches = [(key, entry) for key, entry in shows.items() if entry.get("name") == show_name]
+    if not name_matches:
+        return None, None
+    if len(name_matches) > 1:
+        logger.warning(
+            f"Corpus name-fallback for {show_name!r} is ambiguous across keys "
+            f"{[k for k, _ in name_matches]} (no tmdb_id supplied); using the first. "
+            f"Supply tmdb_id to pick the right same-named show."
+        )
+    return name_matches[0]
+
+
+def _corpus_show_dir(cache_dir, key: str) -> Path:
+    """On-disk precomputed dir for a resolved manifest ``key`` (a tmdb_id string)."""
+    return Path(cache_dir) / "precomputed" / sanitize_filename(str(key))
+
+
+def precomputed_covers_season(
+    cache_dir, show_name: str, season: int, manifest=None, expected_tmdb_id=None
+) -> bool:
+    """Return True when the precomputed vector cache fully covers show+season.
+
+    Mirrors the gate EpisodeMatcher applies at match time (manifest validity,
+    show/season listing, and on-disk .npz/.index.json files) WITHOUT loading
+    vectors, so a True result guarantees the matcher will use the cache. The
+    show name must be the canonical name the matcher resolves to.
+
+    ``manifest`` may be a pre-loaded manifest dict to avoid re-reading and
+    re-validating manifest.json (callers holding a cached copy pass it in).
+
+    ``expected_tmdb_id`` is the TMDB id the calling job has resolved for the
+    show. The manifest is keyed by tmdb_id (v3), so a known id resolves the right
+    same-named show directly; when unknown, the entry is found by name. A
+    name-resolved entry whose id contradicts ``expected_tmdb_id`` is refused.
+    """
+    if manifest is None:
+        manifest = load_precomputed_manifest(cache_dir)
+    if not manifest:
+        return False
+
+    key, show_entry = _resolve_corpus_entry(manifest, show_name, expected_tmdb_id)
+    if not show_entry or season not in show_entry.get("seasons", []):
+        return False
+
+    # Safety rail for the name-resolution fallback: a found-by-name entry whose
+    # id contradicts a known expected id is a DIFFERENT same-named show — refuse.
+    if _tmdb_id_mismatch(expected_tmdb_id, show_entry.get("tmdb_id")):
+        return False
+
+    show_dir = _corpus_show_dir(cache_dir, key)
+    npz_path = show_dir / f"S{season:02d}.npz"
+    index_path = show_dir / f"S{season:02d}.index.json"
+    return npz_path.exists() and index_path.exists()
+
+
+def precomputed_episode_codes(
+    cache_dir, show_name: str, season: int, *, expected_tmdb_id=None
+) -> list[str] | None:
+    """Episode codes the precomputed cache holds for show+season, else None.
+
+    None means the cache doesn't cover it (caller should download/scrape).
+    Lets callers size a result from the cache itself without a TMDB round-trip.
+
+    ``expected_tmdb_id`` resolves the right same-named show's corpus (the manifest
+    is keyed by tmdb_id); without it the show is found by name.
+    """
+    manifest = load_precomputed_manifest(cache_dir)
+    if not precomputed_covers_season(
+        cache_dir, show_name, season, manifest=manifest, expected_tmdb_id=expected_tmdb_id
+    ):
+        return None
+
+    key, _ = _resolve_corpus_entry(manifest, show_name, expected_tmdb_id)
+    index_path = _corpus_show_dir(cache_dir, key) / f"S{season:02d}.index.json"
+    try:
+        with open(index_path, encoding="utf-8") as fh:
+            codes = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return codes if isinstance(codes, list) and codes else None
+
+
+# Season/episode token shared by reference-coverage and the runtime augmentation
+# scan. Mirrors the matcher's own name-agnostic episode detection in
+# get_reference_files: the SRT's name prefix is irrelevant, only the SxxEyy token.
+_SE_TOKEN_RE = re.compile(r"S(\d{1,2})E(\d{1,3})", re.IGNORECASE)
+
+
+def downloaded_episode_codes(data_dir, season: int) -> set[str]:
+    """Episode codes for ``season`` that have a downloaded/scraped SRT on disk.
+
+    Globs ``data_dir`` for ``*.srt`` and reads the ``SxxEyy`` token out of each
+    filename (name-prefix agnostic, exactly like the matcher's get_reference_files),
+    so this agrees with what the matcher will actually load or graft in.
+    """
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        return set()
+    codes: set[str] = set()
+    for srt in list(data_dir.glob("*.srt")) + list(data_dir.glob("*.SRT")):
+        m = _SE_TOKEN_RE.search(srt.name)
+        if m and int(m.group(1)) == season:
+            codes.add(f"S{season:02d}E{int(m.group(2)):02d}")
+    return codes
+
+
+def reference_coverage(
+    cache_dir, tmdb_id, show_name: str, season: int, episode_numbers
+) -> dict[str, str]:
+    """Per-episode subtitle-reference availability for a season.
+
+    Single source of truth shared by the review endpoint (flag), the download
+    phase (heal), and the match phase (use the heal). For each episode number in
+    ``episode_numbers`` (the canonical TMDB roster), returns its ``SxxEyy`` code
+    mapped to one of:
+
+    - ``"precomputed"`` — covered by the shipped precomputed vector cache index.
+    - ``"downloaded"``  — a scraped SRT exists under ``data/<tmdb_id>/``.
+    - ``"missing"``     — in the roster but neither of the above (no reference).
+
+    Precomputed wins when both exist, because precomputed mode reads the vectors
+    and ignores SRTs. Cheap: one JSON read + one dir scan, no network.
+    """
+    cache_dir = Path(cache_dir)
+    pre_codes = set(
+        precomputed_episode_codes(cache_dir, show_name, season, expected_tmdb_id=tmdb_id) or []
+    )
+    data_dir = cache_dir / "data" / corpus_dir_name(tmdb_id, show_name)
+    dl_codes = downloaded_episode_codes(data_dir, season)
+    coverage: dict[str, str] = {}
+    for ep in episode_numbers:
+        code = f"S{season:02d}E{int(ep):02d}"
+        if code in pre_codes:
+            coverage[code] = "precomputed"
+        elif code in dl_codes:
+            coverage[code] = "downloaded"
+        else:
+            coverage[code] = "missing"
+    return coverage
+
+
+def _file_version(path) -> int | None:
+    """Modification time of ``path`` in ns, or None when it cannot be stat'ed.
+
+    Reference subtitles are replaced in place: the validator rejects a damaged
+    SRT, it is deleted, and the re-download lands under the SAME filename. A
+    path-only cache key therefore serves the damaged (empty) text for the life
+    of the process, and the season stays refused with ``references_unreadable``
+    until the backend restarts. Pairing the path with its mtime makes a rewrite
+    a cache miss. A missing file collapses to None, which is itself a distinct
+    version, so the entry is re-read once the file reappears.
+    """
+    try:
+        return Path(path).stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def scraping_reference_signature(reference_files) -> tuple:
+    """Fingerprint a scraping-mode reference set: paths PLUS their mtimes.
+
+    Keyed on paths alone, a season whose damaged SRTs were re-downloaded under
+    the same filenames kept reusing the TF-IDF matcher fitted from the damaged
+    text. Precomputed mode is content-addressed by episode code and needs no
+    mtime.
+    """
+    return (
+        "scraping",
+        tuple((str(rf), _file_version(rf)) for rf in reference_files),
+    )
+
+
+class SubtitleCache:
+    """Cache for storing parsed subtitle data to avoid repeated loading and parsing.
+
+    Every entry is keyed by (path, mtime) rather than by path, so a subtitle
+    replaced in place during a long-running session is re-read. See
+    ``_file_version``.
+    """
+
+    def __init__(self):
+        self.subtitles = {}  # {(file_path, mtime_ns): parsed_content}
+        self.chunk_cache = {}  # {(file_path, mtime_ns, chunk_idx): text}
+        self._full_text_cache = {}  # {(file_path, mtime_ns): cleaned_full_text}
+        self._versions = {}  # {file_path: mtime_ns last seen}
+
+    def _current_key(self, srt_file):
+        """Key for the CURRENT bytes of ``srt_file``, dropping superseded ones.
+
+        These dicts are unbounded (unlike the TF-IDF and transcription caches),
+        so without this a file rewritten repeatedly across a long session would
+        leave one entry per rewrite behind forever. A superseded version can
+        never be read again, so it is evicted rather than bounded. The chunk
+        scan only runs on an actual version change, which is rare.
+        """
+        version = _file_version(srt_file)
+        previous = self._versions.get(srt_file)
+        if srt_file in self._versions and previous != version:
+            self.subtitles.pop((srt_file, previous), None)
+            self._full_text_cache.pop((srt_file, previous), None)
+            for stale in [
+                key for key in self.chunk_cache if key[0] == srt_file and key[1] == previous
+            ]:
+                del self.chunk_cache[stale]
+        self._versions[srt_file] = version
+        return (srt_file, version)
+
+    def get_subtitle_content(self, srt_file):
+        """Get the full raw content of a subtitle file, loading it only once."""
+        srt_file = str(srt_file)
+        cache_key = self._current_key(srt_file)
+        if cache_key not in self.subtitles:
+            reader = SubtitleReader()
+            self.subtitles[cache_key] = reader.read_srt_file(srt_file)
+        return self.subtitles[cache_key]
+
+    def get_chunk(self, srt_file, chunk_idx, chunk_start, chunk_end):
+        """Get a specific time chunk from a subtitle file, with caching."""
+        srt_file = str(srt_file)
+        cache_key = (*self._current_key(srt_file), chunk_idx)
+
+        if cache_key not in self.chunk_cache:
+            content = self.get_subtitle_content(srt_file)
+            reader = SubtitleReader()
+            text_lines = reader.extract_subtitle_chunk(content, chunk_start, chunk_end)
+            text = " ".join(text_lines)
+            text = _clean_subtitle_text(text)
+            self.chunk_cache[cache_key] = text
+
+        return self.chunk_cache[cache_key]
+
+    def get_full_text(self, srt_file):
+        """
+        Get the full cleaned text of an entire subtitle file.
+
+        Extracts all subtitle blocks, joins their text, and applies standard
+        cleaning (lowercase, strip tags, collapse stutters, normalize whitespace).
+        Result is cached for reuse.
+        """
+        srt_file = str(srt_file)
+        cache_key = self._current_key(srt_file)
+        if cache_key not in self._full_text_cache:
+            content = self.get_subtitle_content(srt_file)
+            if not content:
+                self._full_text_cache[cache_key] = ""
+            else:
+                reader = SubtitleReader()
+                # Extract all text from 0 to a very large end time
+                text_lines = reader.extract_subtitle_chunk(content, 0, 999999)
+                full_text = " ".join(text_lines)
+                self._full_text_cache[cache_key] = _clean_subtitle_text(full_text)
+        return self._full_text_cache[cache_key]
+
+    def get_subtitle_duration(self, srt_file, content=None):
+        """Get the total duration of a subtitle file in seconds."""
+        srt_file = str(srt_file)
+        if content is None:
+            content = self.get_subtitle_content(srt_file)
+
+        if not content:
+            return 0.0
+
+        # Content is raw SRT string, use SubtitleReader to parse duration
+        return SubtitleReader.get_duration(content)
+
+
+def _clean_subtitle_text(text: str) -> str:
+    """Clean subtitle text: lowercase, strip tags/special chars, collapse stutters, normalize whitespace."""
+    text = text.lower().strip()
+    text = re.sub(r"[\[{][^\]}]*[\]}]|<.*?>", "", text)  # tolerate mismatched [/{ ]/} delimiters
+    text = re.sub(r"([A-Za-z])-\1+", r"\1", text)  # collapse stutters
+    text = re.sub(r"[^\w\s']", " ", text)  # remove special chars except apostrophes
+    return " ".join(text.split())
+
+
+# --- Confidence calibration --------------------------------------------------
+#
+# The matcher's raw ``ranked_voting_score`` is the mean TF-IDF cosine of the
+# chunks that voted for the winning episode. Comparing a 30s ASR snippet to a
+# full ~22-minute subtitle file ("teaspoon vs bucket") keeps that cosine small
+# (~0.15-0.21) even for a correct match, so it is uninterpretable as a
+# percentage. ``calibrate_confidence`` translates the raw signals into a 0-1
+# confidence a human reviewer can read. It answers "how sure are we this is the
+# right episode?" rather than "how much text overlapped?".
+#
+# Rationale for the constants lives in
+# docs/superpowers/specs/2026-05-22-match-confidence-calibration-design.md.
+
+# Cosine at which a matched chunk counts as full-quality. Votes require >0.15
+# and observed-correct chunks cluster ~0.15-0.21, so the discriminative band is
+# razor-thin; normalized_score is a mild guard, mostly reported for transparency.
+QUALITY_REF_COSINE = 0.18
+# Processed fraction treated as full coverage. ~22-min episodes sample ~0.23, so
+# typical TV reads 1.0 while longer episodes (covered proportionally less) read
+# lower -- the correct direction (the rejected score/coverage design did the
+# opposite, leaking episode length into confidence).
+COVERAGE_REF = 0.15
+# Evidence is a weighted blend of the three independent reported metrics.
+# Consensus (how many sampled chunks agreed) is the strongest, so it dominates.
+W_CONSENSUS = 0.5
+W_NORMALIZED_SCORE = 0.25
+W_COVERAGE = 0.25
+# Floor so a decisive sweep with thin evidence still reads meaningfully, while
+# minimal evidence lands just under the 0.7 review gate.
+EVIDENCE_FLOOR = 0.30
+# Vote-boost parameters: when many independent chunks agree on a winner AND
+# the match is at least somewhat decisive (separation > NEAR_TIE_FLOOR), vote
+# evidence can relax the separation requirement.
+#   NEAR_TIE_FLOOR  — below this separation, no boost is applied. A close
+#     runner-up at any vote count is genuinely ambiguous.
+#   HIGH_CONSENSUS_REF — proportion of scan points for "full consensus" credit.
+#   HIGH_VOTE_REF   — absolute chunk count for "full vote" credit. Deep re-match
+#     uses 25 scan points; 15 chunks agreeing is strong absolute evidence.
+#   MAX_VOTE_BOOST  — maximum separation added by combined consensus + vote credit.
+#     At max boost, separation can be lifted by up to 0.30, which allows a match
+#     with separation ~0.52 to clear the 0.7 review gate (vs ~0.82 previously).
+# Vote-ratio path: a second independent confidence route that fires when the
+# winner matched far more chunks than the runner-up. score_gap (mean-cosine
+# difference) misses this signal because both candidates may score similarly
+# per-chunk even when one matched 3× more chunks overall.
+#   HIGH_VOTE_RATIO         — winner must have this many times the runner-up's
+#     vote count for full ratio credit (e.g. 103 vs 31 = 3.3×).
+#   MIN_CONSENSUS_FOR_RATIO — minimum winner consensus before the ratio path
+#     activates; prevents very sparse matches (e.g. 3/119) from passing.
+NEAR_TIE_FLOOR = 0.15
+HIGH_CONSENSUS_REF = 0.60
+HIGH_VOTE_REF = 15
+MAX_VOTE_BOOST = 0.30
+HIGH_VOTE_RATIO = 3.0
+MIN_CONSENSUS_FOR_RATIO = 0.50
+
+# Rank+margin chunk-vote gate. A 30s ASR chunk (~30-120 words) compared against a
+# full-episode TF-IDF vector (~3-5k words) yields a structurally low absolute
+# cosine even for a perfect match (~0.08-0.22): both vectors are L2-normalized, so
+# the short, sparse chunk can only overlap a small fraction of the episode's mass.
+# An absolute gate (the historical `cosine > 0.15`) therefore rejected most
+# correct chunks, returning episode=None. The *ranking* is reliable instead -- the
+# correct episode leads the runner-up by ~1.8-5.6x -- so a chunk votes for its top
+# episode when that lead is clear. See select_chunk_vote and the empirical scale
+# measurement in docs/superpowers/reviews/2026-05-29-asr-chunk-vote-scale-mismatch.md.
+CHUNK_VOTE_FLOOR = 0.06  # below this top-1 cosine, treat the chunk as noise
+CHUNK_VOTE_MARGIN_RATIO = 1.8  # top-1 must lead the runner-up by this ratio to vote
+
+# A scraped reference corpus needs at least this many subtitles with readable text
+# before a match against it means anything. With one usable reference every chunk
+# that clears the noise floor votes for it (a lone candidate always clears the
+# margin rule in select_chunk_vote), so every track on a disc matches that one
+# episode at full confidence. Two is the smallest corpus in which a vote can be
+# lost.
+MIN_USABLE_REFERENCES = 2
+
+# Calibrated-confidence acceptance floor for the ranked-voting gate. The raw
+# ranked_voting_score is a mean chunk cosine that sits structurally ~0.1 (see the
+# scale note above), so the absolute match_threshold gate rejects correct,
+# decisive matches (e.g. True Detective S1E5 raw=0.100/conf=0.810,
+# S1E7 raw=0.094/conf=0.745) and forces an expensive — sometimes worse — full-file
+# re-transcription. The calibrated 0-1 confidence already folds in separation +
+# vote consensus and is what the curator reads, so a match that clears this floor
+# with enough votes is accepted directly. 0.70 mirrors the curator's auto-organize
+# gate (EpisodeCurator.HIGH_CONFIDENCE_THRESHOLD).
+CONFIDENCE_ACCEPT_FLOOR = 0.70
+
+# Upper bound on the per-matcher ASR transcript cache (entries: chunks + full-file
+# transcripts, keyed by source+offset+duration). One season-unknown file needs
+# ~num_points + 1 entries; the bound just stops the long-lived singleton matcher
+# from growing without limit across many files. On overflow the cache is cleared
+# wholesale (cheap, correctness-preserving — keys are source-addressed).
+MAX_TRANSCRIPTION_CACHE = 1024
+
+# Upper bound on the per-matcher TF-IDF cache (one prepared matcher per distinct
+# reference set / season). A show rarely has more than a few dozen seasons in
+# flight; the bound just stops the long-lived singleton matcher from growing
+# without limit across many shows. On overflow the cache is cleared wholesale
+# (cheap — a prepared matcher rebuilds in ms for precomputed, seconds for scraped).
+MAX_TFIDF_CACHE = 64
+
+
+def select_chunk_vote(
+    tfidf_results: list[tuple[str, float]],
+    floor: float = CHUNK_VOTE_FLOOR,
+    ratio: float = CHUNK_VOTE_MARGIN_RATIO,
+) -> tuple[str, float] | None:
+    """Pick the single episode a transcribed chunk votes for, or None.
+
+    Replaces the miscalibrated absolute cosine gate with a rank+margin rule that
+    survives the chunk-vs-full-episode scale mismatch (see CHUNK_VOTE_FLOOR notes).
+    A chunk votes for its top-ranked episode iff that episode (a) clears ``floor``
+    (guards pure-noise/near-silent chunks) and (b) leads the runner-up by
+    ``ratio``x (so recap or shared-dialogue chunks, where two episodes score
+    similarly, abstain instead of casting a confident-but-wrong vote).
+
+    Args:
+        tfidf_results: ``(reference, cosine)`` pairs sorted by cosine descending,
+            as returned by ``TfidfMatcher.match()``.
+        floor: minimum top-1 cosine required to consider voting.
+        ratio: required ``top1 / runner_up`` lead. A lone candidate (no runner-up)
+            only needs to clear the floor.
+
+    Returns:
+        ``(reference, cosine)`` for the winning episode, or None when no episode
+        clearly leads.
+    """
+    if not tfidf_results:
+        return None
+    top_ref, top_score = tfidf_results[0]
+    if top_score < floor:
+        return None
+    runner_up_score = tfidf_results[1][1] if len(tfidf_results) > 1 else 0.0
+    if top_score < ratio * runner_up_score:
+        return None
+    return top_ref, top_score
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def calibrate_confidence(
+    *,
+    score: float,
+    score_gap: float,
+    vote_count: int,
+    target_votes: int,
+    processed_coverage: float,
+    runner_up_votes: int = 0,
+    chromaprint_signal: dict | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Translate raw match signals into a 0-1 reviewer-facing confidence.
+
+    Args:
+        score: winner's ranked_voting_score (mean matched-chunk cosine).
+        score_gap: top1 - top2 (decisiveness; == score when uncontested).
+        vote_count: chunks that voted for the winner.
+        target_votes: total chunks sampled.
+        processed_coverage: fraction of the file run through the matcher
+            (samples * chunk_len / video_duration), NOT the matched fraction.
+        runner_up_votes: chunks that voted for the best alternative candidate.
+            When provided, enables the vote-ratio confidence path. Default 0
+            (ratio path disabled) for backward compatibility.
+
+    Returns:
+        (confidence, components) where components reports the independent
+        metrics (separation, consensus, normalized_score, coverage, evidence,
+        vote_boost, effective_separation, vote_ratio_score, ratio_confidence),
+        each in [0, 1].  ``vote_ratio`` is also included as a *raw* diagnostic
+        (winner_votes / runner_up_votes) and is NOT bounded to [0, 1] — it
+        equals 0.0 when the ratio path is inactive and can exceed 1.0
+        (e.g. 3.32 for 103 vs 31 votes) when it fires.
+
+    Two independent confidence paths — the higher wins:
+
+    Path 1 — separation-based (score_gap signal):
+        effective_separation = separation + vote_boost
+        vote_boost = MAX_VOTE_BOOST * (consensus / HIGH_CONSENSUS_REF)
+                                     * (vote_count / HIGH_VOTE_REF)
+                     only when separation > NEAR_TIE_FLOOR, else 0
+        base_confidence = effective_separation * evidence
+
+    Path 2 — vote-ratio (chunk-count signal, requires runner_up_votes > 0):
+        Fires when winner matched HIGH_VOTE_RATIO× more chunks than runner-up
+        AND overall consensus >= MIN_CONSENSUS_FOR_RATIO.
+        ratio_confidence = evidence
+                         * clamp(vote_ratio_score)
+                         * clamp(consensus / HIGH_CONSENSUS_REF)
+        where vote_ratio_score scales (vote_count/runner_up_votes) from 1× to
+        HIGH_VOTE_RATIO× into [0, 1].
+
+    confidence = max(base_confidence, ratio_confidence)
+
+    Rationale for Path 2: ranked_voting_score is a per-chunk mean cosine, so
+    a runner-up that matched ⅓ as many chunks as the winner may still produce
+    a similar mean cosine (and thus a small score_gap). Path 1 alone then
+    underestimates confidence. The vote-ratio path captures this: 103 vs 31
+    chunk matches is decisive regardless of whether the mean cosines are close.
+    """
+    eps = 1e-9
+    separation = _clamp01(score_gap / score) if score > eps else 0.0
+    consensus = _clamp01(vote_count / target_votes) if target_votes > 0 else 0.0
+    normalized_score = _clamp01(score / QUALITY_REF_COSINE)
+    coverage_norm = _clamp01(processed_coverage / COVERAGE_REF)
+
+    evidence_raw = (
+        W_CONSENSUS * consensus + W_NORMALIZED_SCORE * normalized_score + W_COVERAGE * coverage_norm
+    )
+    evidence = EVIDENCE_FLOOR + (1.0 - EVIDENCE_FLOOR) * evidence_raw
+
+    # Path 1 — separation-based: near-ties are excluded (runner-up too close
+    # to trust vote count alone). Above the floor, both consensus fraction and
+    # absolute vote count must be high to earn the full boost — requiring many
+    # independent chunks to agree, not just a high proportion of a small sample.
+    if separation > NEAR_TIE_FLOOR:
+        vote_boost = (
+            MAX_VOTE_BOOST
+            * _clamp01(consensus / HIGH_CONSENSUS_REF)
+            * _clamp01(vote_count / HIGH_VOTE_REF)
+        )
+        effective_separation = _clamp01(separation + vote_boost)
+    else:
+        vote_boost = 0.0
+        effective_separation = separation
+    base_confidence = _clamp01(effective_separation * evidence)
+
+    # Path 2 — vote-ratio: fires when the winner matched significantly more
+    # chunks than the runner-up AND the overall consensus is strong. This
+    # captures cases where score_gap is small despite decisive chunk-count
+    # dominance (e.g. 103 vs 31 votes with similar per-chunk cosines).
+    vote_ratio = 0.0
+    vote_ratio_score = 0.0
+    ratio_confidence = 0.0
+    if runner_up_votes > 0 and consensus >= MIN_CONSENSUS_FOR_RATIO:
+        vote_ratio = vote_count / runner_up_votes
+        # Scale from [1×, HIGH_VOTE_RATIO×] → [0, 1]; below 1× impossible, above clamps to 1.
+        vote_ratio_score = _clamp01((vote_ratio - 1.0) / (HIGH_VOTE_RATIO - 1.0))
+        ratio_confidence = _clamp01(
+            evidence * vote_ratio_score * _clamp01(consensus / HIGH_CONSENSUS_REF)
+        )
+
+    confidence = max(base_confidence, ratio_confidence)
+
+    # Chromaprint path (Phase 3) — additive. Absent signal is a no-op; a present
+    # signal can only raise confidence (max), never lower an ASR-strong result.
+    cp_overlap = cp_temporal = cp_rarity = cp_confidence = 0.0
+    if chromaprint_signal:
+        cp_overlap = _clamp01(float(chromaprint_signal.get("hash_overlap", 0.0)))
+        cp_temporal = _clamp01(float(chromaprint_signal.get("temporal_coherence", 0.0)))
+        cp_rarity = _clamp01(float(chromaprint_signal.get("rarity_weighted_score", 0.0)))
+        cp_evidence = EVIDENCE_FLOOR + (1.0 - EVIDENCE_FLOOR) * cp_temporal
+        cp_confidence = _clamp01(cp_overlap * cp_evidence * (0.5 + 0.5 * cp_rarity))
+        confidence = max(confidence, cp_confidence)
+
+    components = {
+        "separation": separation,
+        "vote_boost": vote_boost,
+        "effective_separation": effective_separation,
+        "consensus": consensus,
+        "normalized_score": normalized_score,
+        # Report the actual processed fraction (the metric), not the normalized
+        # form used inside the formula.
+        "coverage": _clamp01(processed_coverage),
+        "evidence": evidence,
+        "vote_ratio": vote_ratio,
+        "vote_ratio_score": vote_ratio_score,
+        "ratio_confidence": ratio_confidence,
+        "hash_overlap": cp_overlap,
+        "temporal_coherence": cp_temporal,
+        "rarity_weighted_score": cp_rarity,
+        "cp_confidence": cp_confidence,
+    }
+    return confidence, components
+
+
+def _attach_calibrated_confidence(
+    best_match: dict,
+    results_summary: list[dict],
+    video_duration: float,
+    chunk_len: int = 30,
+    chromaprint_signal: dict | None = None,
+) -> None:
+    """Mutate ``best_match`` in place with calibrated confidence + leaderboard.
+
+    Sets ``best_match["confidence"]`` to the calibrated value (this is what flows
+    to ``DiscTitle.match_confidence``) while leaving ``best_match["score"]`` and
+    ``match_details["score"]`` as the raw ranked_voting_score that the accept-vs-
+    fallback gate and conflict resolution depend on. Adds the reported metrics to
+    ``match_details`` and builds ``runner_ups`` where each entry keeps its raw
+    ``score`` (for cascading reassignment) and gains a calibrated ``confidence``
+    scaled to the winner so the winner's leaderboard entry equals the headline.
+    """
+    if not results_summary:
+        return
+
+    # results_summary is sorted by score descending by the caller.
+    top1 = results_summary[0]["score"]
+    if len(results_summary) >= 2:
+        score_gap = top1 - results_summary[1]["score"]
+        runner_up_votes = results_summary[1].get("vote_count", 0)
+    else:
+        score_gap = top1
+        runner_up_votes = 0
+
+    md = best_match.setdefault("match_details", {})
+    target_votes = md.get("target_votes", 0)
+    vote_count = md.get("vote_count", 0)
+    processed_coverage = (target_votes * chunk_len / video_duration) if video_duration > 0 else 0.0
+
+    # Use top1 (not best_match["score"]) as the denominator so separation
+    # (score_gap / score) is self-consistent: both derive from results_summary.
+    # They are equal by construction (best_match is the top-scoring candidate),
+    # but sourcing both here removes the implicit cross-reference invariant.
+    confidence, components = calibrate_confidence(
+        score=top1,
+        score_gap=score_gap,
+        vote_count=vote_count,
+        target_votes=target_votes,
+        processed_coverage=processed_coverage,
+        runner_up_votes=runner_up_votes,
+        chromaprint_signal=chromaprint_signal,
+    )
+
+    best_match["confidence"] = confidence
+    md["confidence"] = confidence
+    md["score_gap"] = score_gap
+    md["separation"] = components["separation"]
+    md["vote_boost"] = components["vote_boost"]
+    md["effective_separation"] = components["effective_separation"]
+    md["normalized_score"] = components["normalized_score"]
+    md["consensus"] = components["consensus"]
+    md["vote_ratio"] = components["vote_ratio"]
+    md["ratio_confidence"] = components["ratio_confidence"]
+    md["coverage"] = components["coverage"]
+
+    runner_ups = []
+    for r in results_summary:
+        if r["score"] <= 0:
+            continue
+        ru_confidence = _clamp01(confidence * (r["score"] / top1)) if top1 > 0 else 0.0
+        runner_ups.append(
+            {
+                "episode": r["episode"],
+                "score": r["score"],  # raw, for conflict resolution
+                "confidence": ru_confidence,  # calibrated, for display
+                "vote_count": r["vote_count"],
+                "target_votes": r.get("target_votes", target_votes),
+            }
+        )
+    runner_ups = runner_ups[:5]
+    # Distinct list objects: curator shallow-copies match_details but not the
+    # inner list, so a shared reference could let one mutation corrupt the other.
+    best_match["runner_ups"] = runner_ups
+    md["runner_ups"] = runner_ups[:]
+
+
+class TfidfMatcher:
+    """
+    Episode matcher using TF-IDF cosine similarity.
+
+    Pre-computes TF-IDF vectors for all reference episode texts (full subtitle content),
+    then matches transcribed chunks via cosine similarity — ~1ms per query vs ~465ms
+    for the previous sliding-window RapidFuzz approach, with higher accuracy (97.9% vs 96.6%).
+    """
+
+    def __init__(self):
+        self.vectorizer = None
+        self.ref_matrix = None
+        self.ref_file_order = []  # ordered list of reference file paths (or episode codes)
+        self._prepared = False
+        self._precomputed = False  # True when loaded from the shipped vector cache
+        self._idf = None  # global IDF array, only set in precomputed mode
+        self.total_references = 0  # references offered, including any dropped as empty
+
+    def load_precomputed(self, ref_matrix, ref_episode_codes, idf_array) -> None:
+        """Load a precomputed hashed TF-IDF cache instead of fitting from SRT.
+
+        Args:
+            ref_matrix: scipy CSR matrix, one L2-normalized TF-IDF row per episode.
+            ref_episode_codes: episode codes ("S01E03"), aligned to matrix rows.
+            idf_array: global IDF array used to project queries into the same space.
+        """
+        self.ref_matrix = ref_matrix
+        self.ref_file_order = list(ref_episode_codes)
+        self.total_references = len(self.ref_file_order)
+        self._idf = idf_array
+        self._precomputed = True
+        self._prepared = True
+        logger.info(
+            f"TF-IDF loaded from precomputed cache: {len(self.ref_file_order)} episodes, "
+            f"{self.ref_matrix.shape[1]} features"
+        )
+
+    def prepare(self, reference_files, subtitle_cache: SubtitleCache):
+        """
+        Fit TF-IDF vectorizer on all reference episode full texts.
+
+        References with no readable text are left out of the corpus: a TF-IDF row
+        of zeros can never win a vote, and a corpus that is mostly zeros quietly
+        hands every vote to the few references that do have text.
+        ``total_references`` still counts them, so callers can tell how much of the
+        season was unusable.
+
+        Args:
+            reference_files: List of paths to reference SRT files
+            subtitle_cache: SubtitleCache instance for loading/caching SRT content
+        """
+        self.ref_file_order = []
+        corpus = []
+        dropped = []
+        for rf in (str(r) for r in reference_files):
+            full_text = subtitle_cache.get_full_text(rf)
+            logger.debug(f"  TF-IDF ref: {Path(rf).stem} ({len(full_text)} chars)")
+            if not full_text:
+                dropped.append(Path(rf).stem)
+                continue
+            self.ref_file_order.append(rf)
+            corpus.append(full_text)
+        self.total_references = len(self.ref_file_order) + len(dropped)
+        if dropped:
+            logger.warning(
+                f"TF-IDF: {len(self.ref_file_order)}/{self.total_references} reference "
+                f"subtitles have readable text; skipped {len(dropped)} empty: "
+                f"{', '.join(dropped)}"
+            )
+
+        self.vectorizer = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 2),
+            max_features=10000,
+            sublinear_tf=True,
+        )
+        if corpus:
+            self.ref_matrix = self.vectorizer.fit_transform(corpus)
+            features = self.ref_matrix.shape[1]
+        else:
+            self.ref_matrix = None
+            features = 0
+        self._prepared = True
+        logger.info(f"TF-IDF prepared: {len(self.ref_file_order)} references, {features} features")
+
+    def match(self, query_text: str) -> list[tuple[str, float]]:
+        """
+        Match a transcribed text chunk against all reference episodes.
+
+        Args:
+            query_text: Cleaned transcription text from a video chunk
+
+        Returns:
+            List of (reference_file_path, cosine_score) sorted by score descending
+        """
+        if not self._prepared:
+            raise RuntimeError("TfidfMatcher.prepare() must be called before match()")
+        if not self.ref_file_order:
+            return []
+
+        if self._precomputed:
+            from app.matcher.vectorizer_config import transform_query
+
+            q_vec = transform_query(query_text, self._idf)
+        else:
+            q_vec = self.vectorizer.transform([query_text])
+        sims = sklearn_cosine_similarity(q_vec, self.ref_matrix)[0]
+
+        results = list(zip(self.ref_file_order, sims.tolist(), strict=False))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    @property
+    def is_prepared(self) -> bool:
+        return self._prepared
+
+    def reference_signature(self) -> tuple | None:
+        """Fingerprint of what this matcher was prepared against; None if not prepared."""
+        if not self._prepared:
+            return None
+        # Mode distinguishes precomputed-codes from scraping-paths so a stale
+        # matcher from a prior precomputed call can't keep returning codes
+        # while the new call's `coverages` is path-keyed → KeyError.
+        if self._precomputed:
+            return ("precomputed", tuple(self.ref_file_order))
+        return scraping_reference_signature(self.ref_file_order)
+
+
+class MatchCoverage:
+    """Tracks match coverage for an episode against a video file."""
+
+    def __init__(self, episode_name: str, reference_duration: float, video_duration: float):
+        self.episode_name = episode_name
+        self.reference_duration = reference_duration
+        self.video_duration = video_duration
+        self.matched_chunks = []  # List of {start, duration, confidence}
+
+    def add_match(self, start_time, duration, confidence):
+        self.matched_chunks.append(
+            {"start": start_time, "duration": duration, "confidence": confidence}
+        )
+
+    @property
+    def avg_confidence(self) -> float:
+        if not self.matched_chunks:
+            return 0.0
+        return sum(c["confidence"] for c in self.matched_chunks) / len(self.matched_chunks)
+
+    @property
+    def file_coverage(self) -> float:
+        if self.video_duration <= 0:
+            return 0.0
+        # Assume non-overlapping chunks for simplicity
+        matched_duration = sum(c["duration"] for c in self.matched_chunks)
+        return min(1.0, matched_duration / self.video_duration)
+
+    @property
+    def episode_coverage(self) -> float:
+        """Percentage of the episode referenced that was found."""
+        if self.reference_duration <= 0:
+            return 0.0
+        matched_duration = sum(c["duration"] for c in self.matched_chunks)
+        return min(1.0, matched_duration / self.reference_duration)
+
+    @property
+    def weighted_score(self) -> float:
+        # Legacy method: avg_confidence × file_coverage
+        # Kept for backward compatibility and comparison
+        return self.avg_confidence * self.file_coverage
+
+    @property
+    def total_vote_weight(self) -> float:
+        """Sum of coverage weights for all matched chunks."""
+        if not self.matched_chunks:
+            return 0.0
+        return sum(c["duration"] / self.video_duration for c in self.matched_chunks)
+
+    @property
+    def ranked_voting_score(self) -> float:
+        """
+        Ranked voting score: weighted average of chunk confidences.
+
+        Formula: sum(confidence × weight) / sum(weights)
+        Where weight = chunk_duration / video_duration
+
+        This provides consensus-based matching that considers evidence from all chunks,
+        weights each chunk's vote by its contribution, and produces more stable confidence scores.
+        """
+        if not self.matched_chunks or self.video_duration <= 0:
+            return 0.0
+
+        weighted_sum = sum(
+            c["confidence"] * (c["duration"] / self.video_duration) for c in self.matched_chunks
+        )
+        total_weight = self.total_vote_weight
+
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
+
+    def get_voting_details(self) -> dict:
+        """Get detailed voting information for logging/debugging."""
+        return {
+            "episode": self.episode_name,
+            "vote_count": len(self.matched_chunks),
+            "ranked_score": self.ranked_voting_score,
+            "avg_confidence": self.avg_confidence,
+            "total_weight": self.total_vote_weight,
+            "file_coverage": self.file_coverage,
+            "legacy_weighted_score": self.weighted_score,
+        }
+
+
+class EpisodeMatcher:
+    """
+    Episode matcher using audio fingerprinting and ranked voting.
+
+    Uses sparse sampling strategy (dense: 30s intervals, sparse: 150s intervals)
+    with ranked-choice voting to select the best matching episode based on
+    weighted confidence consensus across all matched chunks.
+    """
+
+    def __init__(
+        self,
+        cache_dir,
+        show_name,
+        min_confidence=0.6,
+        device=None,
+        use_ranked_voting=True,
+        min_vote_count=2,
+        match_threshold=0.10,
+        confidence_accept_floor=CONFIDENCE_ACCEPT_FLOOR,
+        model_name="small",
+        requested_workers=1,
+        expected_tmdb_id=None,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.min_confidence = min_confidence
+        self.show_name = show_name
+        self.expected_tmdb_id = expected_tmdb_id
+        self.chunk_duration = 30
+        self.skip_initial_duration = (
+            90  # Minimal skip for title cards; ranked voting handles intro noise
+        )
+        self.model_name = model_name
+        self.requested_workers = max(1, int(requested_workers or 1))
+        # Effective startup-pinned device (set_asr_device), NOT the raw GPU probe:
+        # probing ctranslate2 directly here claimed "cuda" even when the user had
+        # disabled GPU ASR, which would poison _model_config() — and through it the
+        # persistent transcript-cache model_key (claiming cuda/float16 for output
+        # actually produced on cpu/int8).
+        self.device = device or detect_asr_device()
+        self.temp_dir = Path(tempfile.gettempdir()) / "whisper_chunks"
+        self.temp_dir.mkdir(exist_ok=True)
+        # Initialize subtitle cache
+        self.subtitle_cache = SubtitleCache()
+        # Per-(reference-set) TF-IDF matchers, keyed by reference_signature. The
+        # matcher singleton is SHARED across concurrent identify_episode threads
+        # (parallel ASR, #336); a single mutable slot let one thread's season
+        # rebuild clobber another in-flight season's references mid-scan -> zero
+        # votes -> bogus review. Keying by signature gives each season its own
+        # prepared matcher while preserving cross-call reuse. TfidfMatcher.match()
+        # is read-only, so a cached instance is safe to share across same-season
+        # threads. Bounded + lock-guarded; see _get_tfidf_matcher.
+        self._tfidf_cache: dict[tuple, TfidfMatcher] = {}
+        self._tfidf_cache_lock = threading.Lock()
+        self._max_tfidf_cache = MAX_TFIDF_CACHE
+        # Cache for extracted audio chunks (cleared per identify_episode call)
+        self.audio_chunks = {}
+        # Cache for ASR transcripts, keyed by (resolved_source, start, duration).
+        # Unlike audio_chunks this PERSISTS across identify_episode calls so the
+        # season-unknown path (one call per candidate season) reuses Whisper output
+        # instead of re-transcribing the same offsets per season. Bounded; see
+        # _remember_transcription.
+        self.transcriptions = {}
+        self._max_transcription_cache = MAX_TRANSCRIPTION_CACHE
+        # Store reference files to avoid repeated glob operations
+        self.reference_files_cache = {}
+        # Precomputed subtitle-vector cache (lazily loaded; False once known-absent)
+        self._precomputed_manifest = None
+        self._precomputed_idf = None
+        # Ranked voting parameters
+        self.min_vote_count = min_vote_count
+        self.match_threshold = match_threshold
+        # Accept a decisive, high-calibrated-confidence match even when the raw
+        # mean-cosine score sits at/below match_threshold (see CONFIDENCE_ACCEPT_FLOOR).
+        self.confidence_accept_floor = confidence_accept_floor
+        # Rank+margin chunk-vote gate parameters (see select_chunk_vote).
+        self.chunk_vote_floor = CHUNK_VOTE_FLOOR
+        self.chunk_vote_margin_ratio = CHUNK_VOTE_MARGIN_RATIO
+        # Enable/disable ranked voting (default: True for improved confidence scores)
+        self.use_ranked_voting = use_ranked_voting
+
+    def clean_text(self, text):
+        """Clean transcription text to match TF-IDF vocabulary expectations."""
+        return _clean_subtitle_text(text)
+
+    @staticmethod
+    def _resolve_source(mkv_file) -> str:
+        """Canonical source-path form shared by chunk hash + in-memory cache key."""
+        return str(Path(mkv_file).resolve())
+
+    def _chunk_path(self, mkv_file, start_time, duration):
+        """Hash resolved source path into the filename so concurrent threads don't collide."""
+        src_hash = hashlib.sha1(self._resolve_source(mkv_file).encode("utf-8")).hexdigest()[:16]
+        return self.temp_dir / f"chunk_{src_hash}_{start_time}_{duration}.wav"
+
+    def _transcription_key(self, mkv_file, start_time, duration) -> tuple:
+        """Cache key for an ASR transcript: resolved source path + offset + duration.
+
+        Same shape as the audio-chunk cache key, so the chunk loop and the full-file
+        fallback share one transcript cache without colliding (chunks start >= 300s
+        with a 30s duration; the full-file pass uses start=0 with the file duration).
+        """
+        return (self._resolve_source(mkv_file), start_time, duration)
+
+    def _remember_transcription(self, key: tuple, text: str) -> None:
+        """Store an ASR transcript, bounding the cache.
+
+        The cache persists across identify_episode() calls (it is NOT cleared in the
+        per-call ``finally``), letting the season-unknown path reuse Whisper output
+        across candidate seasons. It is shared across concurrent matches on the
+        singleton matcher; individual dict ops are GIL-safe and keys are
+        source-addressed, so concurrent files never read each other's transcripts.
+        On overflow the whole cache is dropped (a rare, cheap reset). The size-check
+        and clear are not atomic, so two concurrent overflows may flush early — at
+        worst a few extra transcriptions, never a wrong or mixed-up result; a lock
+        isn't warranted for a best-effort perf cache.
+        """
+        if len(self.transcriptions) >= self._max_transcription_cache:
+            self.transcriptions.clear()
+        self.transcriptions[key] = text
+
+    def _model_key_for(self, model) -> str:
+        """L2 transcript-cache model identity, preferring the LOADED model's device.
+
+        ``FasterWhisperModel.load()`` can silently fall back CUDA→CPU when the math
+        libraries are missing; deriving the key from the loaded object's post-load
+        ``device`` means a persisted key can't claim cuda/float16 for output that
+        was actually produced on cpu/int8. Model objects that don't expose a
+        resolved device (e.g. test fakes) fall back to ``_model_config()``, whose
+        device is the startup-pinned effective value (see __init__).
+        """
+        config = self._model_config()
+        loaded_device = getattr(model, "device", None)
+        if loaded_device in ("cpu", "cuda"):
+            config["device"] = loaded_device
+        return model_output_key(config)
+
+    def transcribe_chunk_cached(
+        self,
+        video_file,
+        start_time,
+        chunk_len,
+        model,
+        *,
+        file_key=None,
+        model_key=None,
+        temp_files=None,
+    ) -> str:
+        """Transcribe one chunk through the layered cache: L1 dict → L2 SQLite → Whisper.
+
+        On an L1/L2 hit no wav is extracted, so nothing is appended to
+        ``temp_files`` (same as the historical L1-hit path); on compute the
+        extracted wav IS appended (before transcription, so cleanup happens even
+        if Whisper raises) and the text is written through to BOTH layers so it
+        survives process restarts and re-matches.
+
+        ``file_key``/``model_key`` may be precomputed by the caller (one stat +
+        one key derivation per identify_episode call, reused across offsets);
+        when absent they are derived here so direct callers stay correct.
+        ``transcript_store`` is fail-safe — a broken cache degrades to "just
+        transcribe again", never into a matching error.
+        """
+        chunk_key = self._transcription_key(video_file, start_time, chunk_len)
+        # L1: in-memory memo (persists across identify_episode calls).
+        text = self.transcriptions.get(chunk_key)
+        if text is not None:
+            return text
+
+        if file_key is None:
+            file_key = transcript_store.file_key_for(video_file)
+        if model_key is None:
+            model_key = self._model_key_for(model)
+
+        # L2: persistent store. "" is a valid cached transcript (silent audio);
+        # only None is a miss. On a hit, also populate L1 for this process.
+        text = transcript_store.get(file_key, start_time, chunk_len, model_key)
+        if text is not None:
+            self._remember_transcription(chunk_key, text)
+            return text
+
+        audio_path = self.extract_audio_chunk(video_file, start_time, duration=chunk_len)
+        if temp_files is not None:
+            temp_files.append(audio_path)  # Track for caller's cleanup
+        # `or ""` guards a wrapper returning {"text": None}: caching None would
+        # make this offset a perpetual miss (the `is None` guards above would
+        # re-transcribe it every season). The caller's `len(text) < 10` check
+        # still skips genuinely empty audio.
+        text = (model.transcribe(audio_path).get("text") or "").strip()
+        self._remember_transcription(chunk_key, text)
+        transcript_store.put(file_key, start_time, chunk_len, model_key, text)
+        return text
+
+    def extract_audio_chunk(self, mkv_file, start_time, duration=None):
+        """Extract a chunk of audio from MKV file with caching."""
+        duration = duration or self.chunk_duration
+        # Resolve once so cache_key matches what _chunk_path hashes.
+        cache_key = (self._resolve_source(mkv_file), start_time, duration)
+
+        if cache_key in self.audio_chunks:
+            return self.audio_chunks[cache_key]
+
+        chunk_path = self._chunk_path(mkv_file, start_time, duration)
+        if not chunk_path.exists():
+            cmd = [
+                "ffmpeg",
+                "-ss",
+                str(start_time),
+                "-t",
+                str(duration),
+                "-i",
+                str(mkv_file),
+                "-vn",  # Disable video
+                "-sn",  # Disable subtitles
+                "-dn",  # Disable data streams
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-y",  # Overwrite output files without asking
+                str(chunk_path),
+            ]
+
+            try:
+                logger.debug(
+                    f"Extracting audio segment from {mkv_file} at {start_time}s (duration: {duration}s) using FFmpeg"
+                )
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 30)
+
+                if result.returncode != 0:
+                    error_msg = f"FFmpeg failed with return code {result.returncode}"
+                    if result.stderr:
+                        error_msg += f". Error: {result.stderr.strip()}"
+                    logger.error(error_msg)
+                    logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+                    raise RuntimeError(error_msg)
+
+                # Check if the output file was actually created and has content
+                if not chunk_path.exists():
+                    error_msg = f"FFmpeg completed but output file was not created: {chunk_path}"
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+                # Check if the file has meaningful content (at least 1KB)
+                if chunk_path.stat().st_size < 1024:
+                    error_msg = f"Generated audio chunk is too small ({chunk_path.stat().st_size} bytes), likely corrupted"
+                    logger.warning(error_msg)
+                    # Don't raise an error for small files, but log the warning
+
+                logger.debug(f"Successfully extracted {chunk_path.stat().st_size} byte audio file")
+
+            except subprocess.TimeoutExpired as e:
+                error_msg = f"FFmpeg timed out while extracting audio from {mkv_file}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg) from e
+
+            except Exception as e:
+                error_msg = f"Failed to extract audio from {mkv_file}: {str(e)}"
+                logger.error(error_msg)
+                # Clean up partial file if it exists
+                if chunk_path.exists():
+                    try:
+                        chunk_path.unlink()
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            f"Failed to clean up partial file {chunk_path}: {cleanup_error}"
+                        )
+                raise RuntimeError(error_msg) from e
+
+        chunk_path_str = str(chunk_path)
+        self.audio_chunks[cache_key] = chunk_path_str
+        return chunk_path_str
+
+    def _load_precomputed_manifest(self):
+        """Load and validate the precomputed-cache manifest once. Returns dict or None.
+
+        A missing, unreadable, or version/config-mismatched manifest is treated as
+        "no cache" -- the caller falls back to subtitle scraping.
+        """
+        if self._precomputed_manifest is not None:
+            return self._precomputed_manifest or None
+
+        self._precomputed_manifest = load_precomputed_manifest(self.cache_dir) or False
+        return self._precomputed_manifest or None
+
+    def load_precomputed_season(self, season_number):
+        """Public entry point over the precomputed-cache loader.
+
+        Exposed so the cache packager's publish-gate verification can exercise
+        the real load path without reaching into a private method. Returns
+        (ref_matrix, episode_codes, idf_array) when the shipped cache covers
+        this show+season, otherwise None.
+        """
+        return self._load_precomputed_season(season_number)
+
+    def precomputed_numbering(self, season_number) -> dict | None:
+        """The numbering marker the shipped pack records for this show + season.
+
+        Returns ``{"scheme": ..., "roster_size": ...}`` when the manifest carries
+        a usable one, else ``None``. ``None`` covers every case a caller must not
+        treat as an answer: a pack built before the marker existed, a season the
+        pack does not describe, an explicitly ``unknown`` season, and a malformed
+        entry. The caller then stamps nothing and the runtime size heuristic
+        stays in charge, which is exactly the pre-marker behaviour.
+
+        Read as a per-call local by ``identify_episode``, never cached on the
+        instance. The matcher singleton is shared across concurrent
+        ``identify_episode`` threads (parallel ASR), so a season-scoped value in
+        an instance slot would be clobbered by a sibling thread's scan, the same
+        hazard the per-call TF-IDF matcher below exists to avoid.
+        """
+        manifest = self._load_precomputed_manifest()
+        _key, show_entry = _resolve_corpus_entry(manifest, self.show_name, self.expected_tmdb_id)
+        if not show_entry:
+            return None
+        marker = (show_entry.get("season_numbering") or {}).get(str(season_number))
+        if not isinstance(marker, dict):
+            return None
+        scheme = marker.get("scheme")
+        if scheme not in VALID_SCHEMES or scheme == SCHEME_UNKNOWN:
+            return None
+        return marker
+
+    def _load_precomputed_season(self, season_number):
+        """Load precomputed hashed TF-IDF vectors for this show/season.
+
+        Returns (ref_matrix, episode_codes, idf_array) when the shipped cache
+        covers the show+season, otherwise None (caller falls back to scraping).
+        """
+        # Use the instance-cached manifest (warms the sentinel on first call) and
+        # reuse it for the coverage gate so we read+validate manifest.json at most
+        # once per matcher instance instead of once per title.
+        manifest = self._load_precomputed_manifest()
+        # Resolve the show by tmdb_id (manifest is id-keyed in v3), falling back to
+        # name when the id is unknown. A name-resolved entry whose id contradicts a
+        # known expected id is a different same-named show — refuse it BEFORE the
+        # stale-prune branch so we don't wrongly drop a valid entry.
+        key, show_entry = _resolve_corpus_entry(manifest, self.show_name, self.expected_tmdb_id)
+        entry_id = show_entry.get("tmdb_id") if show_entry else None
+        if _tmdb_id_mismatch(self.expected_tmdb_id, entry_id):
+            logger.warning(
+                f"Precomputed corpus for '{self.show_name}' is tmdb_id {entry_id} but this "
+                f"job resolved tmdb_id {self.expected_tmdb_id}; skipping precomputed (wrong show)"
+            )
+            return None
+        if not precomputed_covers_season(
+            self.cache_dir,
+            self.show_name,
+            season_number,
+            manifest=manifest,
+            expected_tmdb_id=self.expected_tmdb_id,
+        ):
+            # Prune the stale season in-memory so the warning fires at most once per matcher.
+            if show_entry and season_number in show_entry.get("seasons", []):
+                logger.warning(
+                    f"Precomputed cache lists {self.show_name} S{season_number:02d} "
+                    f"but its files are missing; using scraping"
+                )
+                show_entry["seasons"] = [s for s in show_entry["seasons"] if s != season_number]
+                if not show_entry["seasons"]:
+                    manifest["shows"].pop(key, None)
+            return None
+
+        precomputed_dir = self.cache_dir / "precomputed"
+        show_dir = _corpus_show_dir(self.cache_dir, key)
+        npz_path = show_dir / f"S{season_number:02d}.npz"
+        index_path = show_dir / f"S{season_number:02d}.index.json"
+
+        try:
+            if self._precomputed_idf is None:
+                self._precomputed_idf = np.load(precomputed_dir / "idf.npy")
+            # Cache v2 ships uint16 hashed counts; apply TF-IDF here so the
+            # matcher gets the same L2-normalized float32 matrix v1 read
+            # directly from disk. Done once per (show, season) and cached
+            # downstream — the cost is negligible vs. the ~85% size win
+            # (~8 KB/episode vs. ~66 KB/episode for v1 float64 rows).
+            counts = scipy_load_npz(npz_path)
+            ref_matrix = apply_tfidf(counts, self._precomputed_idf)
+            with open(index_path, encoding="utf-8") as fh:
+                episode_codes = json.load(fh)
+        except (OSError, ValueError) as e:
+            logger.warning(
+                f"Failed to load precomputed cache for {self.show_name} "
+                f"S{season_number:02d} ({e}); using scraping"
+            )
+            return None
+
+        if ref_matrix.shape[0] != len(episode_codes):
+            logger.warning(
+                f"Precomputed cache row/index mismatch for {self.show_name} "
+                f"S{season_number:02d}; using scraping"
+            )
+            return None
+
+        ref_matrix, episode_codes = self._augment_with_downloaded_srts(
+            ref_matrix, episode_codes, season_number
+        )
+        return ref_matrix, episode_codes, self._precomputed_idf
+
+    def _augment_with_downloaded_srts(self, ref_matrix, episode_codes, season_number):
+        """Graft downloaded SRTs for episodes the precomputed cache doesn't cover.
+
+        The shipped cache can be incomplete (e.g. Mad Men S02 shipped without
+        S02E05). Once the missing episode's SRT is fetched into ``data/<id>/``,
+        vectorize it exactly as the cache was built (``get_full_text`` ->
+        ``transform_query``, identical feature space) and append it so it becomes
+        a first-class match candidate instead of being silently ignored.
+
+        Additive and idempotent: returns the inputs unchanged when there is
+        nothing to graft, and never raises — a bad SRT is skipped, not fatal.
+        """
+        data_dir = self.cache_dir / "data" / corpus_dir_name(self.expected_tmdb_id, self.show_name)
+        if not data_dir.is_dir():
+            return ref_matrix, episode_codes
+
+        have = set(episode_codes)
+        srt_files = list(data_dir.glob("*.srt")) + list(data_dir.glob("*.SRT"))
+        gaps: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+        for srt in sorted(srt_files):
+            m = _SE_TOKEN_RE.search(srt.name)
+            if not m or int(m.group(1)) != season_number:
+                continue
+            code = f"S{season_number:02d}E{int(m.group(2)):02d}"
+            if code in have or code in seen:
+                continue
+            seen.add(code)
+            gaps.append((code, srt))
+        if not gaps:
+            return ref_matrix, episode_codes
+
+        from app.matcher.vectorizer_config import transform_query
+
+        new_rows = []
+        new_codes = []
+        for code, srt in gaps:
+            try:
+                text = self.subtitle_cache.get_full_text(str(srt))
+                if not text:
+                    continue
+                new_rows.append(transform_query(text, self._precomputed_idf))
+                new_codes.append(code)
+            except Exception as e:  # noqa: BLE001 — a bad SRT must not kill the load
+                logger.warning(f"Could not graft {code} from {srt.name}: {e}")
+        if not new_rows:
+            return ref_matrix, episode_codes
+
+        augmented = scipy_vstack([ref_matrix, *new_rows], format="csr")
+        logger.info(
+            f"Augmented precomputed cache for {self.show_name} S{season_number:02d} with "
+            f"{len(new_codes)} downloaded episode(s): {', '.join(new_codes)}"
+        )
+        return augmented, episode_codes + new_codes
+
+    def get_reference_files(self, season_number):
+        """Get reference subtitle files with caching."""
+        cache_key = (self.show_name, season_number)
+        logger.debug(f"Reference cache key: {cache_key}")
+
+        if cache_key in self.reference_files_cache:
+            logger.debug("Returning cached reference files")
+            return self.reference_files_cache[cache_key]
+
+        # Keyed by tmdb_id (fallback: sanitized name) so two same-named shows
+        # never read each other's downloaded subtitles. Same key the downloader
+        # and scrapers write under, given the same expected id.
+        reference_dir = (
+            self.cache_dir / "data" / corpus_dir_name(self.expected_tmdb_id, self.show_name)
+        )
+        patterns = [
+            f"S{season_number:02d}E",
+            f"S{season_number}E",
+            f"{season_number:02d}x",
+            f"{season_number}x",
+        ]
+
+        reference_files = []
+        for pattern in patterns:
+            # Use case-insensitive file extension matching by checking both .srt and .SRT
+            srt_files = list(reference_dir.glob("*.srt")) + list(reference_dir.glob("*.SRT"))
+            files = [f for f in srt_files if re.search(f"{pattern}\\d+", f.name, re.IGNORECASE)]
+            reference_files.extend(files)
+
+        # Remove duplicates while preserving order
+        reference_files = list(dict.fromkeys(reference_files))
+        logger.debug(f"Found {len(reference_files)} reference files for season {season_number}")
+        # Never cache an EMPTY corpus: references can arrive later in this
+        # process's lifetime (retry-subtitles, mid-job download), and a cached
+        # empty hit would mask them for every subsequent match (#370).
+        if reference_files:
+            self.reference_files_cache[cache_key] = reference_files
+        return reference_files
+
+    def _model_config(self) -> dict:
+        """Single source for the ASR model_config dict (keeps both call sites DRY)."""
+        return {
+            "type": "whisper",
+            "name": self.model_name,
+            "device": self.device,
+            "requested_workers": self.requested_workers,
+        }
+
+    def transcribe_full(self, video_file) -> str | None:
+        """Whisper-transcribe the entire video file, returning the cleaned text.
+
+        Returns None when extraction or transcription fails, or when the
+        returned text has fewer than 50 characters (matches the existing
+        _match_full_file guard).
+        """
+        try:
+            duration = get_video_duration(str(video_file))
+        except Exception as e:
+            logger.error(
+                f"transcribe_full: duration lookup failed for {video_file}: {e}",
+                exc_info=True,
+            )
+            return None
+
+        # The full-file wav (tens of MB) is tracked here and removed in the
+        # finally below — mirroring identify_episode's temp_files_to_remove.
+        # On an L1/L2 hit no wav is extracted, so the list stays empty.
+        temp_files: list[str] = []
+        try:
+            # Memoized by (source, 0, duration): the full-file fallback fires once per
+            # candidate season when no chunk votes, so without this the season-unknown
+            # path re-transcribes the ENTIRE file per season — the single biggest cost.
+            # transcribe_chunk_cached layers the persistent L2 store underneath, so a
+            # full-file transcript is also persisted when produced (free at that point)
+            # and survives restarts; nothing prewarms full files. The L1 check stays
+            # first so an in-memory hit doesn't even touch the model loader.
+            full_key = self._transcription_key(video_file, 0, duration)
+            full = self.transcriptions.get(full_key)
+            if full is None:
+                model = get_cached_model(self._model_config())
+                full = self.transcribe_chunk_cached(
+                    video_file, 0, duration, model, temp_files=temp_files
+                )
+        except Exception as e:
+            logger.warning(
+                f"transcribe_full: transcription failed for {video_file}: {e}",
+                exc_info=True,
+            )
+            return None
+        finally:
+            for p in temp_files:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    # Best-effort temp cleanup — a locked wav (e.g. Windows AV
+                    # scan) is reaped on a later run; missing_ok covers ENOENT.
+                    pass
+            # Drop the audio-chunk memo for the wav we just deleted so a future
+            # compute path re-extracts instead of returning a dangling path
+            # (same hygiene as TranscriptionPrewarmer._transcribe_span).
+            if temp_files:
+                self.audio_chunks.pop((self._resolve_source(video_file), 0, duration), None)
+
+        if len(full) < 50:
+            logger.info(f"transcribe_full: too little text ({len(full)} chars) for {video_file}")
+            return None
+        return full
+
+    def _get_tfidf_matcher(
+        self, signature, *, using_precomputed, precomputed=None, reference_files=None
+    ):
+        """Return a prepared TfidfMatcher for ``signature``, building once and caching.
+
+        Replaces the single shared ``self.tfidf_matcher`` slot. Keying by the
+        reference signature preserves the old cross-call reuse while giving each
+        season (each distinct reference set) its OWN matcher — so concurrent
+        identify_episode threads (parallel ASR) never clobber one another's
+        references mid-scan. ``TfidfMatcher.match()`` is read-only, so a cached
+        instance is safe to share across same-season threads.
+
+        ``precomputed`` is ``(ref_matrix, ref_episode_codes, idf_array)`` in
+        precomputed mode; otherwise ``reference_files`` is fitted.
+        """
+        cached = self._tfidf_cache.get(signature)
+        if cached is not None:
+            return cached
+        # Build OUTSIDE the lock so concurrent different-season builds don't
+        # serialize; insert under the lock (double-checked) so each signature
+        # resolves to a single shared instance. A rare duplicate build on a race
+        # is wasteful but correct.
+        tm = TfidfMatcher()
+        if using_precomputed:
+            ref_matrix, ref_episode_codes, idf_array = precomputed
+            tm.load_precomputed(ref_matrix, ref_episode_codes, idf_array)
+        else:
+            tm.prepare(reference_files, self.subtitle_cache)
+        with self._tfidf_cache_lock:
+            existing = self._tfidf_cache.get(signature)
+            if existing is not None:
+                return existing
+            if len(self._tfidf_cache) >= self._max_tfidf_cache:
+                self._tfidf_cache.clear()
+            self._tfidf_cache[signature] = tm
+            return tm
+
+    def _match_full_file(self, video_file, reference_files, tfidf_matcher):
+        """
+        Fallback: matching by transcribing the ENTIRE file.
+        This is resource intensive but necessary if chunk matching fails.
+
+        Model interaction (loading, duration lookup, the layered transcript
+        cache) lives entirely in ``transcribe_full``; this method only matches
+        the resulting text against the references.
+
+        ``tfidf_matcher`` is the per-call matcher already prepared for this season
+        (passed in, not read from shared state, so a concurrent season can't swap
+        the references out from under the fallback). It is rebuilt from
+        ``reference_files`` only as a defensive fallback if somehow unprepared.
+        """
+        logger.warning(f"Starting FULL FILE transcription fallback for {video_file}...")
+
+        full_transcription = self.transcribe_full(video_file)
+        if not full_transcription:
+            logger.warning("Full file transcription yielded too little text.")
+            return None
+
+        logger.info(f"Full transcription complete ({len(full_transcription)} chars). Comparing...")
+
+        best_confidence = 0
+        best_match = None
+
+        # Use the per-call TF-IDF matcher (read-only match(); safe to share).
+        if tfidf_matcher is None or not tfidf_matcher.is_prepared:
+            tfidf_matcher = TfidfMatcher()
+            tfidf_matcher.prepare(reference_files, self.subtitle_cache)
+
+        cleaned_transcription = self.clean_text(full_transcription)
+        tfidf_results = tfidf_matcher.match(cleaned_transcription)
+
+        if tfidf_results:
+            best_rf, best_confidence = tfidf_results[0]
+            best_match = Path(best_rf)
+
+        logger.info(f"Fallback classification complete. Best confidence: {best_confidence:.2f}")
+
+        if best_confidence > self.min_confidence:
+            try:
+                season, episode = extract_season_episode(best_match.stem)
+                return {
+                    "season": season,
+                    "episode": episode,
+                    "confidence": best_confidence,
+                    "reference_file": str(best_match),
+                    "matched_at": 0,
+                    "method": "full_transcription",
+                    "transcript": full_transcription,
+                }
+            except Exception as e:
+                logger.error(f"Error extracting s/e from matched file {best_match}: {e}")
+
+        return None
+
+    def identify_episode(
+        self,
+        video_file,
+        temp_dir,
+        season_number,
+        progress_callback=None,
+        num_points=None,
+        min_vote_count=None,
+    ):
+        """
+        Identify episode using ranked voting with weighted confidence scoring.
+
+        ``num_points`` overrides the number of audio scan points (default 10);
+        the requested count is snapped up to the nearest lattice level
+        (10/19/37/73/145) — see ``canonical_scan_points`` — so the transcript
+        cache can be fully reused between shallow and deep scans. A denser scan
+        yields more robust votes and a clearer score gap — used by the "deep
+        re-match" path to disambiguate conflicts.
+        ``min_vote_count`` overrides the minimum matched-chunk count required to
+        accept a match (default ``self.min_vote_count``).
+
+        Process:
+        1. Extract audio chunks using sparse sampling strategy
+        2. Transcribe each chunk and match against reference subtitles
+        3. Accumulate votes (matches > 0.6 threshold) for each reference episode
+        4. Calculate ranked voting score: weighted average of chunk confidences
+        5. Select episode with highest ranked voting score (threshold: 0.15)
+        6. Fallback to full-file transcription if no confident match
+
+        Ranked voting formula:
+            score = sum(confidence × weight) / sum(weights)
+            where weight = chunk_duration / video_duration
+
+        Args:
+            video_file: Path to MKV file
+            temp_dir: Temporary directory for audio extraction
+            season_number: Season number to search
+            progress_callback: Optional callable(stage: str, percent: float)
+
+        Returns:
+            Dict with season, episode, confidence, score, match_details
+            None if no match found
+
+            match_details includes:
+            - matches_found: int
+            - matches_rejected: int
+            - total_chunks: int
+            - candidate_scores: dict {episode: score}
+        """
+        logger.info(
+            f"[Matcher] identify_episode starting for {video_file} (Season {season_number})"
+        )
+
+        # Cleanup temp files when done
+        temp_files_to_remove = []
+
+        try:
+            if progress_callback:
+                progress_callback("analyzing", 0.0)
+
+            # 1. Get References - shipped precomputed vectors, else scraped SRT
+            precomputed = self._load_precomputed_season(season_number)
+            using_precomputed = precomputed is not None
+
+            # Per-call local, never an instance slot: see precomputed_numbering.
+            # A scraped season has no marker, so this stays None and every later
+            # reader falls back to the runtime size heuristic.
+            numbering = self.precomputed_numbering(season_number) if using_precomputed else None
+
+            if using_precomputed:
+                ref_matrix, ref_episode_codes, idf_array = precomputed
+                reference_files = []  # no SRT files on disk in precomputed mode
+                logger.info(
+                    f"[Matcher] using precomputed subtitle-vector cache for "
+                    f"'{self.show_name}' season {season_number} "
+                    f"({len(ref_episode_codes)} episodes)"
+                )
+            else:
+                reference_files = self.get_reference_files(season_number)
+                if not reference_files:
+                    reference_dir = (
+                        self.cache_dir
+                        / "data"
+                        / corpus_dir_name(self.expected_tmdb_id, self.show_name)
+                    )
+                    logger.error(
+                        f"No reference subtitle files found for '{self.show_name}' "
+                        f"season {season_number}. Expected directory: {reference_dir}. "
+                        f"This usually means subtitle download failed. "
+                        f"Check subtitle download status and retry if needed."
+                    )
+                    return None
+
+            # Resolve the TF-IDF matcher for THIS season's reference set as a
+            # per-call local — never a shared instance slot. The matcher singleton
+            # is shared across concurrent identify_episode threads (parallel ASR),
+            # so a single mutable slot let a sibling thread's season rebuild
+            # clobber this scan's references mid-loop (codes the path-keyed
+            # `coverages` dict doesn't hold → KeyError → zero votes → bogus review).
+            # _get_tfidf_matcher caches per reference signature, so reuse is kept
+            # without the cross-thread races. See test_matcher_concurrency.
+            expected_signature: tuple = (
+                ("precomputed", tuple(ref_episode_codes))
+                if using_precomputed
+                else scraping_reference_signature(reference_files)
+            )
+            tfidf_matcher = self._get_tfidf_matcher(
+                expected_signature,
+                using_precomputed=using_precomputed,
+                precomputed=(ref_matrix, ref_episode_codes, idf_array)
+                if using_precomputed
+                else None,
+                reference_files=reference_files,
+            )
+
+            # The precomputed cache gets the same floor: its builders drop references
+            # that read as empty, so a season built from damaged subtitles can ship
+            # with a single row that wins every vote.
+            if using_precomputed:
+                usable = total = len(ref_episode_codes)
+            else:
+                usable, total = len(tfidf_matcher.ref_file_order), len(reference_files)
+            if usable < MIN_USABLE_REFERENCES:
+                logger.error(
+                    f"Only {usable} of {total} reference subtitles for "
+                    f"'{self.show_name}' season {season_number} contain readable text; "
+                    f"not matching {Path(video_file).name} against them."
+                )
+                return {
+                    "season": season_number,
+                    "episode": None,
+                    "confidence": 0.0,
+                    "score": 0.0,
+                    "match_details": {
+                        "error": REFERENCES_UNREADABLE_ERROR_CODE,
+                        "usable_references": usable,
+                        "total_references": total,
+                    },
+                    "runner_ups": [],
+                }
+
+            if progress_callback:
+                progress_callback("analyzing", 5.0)
+
+            # 2. Get Video Duration
+            try:
+                video_duration = get_video_duration(str(video_file))
+            except Exception as e:
+                logger.error(f"Failed to get video duration for {video_file}: {e}")
+                return None
+
+            # 3. Initialize Coverages
+            coverages = {}
+            if using_precomputed:
+                # No SRT durations are shipped; assume reference duration == video
+                # duration for penalty-free coverage (same as the ref_dur==0 fallback).
+                for code in ref_episode_codes:
+                    coverages[code] = MatchCoverage(code, video_duration, video_duration)
+            else:
+                ref_durations = {}
+                for rf in reference_files:
+                    try:
+                        content = self.subtitle_cache.get_subtitle_content(rf)
+                        ref_durations[str(rf)] = SubtitleReader.get_duration(content)
+                    except Exception as e:
+                        logger.warning(f"Could not get duration for reference {rf}: {e}")
+                        ref_durations[str(rf)] = 0.0
+
+                for rf in reference_files:
+                    ref_dur = ref_durations.get(str(rf), video_duration)
+                    # Missing ref duration -> assume video duration for penalty-free matching
+                    if ref_dur == 0:
+                        ref_dur = video_duration
+
+                    ep_name = Path(rf).stem
+                    coverages[str(rf)] = MatchCoverage(ep_name, ref_dur, video_duration)
+
+            # 5. Scan Chunks - Canonical Nested Lattice
+            # Offsets come from canonical_scan_points so a shallow scan is a strict
+            # subset of any deeper re-match (transcript-cache reuse across depths).
+
+            chunk_len = 30
+            skip_initial = self.skip_initial_duration  # 90s - skip opening title cards
+
+            # TF-IDF matching is fast (~1ms/query) and accurate. More sample
+            # points reduce false positives from commentary/alternate audio tracks.
+            # Caller may request a denser scan (deep re-match) for disambiguation;
+            # canonical_scan_points handles None/<2 (default 10) and level snapping.
+            scan_points = canonical_scan_points(
+                video_duration,
+                skip_initial=skip_initial,
+                chunk_len=chunk_len,
+                num_points=num_points,
+            )
+
+            model_config = self._model_config()
+            model = get_cached_model(model_config)
+            # L2 transcript-cache identity, computed ONCE per call (one stat, one
+            # key derivation) and passed into every chunk lookup below.
+            l2_file_key = transcript_store.file_key_for(video_file)
+            l2_model_key = self._model_key_for(model)
+
+            if progress_callback:
+                progress_callback("preparing_model", 10.0)
+
+            span = f"{scan_points[0]}s-{scan_points[-1]}s" if scan_points else "empty"
+            logger.info(
+                f"Scanning {len(scan_points)} chunks using {model_config['name']} + TF-IDF "
+                f"matching (canonical lattice, span {span})"
+            )
+            logger.debug(
+                f"Scan points: {scan_points[:5]}... {scan_points[-3:]} (showing first 5 and last 3)"
+            )
+
+            matches_found_count = 0  # Total matched chunks
+            matches_rejected_count = 0  # Total rejected chunks
+
+            for i, start_time in enumerate(scan_points, 1):
+                # Calculate progress: 10% to 90% allocated for scanning
+                scan_percent = 10.0 + (i / len(scan_points)) * 80.0
+
+                try:
+                    # Transcribe through the layered cache (L1 dict → L2 SQLite →
+                    # Whisper). On a hit (a later candidate season re-scanning the
+                    # same file, or a re-match after a restart) we skip both ffmpeg
+                    # extraction and Whisper — only the ~1ms TF-IDF match below
+                    # re-runs. The wav is appended to temp_files_to_remove only
+                    # when actually extracted (compute path).
+                    text = self.transcribe_chunk_cached(
+                        video_file,
+                        start_time,
+                        chunk_len,
+                        model,
+                        file_key=l2_file_key,
+                        model_key=l2_model_key,
+                        temp_files=temp_files_to_remove,
+                    )
+
+                    if len(text) < 10:
+                        logger.debug(
+                            f"Chunk {i}/{len(scan_points)} @ {start_time}s: transcription too short ({len(text)} chars), skipping"
+                        )
+                        matches_rejected_count += 1
+                        if progress_callback:
+                            progress_callback("transcribing", scan_percent)
+                        continue
+
+                    logger.debug(
+                        f"Chunk {i}/{len(scan_points)} @ {start_time}s: transcribed {len(text)} chars, matching via TF-IDF..."
+                    )
+
+                    # TF-IDF cosine similarity against full episode texts. The
+                    # chunk-vs-full-episode cosine is structurally low even for a
+                    # perfect match, so vote on rank+margin rather than an absolute
+                    # cosine gate (see select_chunk_vote). One vote per chunk: its
+                    # clearly-leading top episode, or none.
+                    tfidf_results = tfidf_matcher.match(text)
+                    vote = select_chunk_vote(
+                        tfidf_results,
+                        floor=self.chunk_vote_floor,
+                        ratio=self.chunk_vote_margin_ratio,
+                    )
+
+                    if vote is not None:
+                        rf_str, score = vote
+                        coverages[rf_str].add_match(start_time, chunk_len, score)
+                        matches_found_count += 1
+                        logger.debug(
+                            f"  {Path(rf_str).stem}: VOTE @ video={start_time}s "
+                            f"(cosine={score:.3f}, clear margin over runner-up)"
+                        )
+                    else:
+                        matches_rejected_count += 1
+                        if tfidf_results:
+                            top_ref, top_score = tfidf_results[0]
+                            runner = tfidf_results[1][1] if len(tfidf_results) > 1 else 0.0
+                            logger.debug(
+                                f"Chunk {i}/{len(scan_points)} @ {start_time}s: no clear vote "
+                                f"(top {Path(top_ref).stem}={top_score:.3f}, "
+                                f"runner-up={runner:.3f})"
+                            )
+
+                except Exception as e:
+                    logger.warning(
+                        f"Error processing chunk {i}/{len(scan_points)} at {start_time}s: {e}"
+                    )
+                    matches_rejected_count += 1
+                    if progress_callback:
+                        progress_callback("transcribing", scan_percent)
+                    continue
+
+                # Build interim vote standings after each chunk
+                if progress_callback:
+                    interim_standings = []
+                    for _rf_str_cov, cov in coverages.items():
+                        if cov.matched_chunks:
+                            ep_season, ep_episode = extract_season_episode(cov.episode_name)
+                            interim_standings.append(
+                                {
+                                    "episode": f"S{ep_season:02d}E{ep_episode:02d}",
+                                    "score": cov.ranked_voting_score,
+                                    "vote_count": len(cov.matched_chunks),
+                                    "target_votes": len(scan_points),
+                                }
+                            )
+                    interim_standings.sort(key=lambda x: x["score"], reverse=True)
+                    progress_callback("matching", scan_percent, interim_standings[:5])
+
+            logger.info(
+                f"Sparse sampling complete: {matches_found_count} matched / {matches_rejected_count} rejected chunks"
+            )
+
+            # 6. Evaluate Results using Ranked Voting
+            # Each reference episode accumulates weighted votes from matched chunks.
+            # Winner: highest weighted consensus score (not just highest single match).
+            best_score = 0
+            best_match = None
+
+            results_summary = []
+
+            for rf_str, cov in coverages.items():
+                # Select scoring method based on configuration
+                if self.use_ranked_voting:
+                    score = cov.ranked_voting_score
+                else:
+                    score = cov.weighted_score  # Legacy method for comparison
+
+                season, episode = extract_season_episode(cov.episode_name)
+
+                match_info = {
+                    "episode": f"S{season}E{episode}",
+                    "score": score,
+                    "ranked_score": cov.ranked_voting_score,
+                    "avg_conf": cov.avg_confidence,
+                    "file_cov": cov.file_coverage,
+                    "vote_count": len(cov.matched_chunks),
+                    "target_votes": len(scan_points),
+                    "total_weight": cov.total_vote_weight,
+                }
+                results_summary.append(match_info)
+
+                if score > best_score:
+                    best_score = score
+                    best_match = {
+                        "season": season,
+                        "episode": episode,
+                        "confidence": score,  # Use ranked voting score as confidence
+                        "score": score,
+                        "reference_file": rf_str,
+                        "matched_at": cov.matched_chunks[0]["start"] if cov.matched_chunks else 0,
+                        "match_details": match_info,
+                        "voting_details": cov.get_voting_details(),
+                    }
+
+            # Prepare detailed stats for return
+            # Positional vote runs: a track holding two conjoined ~11-minute
+            # segments votes for E01 across the first half and E02 across the
+            # second, with the seam chunk abstaining. coverages already carries
+            # every vote's timestamp, so this costs no extra transcription.
+            # extract_season_episode returns (None, None) for a reference name it
+            # cannot parse, so filter before formatting: an unguarded
+            # "S{:02d}".format(None) raises ValueError and would abort the match.
+            positional_votes: list[tuple[float, str]] = []
+            for cov in coverages.values():
+                cov_season, cov_episode = extract_season_episode(cov.episode_name)
+                if cov_season is None or cov_episode is None:
+                    continue
+                cov_code = f"S{cov_season:02d}E{cov_episode:02d}"
+                positional_votes.extend((c["start"], cov_code) for c in cov.matched_chunks)
+
+            multi_verdict = decompose_vote_runs(positional_votes, len(scan_points))
+            multi_detail = multi_verdict.to_dict()
+
+            # decompose_vote_runs normalizes against the VOTED span, so a stretch
+            # of the file that never voted is invisible to it (a third segment
+            # missing from the TMDB reference set, say). Record the unexplained
+            # SCANNED head and tail here (scan_points[0]/[-1] sit inside the file,
+            # not at its true start/end — skip_initial trims the head and the last
+            # scan point sits before EOF, so this measures the un-voted portion of
+            # the scanned range, not the whole file), where the scan offsets are in
+            # scope, so a reviewer looking at a two-code suggestion for a
+            # three-segment file has a signal that something is unaccounted for.
+            # Under-listing is otherwise silent: a short code list looks complete.
+            if positional_votes and scan_points:
+                multi_detail["head_gap_seconds"] = round(
+                    min(v[0] for v in positional_votes) - scan_points[0], 1
+                )
+                multi_detail["tail_gap_seconds"] = round(
+                    scan_points[-1] - max(v[0] for v in positional_votes), 1
+                )
+
+            if multi_verdict.is_multi_episode:
+                logger.info(
+                    f"[Matcher] {video_file}: chunk votes describe "
+                    f"{len(multi_verdict.runs)} conjoined episodes "
+                    f"{multi_verdict.codes}, routing to review"
+                )
+
+            match_stats = {
+                "matches_found": matches_found_count,
+                "matches_rejected": matches_rejected_count,
+                "total_chunks": len(scan_points),
+                "multi_episode": multi_detail,
+                # How many episodes the corpus claims for this season. Recorded on
+                # every result, not just the refusal path above, because callers
+                # need it to tell whether the corpus is numbered like the TMDB
+                # roster: a segment-format show has a 13-entry half-hour corpus
+                # against a 38-entry segment roster, and a code from the former
+                # must not be read as a coordinate in the latter.
+                "reference_count": total,
+            }
+            stamp_numbering(match_stats, numbering)
+
+            if best_match:
+                # Merge stats into match_details before calibration so the helper
+                # operates on the full per-winner detail dict.
+                best_match["match_details"].update(match_stats)
+
+                # Sort candidates so the calibrator sees top1/top2 in order, then
+                # translate the raw signals into a 0-1 reviewer-facing confidence
+                # and build the runner-up leaderboard. This sets
+                # best_match["confidence"] (calibrated, -> DiscTitle.match_confidence)
+                # while leaving best_match["score"] raw for the accept-gate and
+                # conflict resolution. All candidates (incl. the winner) appear in
+                # runner_ups so the UI can show the full leaderboard. See
+                # calibrate_confidence for rationale.
+                results_summary.sort(key=lambda x: x["score"], reverse=True)
+                _attach_calibrated_confidence(best_match, results_summary, video_duration)
+
+                score_gap = best_match["match_details"].get("score_gap", 0.0)
+
+                # Log top candidates with voting + calibration analysis
+                voting_method = "ranked voting" if self.use_ranked_voting else "weighted score"
+                logger.info(f"{voting_method.capitalize()} results for {video_file.name}:")
+                logger.info(
+                    f"  Calibrated confidence: {best_match['confidence']:.3f} "
+                    f"(raw score={best_match['score']:.3f}, "
+                    f"score_gap={score_gap:.4f} "
+                    f"{'decisive' if score_gap > 0.01 else 'LOW-uncertain'})"
+                )
+
+                for i, result in enumerate(results_summary[:5], 1):
+                    logger.info(
+                        f"  {i}. {result['episode']}: "
+                        f"score={result['score']:.3f}, "
+                        f"votes={result['vote_count']}, "
+                        f"avg_conf={result['avg_conf']:.3f}, "
+                        f"coverage={result['file_cov']:.1%}, "
+                        f"total_weight={result['total_weight']:.4f}"
+                    )
+
+                effective_min_votes = (
+                    min_vote_count if min_vote_count is not None else self.min_vote_count
+                )
+
+                # Accept when EITHER the raw mean-cosine clears match_threshold OR
+                # the calibrated confidence clears confidence_accept_floor — both
+                # with enough votes. The raw-score path is kept as an OR, so this
+                # only ever accepts MORE than before (never rejects a prior accept).
+                # The calibrated path rescues correct, decisive matches whose raw
+                # cosine sits structurally ~0.1 (e.g. True Detective S1E5/S1E7) from
+                # the expensive — and sometimes worse — full-file fallback.
+                vote_count = best_match["match_details"]["vote_count"]
+                calibrated = best_match.get("confidence", 0.0)
+                score_ok = best_match["score"] > self.match_threshold
+                confidence_ok = calibrated >= self.confidence_accept_floor
+                votes_ok = vote_count >= effective_min_votes
+
+                logger.info(
+                    f"Best match evaluation: "
+                    f"score {best_match['score']:.3f} vs threshold {self.match_threshold}, "
+                    f"calibrated {calibrated:.3f} vs floor {self.confidence_accept_floor}, "
+                    f"votes {vote_count} vs minimum {effective_min_votes}"
+                )
+
+                if (score_ok or confidence_ok) and votes_ok:
+                    accept_via = "raw score" if score_ok else "calibrated confidence"
+                    logger.info(
+                        f"Ranked voting match: S{best_match['season']:02d}E{best_match['episode']:02d} "
+                        f"(via {accept_via}; score={best_match['score']:.3f}, "
+                        f"confidence={calibrated:.3f}, votes={vote_count})"
+                    )
+                    return best_match
+
+                if (score_ok or confidence_ok) and not votes_ok:
+                    logger.warning(
+                        f"⚠ Match rejected: insufficient evidence. "
+                        f"Episode: {best_match['match_details']['episode']}, "
+                        f"score: {best_match['score']:.3f}, confidence: {calibrated:.3f}, "
+                        f"votes: {vote_count}/{effective_min_votes}, "
+                        f"coverage: {best_match['match_details']['file_cov']:.1%}, "
+                        f"matched_at: {best_match['matched_at']}s"
+                    )
+                    # Fall through to fallback
+                # else: neither raw score nor calibrated confidence cleared —
+                # fall through to fallback.
+            else:
+                # Zero chunks cleared the rank+margin vote gate. Crucially, do NOT
+                # early-return episode=None here: the chunk cosine scale is
+                # structurally low, while the full-file fallback compares
+                # whole-vs-whole on a higher, properly-calibrated scale. Falling
+                # through reaches it. (Historically the early return made that
+                # fallback dead code in exactly the total-miss case it exists for.)
+                logger.warning(
+                    f"No chunks cleared the vote gate for {video_file}; "
+                    f"attempting full-file fallback"
+                )
+
+            # --- FALLBACK ---
+            # Full-file fallback when chunk voting produced no acceptable match
+            # (no votes at all, score below threshold, or too few votes).
+            # Reached on any non-accept: low raw score, low calibrated confidence,
+            # too few votes, OR zero voting chunks (best_match is None here). State
+            # what an accept NEEDED rather than asserting which gate failed — the
+            # blocker may be votes alone even though score/confidence cleared.
+            logger.info(
+                f"Ranked voting produced no acceptable match "
+                f"(best score {best_score:.3f}; needed raw score > {self.match_threshold} "
+                f"or calibrated confidence ≥ {self.confidence_accept_floor}, with enough votes). "
+                f"Attempting FULL FILE fallback..."
+            )
+            match = self._match_full_file(video_file, reference_files, tfidf_matcher)
+
+            if match:
+                # Intentional exception to calibration: the full-file fallback
+                # compares whole transcription vs whole subtitle ("bucket vs
+                # bucket"), so its cosine lands on a higher scale than chunk
+                # cosines and is already > min_confidence by construction. We pass
+                # it through uncalibrated; curator's review gate reads it directly.
+                match["score"] = match[
+                    "confidence"
+                ]  # Full file score is just confidence (coverage=1.0)
+                match["match_details"] = {
+                    "method": "full_transcription",
+                    "score": match["confidence"],
+                }
+                return match
+
+            # Nothing matched, even via the fallback. Return the no-episode result
+            # with scan stats preserved (not a bare None) so the UI/diagnostics
+            # show what was attempted.
+            logger.warning(f"No episode matches found for {video_file}")
+            return {
+                "season": season_number,
+                "episode": None,
+                "confidence": 0.0,
+                "score": 0.0,
+                "match_details": match_stats,
+                "runner_ups": [],
+            }
+
+        except Exception as e:
+            logger.error(
+                f"Unexpected error during episode identification for {video_file}: {e}",
+                exc_info=True,
+            )
+            return None
+
+        finally:
+            # Cleanup temp files
+            for p in temp_files_to_remove:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            # Also clean cached chunks
+            self.audio_chunks.clear()
+
+
+def get_video_duration(video_file, _retries: int = 6, _retry_delay: float = 5.0):
+    """Get video duration using ffprobe, with retry on Windows file-lock errors.
+
+    Retries up to `_retries` times with `_retry_delay` seconds between attempts,
+    to handle the window where MakeMKV has finished writing but still holds the
+    file handle open (causing PermissionError / EACCES in ffprobe on Windows).
+    """
+    last_error = None
+    for attempt in range(1, _retries + 1):
+        try:
+            logger.debug(
+                f"Getting duration for video file: {video_file} (attempt {attempt}/{_retries})"
+            )
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(video_file),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode != 0:
+                error_msg = f"ffprobe failed with return code {result.returncode}"
+                if result.stderr:
+                    error_msg += f". Error: {result.stderr.strip()}"
+                # Retry on permission-related errors (Windows file lock)
+                if "Permission denied" in (result.stderr or "") and attempt < _retries:
+                    logger.warning(
+                        f"[MATCH] ffprobe permission denied for {video_file}, "
+                        f"retrying in {_retry_delay}s (attempt {attempt}/{_retries})..."
+                    )
+                    time.sleep(_retry_delay)
+                    last_error = RuntimeError(error_msg)
+                    continue
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+            duration_str = result.stdout.strip()
+            if not duration_str:
+                raise RuntimeError("ffprobe returned empty duration")
+
+            duration = float(duration_str)
+            if duration <= 0:
+                raise RuntimeError(f"Invalid duration: {duration}")
+
+            result_duration = int(np.ceil(duration))
+            logger.debug(f"Video duration: {result_duration} seconds")
+            return result_duration
+
+        except subprocess.TimeoutExpired as e:
+            error_msg = f"ffprobe timed out while getting duration for {video_file}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+        except ValueError as e:
+            error_msg = f"Failed to parse duration from ffprobe output for {video_file}: {e}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+        except RuntimeError:
+            raise
+        except Exception as e:
+            error_msg = f"Unexpected error getting video duration for {video_file}: {e}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
+    # All retries exhausted
+    raise last_error or RuntimeError(
+        f"Failed to get duration for {video_file} after {_retries} attempts"
+    )
+
+
+def detect_file_encoding(file_path):
+    """
+    Detect the encoding of a file using chardet.
+
+    Args:
+        file_path (str or Path): Path to the file
+
+    Returns:
+        str: Detected encoding, defaults to 'utf-8' if detection fails
+    """
+    try:
+        with open(file_path, "rb") as f:
+            raw_data = f.read(min(1024 * 1024, Path(file_path).stat().st_size))  # Read up to 1MB
+        result = chardet.detect(raw_data)
+        encoding = result["encoding"]
+        confidence = result["confidence"]
+
+        logger.debug(
+            f"Detected encoding {encoding} with {confidence:.2%} confidence for {file_path}"
+        )
+        return encoding if encoding else "utf-8"
+    except Exception as e:
+        logger.warning(f"Error detecting encoding for {file_path}: {e}")
+        return "utf-8"
+
+
+def read_file_with_fallback(file_path, encodings=None):
+    """
+    Read a file trying multiple encodings in order of preference.
+
+    Results are memoized per (path, mtime): a subtitle replaced in place during
+    a long-running session is re-read rather than served from the cache built
+    off the previous bytes. An explicit ``encodings`` list bypasses the memo
+    (lists are unhashable, and it is not the hot path).
+
+    Args:
+        file_path (str or Path): Path to the file
+        encodings (list): List of encodings to try, defaults to common subtitle encodings
+
+    Returns:
+        str: File contents
+
+    Raises:
+        ValueError: If file cannot be read with any encoding
+    """
+    if encodings is not None:
+        return _read_file_uncached(file_path, encodings)
+    return _read_file_cached(str(file_path), _file_version(file_path))
+
+
+@lru_cache(maxsize=100)
+def _read_file_cached(file_path, version):
+    """Memoized read keyed by path AND ``version`` (the file's mtime)."""
+    return _read_file_uncached(file_path, None)
+
+
+def _read_file_uncached(file_path, encodings):
+    file_path = Path(file_path)
+    if encodings is None:
+        # A UTF-16 byte-order mark settles the encoding. Decoding it leniently here,
+        # instead of through detection, keeps the matcher in agreement with
+        # is_valid_srt_file on UTF-16 files that carry a stray trailing byte.
+        bom_text = decode_utf16_bom(file_path.read_bytes())
+        if bom_text is not None:
+            logger.debug(f"Successfully read {file_path} as UTF-16 (byte-order mark)")
+            return bom_text
+        # First try detected encoding, then fallback to common subtitle encodings
+        detected = detect_file_encoding(file_path)
+        encodings = [detected, "utf-8", "latin-1", "cp1252", "iso-8859-1"]
+
+    errors = []
+
+    for encoding in encodings:
+        try:
+            with open(file_path, encoding=encoding) as f:
+                content = f.read()
+            logger.debug(f"Successfully read {file_path} using {encoding} encoding")
+            return content
+        except UnicodeDecodeError as e:
+            errors.append(f"{encoding}: {str(e)}")
+            continue
+
+    error_msg = f"Failed to read {file_path} with any encoding. Errors:\n" + "\n".join(errors)
+    logger.error(error_msg)
+    raise ValueError(error_msg)
+
+
+class SubtitleReader:
+    """Helper class for reading and parsing subtitle files."""
+
+    @staticmethod
+    def parse_timestamp(timestamp):
+        """Parse SRT timestamp into seconds."""
+        hours, minutes, seconds = timestamp.replace(",", ".").split(":")
+        return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+
+    @staticmethod
+    def read_srt_file(file_path):
+        """
+        Read an SRT file and return its contents with robust encoding handling.
+
+        Args:
+            file_path (str or Path): Path to the SRT file
+
+        Returns:
+            str: Contents of the SRT file
+        """
+        return read_file_with_fallback(file_path)
+
+    @staticmethod
+    def extract_subtitle_chunk(content, start_time, end_time):
+        """
+        Extract subtitle text for a specific time window.
+
+        Args:
+            content (str): Full SRT file content
+            start_time (float): Chunk start time in seconds
+            end_time (float): Chunk end time in seconds
+
+        Returns:
+            list: List of subtitle texts within the time window
+        """
+        text_lines = []
+        for cue in iter_srt_cues(content):
+            if not cue.lines or cue.end < start_time or cue.start > end_time:
+                continue
+            text = cue.text
+            # Skip watermark/ad blocks (URLs, credit lines, etc.)
+            if _is_watermark_block(text, list(cue.lines), cue.start):
+                logger.debug(f"Filtered watermark/ad block at {cue.start:.1f}s: {text[:80]}")
+                continue
+            text_lines.append(text)
+        return text_lines
+
+    @staticmethod
+    def get_duration(content):
+        """
+        Get the duration of the subtitle file (max end timestamp across all cues).
+
+        Uses max() instead of the last cue because some subtitle files have
+        watermark/ad blocks appended at the end with timestamps near 0:00,
+        which would incorrectly report the duration as ~2 seconds.
+
+        Args:
+            content (str): Full SRT file content
+
+        Returns:
+            float: Duration in seconds, or 0 if parsing fails
+        """
+        try:
+            return max((cue.end for cue in iter_srt_cues(content)), default=0.0)
+        except Exception as e:
+            logger.warning(f"Error getting duration from subtitle content: {e}")
+            return 0.0
+
+
+# Note: Model caching is now handled by the ASR abstraction layer in asr_models.py

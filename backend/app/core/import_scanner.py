@@ -1,0 +1,351 @@
+"""Recursive scanner for manual media import.
+
+Given a folder (or a single .mkv file) chosen by the user, walk the tree, find
+every .mkv at any depth, and group the files into import units keyed by
+(show, season). Intermediate folders that are not "Season NN" (for example
+"Disc 1") are transparent: we recurse through them and roll their files up into
+the inferred season.
+
+This is the single source of truth for which files belong to which import job,
+so the preview and the actual import are always consistent. Pure and
+synchronous; callers run it via asyncio.to_thread. No network calls.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# Matches "Season 1", "season 01", "Season 12", etc. (mirrors the old watcher).
+_SEASON_RE = re.compile(r"^[Ss]eason\s*0*(\d+)$")
+
+# Matches "Disc 1", "disc 02", etc. Disc folders are transparent grouping levels,
+# not shows, so a "Show / Disc N / *.mkv" layout resolves to one show, not many.
+_DISC_RE = re.compile(r"^[Dd]isc\s*0*\d+$")
+
+# Matches a show folder whose name also carries the season, as an external rip is
+# commonly named: "Psych Season 3", "Psych - S03", "PSYCH_S3_D1" (underscores are
+# already spaces by the time this runs). A season keyword is required, so a title
+# that merely ends in a number ("Babylon 5") is left alone, and the show part must
+# be non-empty, so a bare "Season 4" still takes the picked-season path (#667).
+_SHOW_SEASON_SUFFIX_RE = re.compile(
+    r"^(?P<show>.*?\S)[\s.-]+(?:season|series|s)\s*0*(?P<season>\d{1,2})"
+    r"(?:[\s.-]+(?:disc|d)\s*0*\d+)?$",
+    re.IGNORECASE,
+)
+
+# A directory holding one of these is a disc backup, not a folder of media.
+_DISC_IMAGE_MARKERS = ("BDMV", "VIDEO_TS")
+
+# Bound the walk so a user pointing at a huge tree (or a symlink loop) can't
+# hang the request. Surfaced as ImportScan.truncated when hit.
+_MAX_FILES = 5000
+_MAX_DEPTH = 12
+
+# Bound the best-effort size sum for a single disc image. A real BDMV/VIDEO_TS
+# backup has at most a few hundred entries (stat() is O(1) regardless of the
+# multi-GB size of each stream file), so this never triggers on a genuine
+# single-disc backup. It exists only to stop a pathological/misidentified tree
+# (e.g. a "BDMV" folder someone nested other data under) from turning an
+# interactive folder-picker scan into a slow recursive walk. When the cap is
+# hit we stop early and return the partial sum rather than blocking.
+_MAX_DISC_IMAGE_SIZE_ENTRIES = 2000
+
+
+@dataclass
+class ImportUnit:
+    show_name: str | None
+    season: int | None
+    files: list[Path]
+    total_bytes: int
+
+
+@dataclass
+class DiscImageUnit:
+    """A disc backup folder or ISO file, to be scanned and extracted by MakeMKV."""
+
+    path: Path
+    name: str
+    kind: str  # "backup" | "iso"
+    total_bytes: int
+
+
+def is_disc_image_dir(path: Path) -> bool:
+    """Whether this directory is a MakeMKV disc backup."""
+    try:
+        return any((path / marker).is_dir() for marker in _DISC_IMAGE_MARKERS)
+    except OSError:
+        return False
+
+
+def _dir_size_bounded(root: Path) -> int:
+    """Best-effort recursive size of a directory, capped to stay interactive.
+
+    See _MAX_DISC_IMAGE_SIZE_ENTRIES for why this is bounded rather than a
+    plain recursive sum.
+    """
+    total = 0
+    count = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for entry in entries:
+            if count >= _MAX_DISC_IMAGE_SIZE_ENTRIES:
+                return total
+            count += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+@dataclass
+class ImportScan:
+    root: Path
+    units: list[ImportUnit]
+    loose_files: list[Path]
+    total_files: int
+    total_bytes: int
+    truncated: bool = False
+    # Disc backup folders (BDMV/VIDEO_TS) and .iso files found in the tree. These
+    # are scanned and extracted through the normal pipeline rather than filed, so
+    # they are kept separate from `units` (which are ready-made MKVs to move).
+    disc_images: list[DiscImageUnit] = field(default_factory=list)
+    # True when the picked folder is a single title (holds media / Season / Disc
+    # directly) rather than a parent-of-shows/library folder. Drives in-place
+    # organize layout: a single-title pick organizes next to itself, not under a
+    # spurious TV/ or Movies/ subdir created inside the title folder.
+    picked_is_show: bool = False
+    # True when the picked folder is itself a "Season NN" folder. The show then
+    # comes from its parent and the season from its own name. Drives in-place
+    # organize: the canonical "Show (Year)/Season XX" is recreated under the
+    # season folder's grandparent (the show's parent), not inside the season folder.
+    picked_is_season: bool = False
+
+
+def _clean_show(name: str) -> str:
+    """Light cleanup of a folder name for use as a show title (keeps any year)."""
+    cleaned = re.sub(r"\s+", " ", name.replace("_", " ")).strip()
+    return cleaned or name
+
+
+def _split_show_season(name: str) -> tuple[str, int | None]:
+    """Clean a show folder name and split off a trailing season, if it has one.
+
+    "Psych Season 3" -> ("Psych", 3); "Seinfeld" -> ("Seinfeld", None). The
+    season is a fallback: an explicit "Season NN" folder below it wins.
+    """
+    cleaned = _clean_show(name)
+    m = _SHOW_SEASON_SUFFIX_RE.match(cleaned)
+    if not m:
+        return cleaned, None
+    return m.group("show"), int(m.group("season"))
+
+
+def _safe_size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def _safe_dirs(p: Path) -> list[Path]:
+    out: list[Path] = []
+    try:
+        for entry in os.scandir(p):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    out.append(Path(entry.path))
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return out
+
+
+def _season_from_path(file: Path, root: Path) -> int | None:
+    """Season from the nearest 'Season NN' ancestor of file under root, else None."""
+    try:
+        rel_parts = file.relative_to(root).parts
+    except ValueError:
+        rel_parts = file.parts
+    for part in reversed(rel_parts[:-1]):  # exclude the filename itself
+        m = _SEASON_RE.match(part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _iter_mkvs(root: Path) -> tuple[list[Path], list[DiscImageUnit], bool]:
+    """Recursively collect .mkv files under root, bounded by count and depth.
+
+    Skips symlinked directories and any file whose resolved path escapes root,
+    so a crafted symlink cannot surface outside files or cause a loop. A
+    directory that is itself a disc backup (BDMV/VIDEO_TS) is recorded as a
+    DiscImageUnit and NOT descended into: that short-circuit is what keeps a
+    backup's thousands of stream files out of the _MAX_FILES budget. A file
+    with a .iso suffix is likewise recorded as a DiscImageUnit rather than
+    skipped.
+    """
+    found: list[Path] = []
+    disc_images: list[DiscImageUnit] = []
+    truncated = False
+    root_resolved = root.resolve()
+
+    def walk(d: Path, depth: int) -> None:
+        nonlocal truncated
+        if truncated:
+            return
+        if depth > _MAX_DEPTH:
+            truncated = True
+            return
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            return
+        for entry in entries:
+            if len(found) >= _MAX_FILES:
+                truncated = True
+                return
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    p = Path(entry.path)
+                    if is_disc_image_dir(p):
+                        disc_images.append(DiscImageUnit(p, p.name, "backup", _dir_size_bounded(p)))
+                        continue
+                    walk(p, depth + 1)
+                elif entry.is_file(follow_symlinks=False):
+                    p = Path(entry.path)
+                    name_lower = entry.name.lower()
+                    if name_lower.endswith(".iso"):
+                        disc_images.append(DiscImageUnit(p, p.name, "iso", _safe_size(p)))
+                        continue
+                    if not name_lower.endswith(".mkv"):
+                        continue
+                    try:
+                        if not p.resolve().is_relative_to(root_resolved):
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                    found.append(p)
+            except OSError:
+                continue
+
+    walk(root, 0)
+    return found, disc_images, truncated
+
+
+def scan(path: Path) -> ImportScan:
+    """Scan a folder or single .mkv file into import units."""
+    path = Path(path).expanduser()
+
+    # Single-file target: one flat unit; show derived from the parent folder.
+    if path.is_file():
+        if path.suffix.lower() == ".iso":
+            size = _safe_size(path)
+            image = DiscImageUnit(path, path.name, "iso", size)
+            return ImportScan(path.parent, [], [], 0, 0, False, disc_images=[image])
+        if path.suffix.lower() != ".mkv":
+            return ImportScan(path.parent, [], [], 0, 0, False)
+        size = _safe_size(path)
+        show, season = _split_show_season(path.parent.name)
+        unit = ImportUnit(show, season, [path], size)
+        return ImportScan(path.parent, [unit], [], 1, size, False, picked_is_show=True)
+
+    root = path
+
+    # The picked folder is itself a disc backup: it's a single disc image, not
+    # a folder of MKVs to walk.
+    if is_disc_image_dir(root):
+        size = _dir_size_bounded(root)
+        image = DiscImageUnit(root, root.name, "backup", size)
+        return ImportScan(root, [], [], 0, 0, False, disc_images=[image])
+
+    # Third identity case: the user navigated INTO a "Season NN" folder and picked
+    # it directly. Neither the "picked folder is a show" nor the "picked folder is
+    # a parent of shows" branch fits: the show is the folder's parent, and the
+    # season is the folder's own name. Without this, show_for() returns the season
+    # folder name ("Season 4") and _season_from_path() returns None (the season
+    # segment is the root, which it excludes).
+    picked_season_match = _SEASON_RE.match(root.name)
+    picked_season = int(picked_season_match.group(1)) if picked_season_match else None
+
+    files, disc_images, truncated = _iter_mkvs(root)
+
+    immediate_dirs = _safe_dirs(root)
+    has_loose_top = any(f.parent == root for f in files)
+    has_season_top = any(_SEASON_RE.match(d.name) for d in immediate_dirs)
+    has_disc_top = any(_DISC_RE.match(d.name) for d in immediate_dirs)
+
+    # The picked folder IS a single show when it directly holds media, season
+    # folders, or disc folders. Only when its immediate children are none of
+    # those do we treat each child as a separate show (a parent-of-shows folder).
+    picked_is_show = has_loose_top or has_season_top or has_disc_top
+
+    # Loose top-level files beside structured season folders are ambiguous; report
+    # them rather than silently merging (preserves the old data-loss safeguard).
+    loose_files: list[Path] = []
+    structured = files
+    if has_season_top and has_loose_top:
+        loose_files = sorted(f for f in files if f.parent == root)
+        structured = [f for f in files if f.parent != root]
+
+    def show_for(file: Path) -> tuple[str | None, int | None]:
+        """The file's show, plus any season carried in the show folder's name."""
+        if picked_season is not None:
+            # A "Season NN" folder at the filesystem root has no parent name; fall
+            # back to None (the unresolved-show sentinel) rather than persisting "".
+            show, _ = _split_show_season(root.parent.name)
+            return show or None, None
+        if picked_is_show:
+            return _split_show_season(root.name)
+        try:
+            rel = file.relative_to(root)
+        except ValueError:
+            return _split_show_season(root.name)
+        return _split_show_season(rel.parts[0] if len(rel.parts) > 1 else root.name)
+
+    groups: dict[tuple[str | None, int | None], list[Path]] = defaultdict(list)
+    for f in structured:
+        show, suffix_season = show_for(f)
+        # Most specific first: a "Season NN" folder under the show, then the
+        # picked season folder itself, then the season in the show folder's name.
+        season = _season_from_path(f, root)
+        if season is None:
+            season = picked_season
+        if season is None:
+            season = suffix_season
+        groups[(show, season)].append(f)
+
+    units: list[ImportUnit] = []
+    for (show, season), unit_files in sorted(
+        groups.items(),
+        key=lambda kv: (str(kv[0][0]), kv[0][1] if kv[0][1] is not None else -1),
+    ):
+        ordered = sorted(unit_files)
+        units.append(ImportUnit(show, season, ordered, sum(_safe_size(f) for f in ordered)))
+
+    total_files = len(structured) + len(loose_files)
+    total_bytes = sum(u.total_bytes for u in units) + sum(_safe_size(f) for f in loose_files)
+    return ImportScan(
+        root,
+        units,
+        loose_files,
+        total_files,
+        total_bytes,
+        truncated,
+        disc_images=disc_images,
+        picked_is_show=picked_is_show,
+        picked_is_season=picked_season is not None,
+    )

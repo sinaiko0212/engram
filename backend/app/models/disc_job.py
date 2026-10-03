@@ -1,0 +1,254 @@
+"""DiscJob model - the core state machine for disc processing."""
+
+from datetime import UTC, datetime
+from enum import StrEnum
+
+from sqlalchemy import text
+from sqlmodel import Field, SQLModel
+
+
+class JobState(StrEnum):
+    """States in the disc processing lifecycle."""
+
+    IDLE = "idle"
+    IDENTIFYING = "identifying"  # Scanning disc structure
+    BACKING_UP = "backing_up"  # Writing a full decrypted disc copy before extraction
+    REVIEW_NEEDED = "review_needed"  # Human-in-the-Loop trigger
+    RIPPING = "ripping"  # Active extraction
+    MATCHING = "matching"  # Audio fingerprinting
+    ORGANIZING = "organizing"  # Moving files to library
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+TERMINAL_JOB_STATES = frozenset({JobState.COMPLETED, JobState.FAILED})
+
+
+class ContentType(StrEnum):
+    """Type of content on the disc."""
+
+    TV = "tv"
+    MOVIE = "movie"
+    UNKNOWN = "unknown"
+
+
+class TitleState(StrEnum):
+    """State of an individual title."""
+
+    PENDING = "pending"
+    RIPPING = "ripping"
+    QUEUED = "queued"  # Ripped/on disk, waiting for a matching slot (subtitle + semaphore wait)
+    MATCHING = "matching"
+    MATCHED = "matched"  # Intermediate state: matched but not yet organized
+    REVIEW = "review"  # Ripped successfully but needs human review for episode assignment
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"  # User skipped this track before ripping; excluded, not a failure
+
+
+class DiscJob(SQLModel, table=True):
+    """Represents a disc ripping job with full state tracking."""
+
+    __tablename__ = "disc_jobs"
+
+    id: int | None = Field(default=None, primary_key=True)
+    drive_id: str = Field(index=True)  # e.g., "E:" or "/dev/sr0"
+    volume_label: str = ""  # e.g., "THE_OFFICE_S1"
+
+    # Classification
+    content_type: ContentType = ContentType.UNKNOWN
+    detected_title: str | None = None  # e.g., "The Office"
+    detected_season: int | None = None
+
+    # Classification metadata (persisted from DiscAnalysisResult)
+    classification_confidence: float = Field(
+        default=0.0, sa_column_kwargs={"server_default": "0.0"}
+    )
+    classification_source: str = Field(
+        default="heuristic", sa_column_kwargs={"server_default": "'heuristic'"}
+    )
+    tmdb_id: int | None = Field(default=None)
+    tmdb_name: str | None = Field(default=None)
+    # First-air year for the resolved show; persisted at identify time so the
+    # organizer can build a disambiguated library folder (Frasier 1993 vs 2023)
+    # deterministically and offline. Nullable — degrades to id-only/bare folder.
+    tmdb_year: int | None = Field(default=None)
+    # Same-name TMDB collision candidates (JSON list of {tmdb_id, name, year,
+    # popularity}). Recorded at identify time whenever >=2 same-name shows exist
+    # (e.g. Frasier 1993 #3452 vs 2023 revival #195241) so the downstream
+    # wrong-show detector can suggest the right twin without re-querying TMDB.
+    candidates_json: str | None = Field(default=None)
+    play_all_indices_json: str | None = Field(default=None)
+    is_ambiguous_movie: bool = Field(default=False, sa_column_kwargs={"server_default": "0"})
+
+    # Paths
+    staging_path: str | None = None
+    final_path: str | None = None
+    # Explicit file manifest for manual imports (drive_id == "import").
+    # JSON: {"root": "<picked folder abs path>", "files": ["<abs mkv>", ...]}.
+    # When present, identify_from_staging ingests exactly these files instead of
+    # a non-recursive glob, so files nested in Disc/ subfolders import correctly;
+    # "root" is the in-place organize base for destination_mode == "in_place".
+    import_manifest_json: str | None = Field(default=None)
+
+    # What MakeMKV is pointed at for this job: "dev:E:", "disc:0",
+    # "file:<backup folder>" or "iso:<file>". None on every row written before
+    # backup support, meaning "legacy: derive from drive_id" (DiscSource.from_job).
+    # Diverges from drive_id exactly once: after a successful backup, drive_id is
+    # still the drive the disc came from while source_spec has become the copy.
+    source_spec: str | None = Field(default=None)
+    # Where this job's backup landed. Kept for history and for re-import. No
+    # cleanup path touches it today, and that is deliberate: backups are the
+    # user's preservation copy, so any future cleanup must exclude this root
+    # explicitly rather than inheriting staging's rules.
+    backup_path: str | None = Field(default=None)
+    # "pending" | "completed" | "failed" | "skipped". None means no backup was
+    # attempted (the feature is off). Mirrors subtitle_status: a small closed set
+    # of literals here, with the free-text explanation in its own column, so no
+    # consumer has to parse a delimiter out of a status.
+    backup_status: str | None = Field(default=None)
+    # Why the backup failed or was skipped, as a short sentence a person can
+    # read in a UI row ("no backup location is configured", or a MakeMKV error
+    # string). Deliberately prose for BOTH outcomes: a skip's short code
+    # ("not_configured") stays in the logs, because nothing machine-reads it and
+    # the history panel has no dictionary to expand it with. None when
+    # backup_status is pending or completed.
+    backup_status_reason: str | None = Field(default=None)
+
+    # Progress Tracking
+    state: JobState = JobState.IDLE
+    current_speed: str = "0.0x"
+    eta_seconds: int = 0
+    progress_percent: float = 0.0
+    current_title: int = 0
+    total_titles: int = 0
+
+    # Subtitle tracking
+    subtitle_status: str | None = None  # "downloading", "completed", "partial", "failed", None
+    # Subtitle-specific failure detail, kept separate from the catch-all
+    # error_message so the two can't clobber each other or leak across banners.
+    subtitle_error_message: str | None = None
+    subtitles_downloaded: int = 0
+    subtitles_total: int = 0
+    subtitles_failed: int = 0
+
+    # Metadata
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    completed_at: datetime | None = Field(default=None)  # When job reached terminal state
+    cleared_at: datetime | None = Field(default=None)  # Soft-delete: hidden from dashboard
+    error_message: str | None = None
+    destination_mode: str = Field(
+        default="library", sa_column_kwargs={"server_default": text("'library'")}
+    )
+    review_reason: str | None = None  # Human-readable reason why review is needed
+    # Non-blocking identity CTA for jobs that rip first and ask questions later
+    # (walk-away Phase B). JSON: {"kind": "name"|"season"|"reidentify",
+    # "reason": "<human-readable text>"}
+    # Set at identify-time by IdentificationCoordinator when the disc ships to
+    # RIPPING with an open identity question; cleared when the user answers (B5)
+    # or the answer becomes moot (job reaches COMPLETED/FAILED); converted to
+    # review_reason if REVIEW_NEEDED is still needed at rip-end (B4).
+    # Owned by: IdentificationCoordinator (set + clear-on-answer) /
+    # JobManager._converge_identity_pending_job (convert) /
+    # JobStateMachine.transition (terminal clear).
+    identity_prompt_json: str | None = Field(default=None)
+    conflict_status: str | None = None  # Transient note while auto-resolving episode conflicts
+    # Why classification ran without TMDB (key absent/rejected) — shown verbatim
+    # on the job card so degraded heuristic-only results name their cause (#243).
+    # None when TMDB participated normally.
+    tmdb_degraded_reason: str | None = None
+
+    # Title information (JSON stored as string for simplicity)
+    titles_json: str | None = None  # List of titles with durations
+
+    # Disc metadata for multi-disc sets
+    disc_number: int = 1  # For multi-disc sets, default to 1
+
+    # TheDiscDB metadata
+    content_hash: str | None = Field(default=None)  # MakeMKV disc fingerprint (MD5)
+    discdb_slug: str | None = Field(default=None)  # e.g., "band-of-brothers-2001"
+    discdb_disc_slug: str | None = Field(default=None)  # e.g., "S01D01"
+    discdb_mappings_json: str | None = Field(
+        default=None
+    )  # JSON-serialized DiscDbTitleMapping list
+
+    # TheDiscDB contribution tracking
+    exported_at: datetime | None = Field(default=None)  # When disc data was exported locally
+    upc_code: str | None = Field(default=None)  # UPC barcode for full contributions
+    asin: str | None = Field(default=None)  # Amazon Standard Identification Number
+    release_date: str | None = Field(default=None)  # Release date from product lookup (ISO)
+    release_group_id: str | None = Field(default=None)  # UUID grouping multi-disc releases
+    submitted_at: datetime | None = Field(default=None)  # When submitted to TheDiscDB API
+    discdb_submission_id: str | None = Field(default=None)  # ID from TheDiscDB after submission
+    discdb_contribute_url: str | None = Field(default=None)  # URL to continue on TheDiscDB
+
+
+class DiscTitle(SQLModel, table=True):
+    """Individual title (track) on a disc."""
+
+    __tablename__ = "disc_titles"
+
+    id: int | None = Field(default=None, primary_key=True)
+    job_id: int = Field(foreign_key="disc_jobs.id", index=True)
+    title_index: int  # MakeMKV title index (scan-order position, 0-based)
+    output_index: int | None = None  # Disc-native "_tNN" number MakeMKV embeds in this
+    # title's suggested output filename (TINFO attr 27), captured at scan time. Usually
+    # equal to title_index, but not guaranteed — some discs number titles starting at 1
+    # or with gaps (issue #517). None on rows created before this field existed, or
+    # where MakeMKV supplied no suggested filename; those fall back to title_index.
+    duration_seconds: int
+    file_size_bytes: int = 0
+    chapter_count: int = 0
+
+    # Selection
+    is_selected: bool = True
+    output_filename: str | None = None
+
+    # Version/Quality info
+    video_resolution: str | None = None  # e.g., "4K", "1080p", "480p"
+    edition: str | None = None  # e.g., "Extended", "Director's Cut", "Theatrical"
+
+    # Matching results
+    matched_episode: str | None = None  # e.g., "S01E01"
+    match_confidence: float = 0.0
+    match_details: str | None = None  # JSON string with score breakdown
+
+    # Number of automatic/manual re-rip attempts for this title (Feature C).
+    # Bounds auto re-rip after a clean & reinsert; see RERIP_MAX_ATTEMPTS.
+    rerip_attempts: int = 0
+
+    # Progress
+    state: TitleState = TitleState.PENDING
+
+    # Conflict resolution for organization
+    conflict_resolution: str | None = None  # User's choice for specific conflict
+    existing_file_path: str | None = None  # Path to existing file causing conflict
+
+    # MakeMKV track metadata (for TheDiscDB contributions)
+    source_filename: str | None = None  # e.g., "00001.m2ts"
+    segment_count: int = 0
+    segment_map: str | None = None  # e.g., "1,2,3"
+
+    # Organization tracking
+    organized_from: str | None = None  # Source filename
+    organized_to: str | None = None  # Destination path
+    is_extra: bool = False  # True if organized as extra content
+
+    # Match source tracking
+    match_source: str | None = Field(default=None)  # "discdb", "engram", "user", "ai_llm"
+
+    # Chromaprint fingerprint (Phase 1 — extraction + storage only; no identification yet)
+    chromaprint_blob: bytes | None = Field(default=None)
+    chromaprint_extracted_at: datetime | None = Field(default=None)
+
+    discdb_match_details: str | None = Field(default=None)  # DiscDB match preserved separately
+    discdb_flagged: bool = Field(default=False)  # User flagged DiscDB data as incorrect
+    discdb_flag_reason: str | None = Field(default=None)  # Reason for flag
+    extra_description: str | None = Field(default=None)  # User annotation for extras
+
+    # Episode-ordering audit (#200) — records which OUTPUT ordering was applied
+    # when this title was organized, for history/auditability. matched_episode
+    # stays CANONICAL (aired order); these only describe the filename projection.
+    episode_ordering: str | None = Field(default=None)  # e.g. "dvd"; None = aired/default
+    episode_group_id: str | None = Field(default=None)  # TMDB group id used, if any

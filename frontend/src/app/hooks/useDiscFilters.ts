@@ -1,0 +1,71 @@
+/**
+ * Disc filtering and transformation logic
+ */
+
+import { useState, useMemo } from 'react';
+import type { Job, DiscTitle } from '../../types';
+import { transformJobToDiscData } from '../../types/adapters';
+import { generateMockDiscs } from '../utils/mockData';
+
+export function useDiscFilters(
+    jobs: Job[],
+    titlesMap: Record<number, DiscTitle[]>,
+    devMode: boolean = false
+) {
+    const [filter, setFilter] = useState<"all" | "active" | "completed">("active");
+
+    // Transform jobs to disc data for display
+    const discsData = useMemo(() => {
+        if (devMode) {
+            return generateMockDiscs();
+        }
+        return jobs.map(job => ({
+            ...transformJobToDiscData(job, titlesMap[job.id] || []),
+            needsReview: job.state === 'review_needed',
+            // Distinguishes "titles fetched and genuinely empty" (key present, []),
+            // from "not fetched yet" (key absent). The titles request resolves after
+            // the job list, so without this a post-rip review_needed job briefly has
+            // tracks=[] on first render — enough to flash the pre-rip banner/emphasis.
+            tracksLoaded: titlesMap[job.id] !== undefined,
+        }));
+    }, [jobs, titlesMap, devMode]);
+
+    // Filter discs based on current filter
+    const filteredDiscs = useMemo(() => {
+        return discsData.filter((disc) => {
+            if (filter === "active") {
+                return disc.state !== "completed" && disc.state !== "error";
+            }
+            if (filter === "completed") {
+                return disc.state === "completed";
+            }
+            return true;
+        });
+    }, [discsData, filter]);
+
+    // Calculate counts for filter badges
+    const activeCount = useMemo(() => {
+        return discsData.filter((d) => d.state !== "completed" && d.state !== "error").length;
+    }, [discsData]);
+
+    const completedCount = useMemo(() => {
+        return discsData.filter((d) => d.state === "completed").length;
+    }, [discsData]);
+
+    // Failed jobs sit in neither the Active nor the Done bucket above, so without
+    // their own count the clear button (gated on completedCount) never renders and
+    // they cannot be dismissed at all.
+    const failedCount = useMemo(() => {
+        return discsData.filter((d) => d.state === "error").length;
+    }, [discsData]);
+
+    return {
+        filter,
+        setFilter,
+        discsData,
+        filteredDiscs,
+        activeCount,
+        completedCount,
+        failedCount,
+    };
+}

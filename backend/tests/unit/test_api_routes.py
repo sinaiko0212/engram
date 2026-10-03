@@ -1,0 +1,1087 @@
+"""Unit tests for API routes.
+
+Tests the REST API endpoints including job management, configuration,
+and validation. Uses async client with in-memory DB (patched via conftest.py).
+"""
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.database import get_session
+from app.main import app
+from app.models import AppConfig, DiscJob, DiscTitle
+from app.models.disc_job import ContentType, JobState, TitleState
+
+# Import the patched session factory from conftest
+from tests.unit.conftest import _unit_session_factory
+
+
+async def _seed_config(
+    staging_path="/tmp/staging",
+    makemkv_key="T-test-key-1234567890",
+    tmdb_api_key="eyJhbGciOiJIUzI1NiJ9.test_jwt_token",
+    **kwargs,
+) -> AppConfig:
+    """Insert a config row via the patched session factory."""
+    async with _unit_session_factory() as session:
+        config = AppConfig(
+            makemkv_path="/usr/bin/makemkvcon",
+            makemkv_key=makemkv_key,
+            staging_path=staging_path,
+            library_movies_path="/media/movies",
+            library_tv_path="/media/tv",
+            tmdb_api_key=tmdb_api_key,
+            max_concurrent_matches=4,
+            ffmpeg_path="/usr/bin/ffmpeg",
+            conflict_resolution_default="rename",
+            **kwargs,
+        )
+        session.add(config)
+        await session.commit()
+        await session.refresh(config)
+        return config
+
+
+async def _seed_job(**kwargs) -> DiscJob:
+    """Insert a job row via the patched session factory."""
+    defaults = dict(
+        drive_id="D:",
+        volume_label="TEST_DISC",
+        content_type=ContentType.TV,
+        state=JobState.IDLE,
+        detected_title="Test Show",
+        detected_season=1,
+        staging_path="/tmp/staging/job_123",
+    )
+    defaults.update(kwargs)
+    async with _unit_session_factory() as session:
+        job = DiscJob(**defaults)
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        return job
+
+
+async def _seed_titles(job_id: int, count: int = 3) -> list[DiscTitle]:
+    """Insert title rows via the patched session factory."""
+    async with _unit_session_factory() as session:
+        titles = []
+        for i in range(count):
+            title = DiscTitle(
+                job_id=job_id,
+                title_index=i,
+                duration_seconds=2400 + i * 60,
+                file_size_bytes=1024 * 1024 * 1024,
+                state=TitleState.PENDING,
+            )
+            session.add(title)
+            titles.append(title)
+        await session.commit()
+        for t in titles:
+            await session.refresh(t)
+        return titles
+
+
+@pytest.fixture
+async def client():
+    """Provide an async HTTP client with the patched DB session."""
+
+    async def override_get_session():
+        async with _unit_session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_get_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Job Endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestJobEndpoints:
+    """Test job-related API endpoints."""
+
+    async def test_list_jobs_empty(self, client):
+        response = await client.get("/api/jobs")
+        assert response.status_code == 200
+        assert response.json() == []
+
+    async def test_list_jobs_with_data(self, client):
+        job = await _seed_job()
+        response = await client.get("/api/jobs")
+        assert response.status_code == 200
+        jobs = response.json()
+        assert len(jobs) == 1
+        assert jobs[0]["id"] == job.id
+        assert jobs[0]["volume_label"] == "TEST_DISC"
+        assert jobs[0]["state"] == "idle"
+
+    async def test_get_job_by_id(self, client):
+        job = await _seed_job()
+        response = await client.get(f"/api/jobs/{job.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == job.id
+        assert data["detected_title"] == "Test Show"
+        assert data["detected_season"] == 1
+
+    async def test_get_job_not_found(self, client):
+        response = await client.get("/api/jobs/999")
+        assert response.status_code == 404
+
+    async def test_candidates_json_exposed_in_job_and_detail(self, client):
+        """Same-name twin candidates must survive the serializers in both the
+        job response and the detail response, or the UI can't surface the
+        "did you mean Frasier (2023)?" disambiguation (three-way-sync rule)."""
+        payload = (
+            '[{"tmdb_id": 3452, "name": "Frasier", "year": "1993"}, '
+            '{"tmdb_id": 195241, "name": "Frasier", "year": "2023"}]'
+        )
+        job = await _seed_job(candidates_json=payload)
+
+        resp = await client.get(f"/api/jobs/{job.id}")
+        assert resp.status_code == 200
+        assert resp.json()["candidates_json"] == payload
+
+        detail = await client.get(f"/api/jobs/{job.id}/detail")
+        assert detail.status_code == 200
+        assert detail.json()["candidates_json"] == payload
+
+    async def test_identity_prompt_json_exposed_in_job_and_detail(self, client):
+        """identity_prompt_json must survive BOTH the JobResponse serializer and
+        build_job_detail() — three-way-sync rule; REST/WS serializer drift is a
+        documented recurring bug class. Mirrors the candidates_json guard above.
+        Also verifies the field defaults to null (not omitted) when not set, so
+        the frontend merge can discriminate present-and-null from absent."""
+        prompt = '{"kind": "season", "reason": "Could not detect season automatically"}'
+        with_prompt = await _seed_job(identity_prompt_json=prompt)
+        without_prompt = await _seed_job(volume_label="NO_PROMPT")
+
+        resp = await client.get(f"/api/jobs/{with_prompt.id}")
+        assert resp.status_code == 200
+        assert resp.json()["identity_prompt_json"] == prompt
+
+        detail = await client.get(f"/api/jobs/{with_prompt.id}/detail")
+        assert detail.status_code == 200
+        assert detail.json()["identity_prompt_json"] == prompt
+
+        # Null when not set — field must be present (not omitted) in both payloads
+        resp2 = await client.get(f"/api/jobs/{without_prompt.id}")
+        assert resp2.json()["identity_prompt_json"] is None
+
+        detail2 = await client.get(f"/api/jobs/{without_prompt.id}/detail")
+        assert detail2.json()["identity_prompt_json"] is None
+
+    async def test_tmdb_identity_fields_exposed_in_job_response(self, client):
+        """The dashboard reads tmdb_id to suppress the dead-end episode-review
+        button, and the re-identify modal shows tmdb_name/tmdb_year. These must
+        survive the JobResponse serializer in both list and by-id endpoints —
+        present (even as null) for an unconfirmed disc, populated for a known one."""
+        confirmed = await _seed_job(tmdb_id=18409, tmdb_name="The Office", tmdb_year=2005)
+        unconfirmed = await _seed_job(volume_label="AMBIGUOUS", tmdb_id=None)
+
+        by_id = (await client.get(f"/api/jobs/{confirmed.id}")).json()
+        assert by_id["tmdb_id"] == 18409
+        assert by_id["tmdb_name"] == "The Office"
+        assert by_id["tmdb_year"] == 2005
+
+        listed = {j["id"]: j for j in (await client.get("/api/jobs")).json()}
+        # Null identity is present-as-null (not omitted), so `tmdb_id == null`
+        # is a reliable client-side discriminator.
+        assert listed[unconfirmed.id]["tmdb_id"] is None
+        assert listed[confirmed.id]["tmdb_id"] == 18409
+
+    async def test_tmdb_identity_fields_exposed_in_job_detail(self, client):
+        """build_job_detail() assembles the detail dict manually, so tmdb_year must be
+        declared in JobDetailResponse AND added to the dict — Pydantic silently drops a
+        field present in only one of the two."""
+        confirmed = await _seed_job(tmdb_id=18409, tmdb_name="The Office", tmdb_year=2005)
+
+        detail = (await client.get(f"/api/jobs/{confirmed.id}/detail")).json()
+        assert detail["tmdb_id"] == 18409
+        assert detail["tmdb_name"] == "The Office"
+        assert detail["tmdb_year"] == 2005
+
+    async def test_get_job_titles(self, client):
+        job = await _seed_job()
+        await _seed_titles(job.id, count=3)
+        response = await client.get(f"/api/jobs/{job.id}/titles")
+        assert response.status_code == 200
+        titles = response.json()
+        assert len(titles) == 3
+        assert titles[0]["title_index"] == 0
+        assert titles[0]["state"] == "pending"
+
+    async def test_start_job_not_found(self, client):
+        response = await client.post("/api/jobs/999/start")
+        assert response.status_code == 404
+
+    async def test_cancel_job_not_found(self, client):
+        response = await client.post("/api/jobs/999/cancel")
+        assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Config Endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestConfigEndpoints:
+    """Test configuration API endpoints."""
+
+    async def test_get_config_redacts_api_keys(self, client):
+        await _seed_config()
+        response = await client.get("/api/config")
+        assert response.status_code == 200
+        config = response.json()
+        assert config["makemkv_key"] == "***"
+        assert config["tmdb_api_key"] == "***"
+        assert config["makemkv_path"] == "/usr/bin/makemkvcon"
+        assert config["staging_path"] == "/tmp/staging"
+        assert config["library_movies_path"] == "/media/movies"
+
+    async def test_get_config_creates_default_when_empty(self, client):
+        response = await client.get("/api/config")
+        assert response.status_code == 200
+
+    async def test_allow_lan_access_defaults_false(self, client):
+        await _seed_config()
+        config = (await client.get("/api/config")).json()
+        assert config["allow_lan_access"] is False
+
+    async def test_allow_lan_access_roundtrips(self, client):
+        await _seed_config()
+        response = await client.put("/api/config", json={"allow_lan_access": True})
+        assert response.status_code == 200
+        config = (await client.get("/api/config")).json()
+        assert config["allow_lan_access"] is True
+
+    async def test_update_config(self, client):
+        await _seed_config()
+        update_data = {
+            "staging_path": "/new/staging/path",
+            "max_concurrent_matches": 8,
+        }
+        response = await client.put("/api/config", json=update_data)
+        assert response.status_code == 200
+
+        verify = await client.get("/api/config")
+        config = verify.json()
+        # Paths are stored normalized (separator style settled, ~ expanded, UNC
+        # canonicalized), so the expectation is the normalized form rather than
+        # the literal input — the same value, spelled one way.
+        from app.core.paths import normalize_user_path
+
+        assert config["staging_path"] == normalize_user_path("/new/staging/path")
+        assert config["max_concurrent_matches"] == 8
+
+    async def test_update_config_with_new_api_keys(self, client):
+        await _seed_config()
+        update_data = {
+            "makemkv_key": "T-new-key-0987654321",
+            "tmdb_api_key": "eyJhbGciOiJIUzI1NiJ9.new_token",
+        }
+        response = await client.put("/api/config", json=update_data)
+        assert response.status_code == 200
+
+        verify = await client.get("/api/config")
+        config = verify.json()
+        assert config["makemkv_key"] == "***"
+        assert config["tmdb_api_key"] == "***"
+
+    async def test_update_config_rejects_unknown_discord_template_variable(self, client):
+        await _seed_config()
+        response = await client.put("/api/config", json={"discord_template_completed": "{{bogus}}"})
+        assert response.status_code == 422
+        assert "bogus" in response.json()["detail"]
+
+    async def test_update_config_accepts_valid_discord_template(self, client):
+        await _seed_config()
+        response = await client.put(
+            "/api/config", json={"discord_template_completed": "{{title}} is done"}
+        )
+        assert response.status_code == 200
+
+        verify = await client.get("/api/config")
+        config = verify.json()
+        assert config["discord_template_completed"] == "{{title}} is done"
+
+    async def test_update_config_accepts_blank_discord_template(self, client):
+        await _seed_config(discord_template_completed="{{title}} is done")
+        response = await client.put("/api/config", json={"discord_template_completed": ""})
+        assert response.status_code == 200
+
+        verify = await client.get("/api/config")
+        config = verify.json()
+        assert config["discord_template_completed"] == ""
+
+    async def test_get_config_survives_null_discord_templates(self, client):
+        """GET /api/config must return 200 even when the Discord template columns
+        are NULL in the database.
+
+        Regression for the 0.26.0 upgrade 500: an early 0.26.0 build could add
+        discord_template_completed / discord_template_failed as NULL on upgrade,
+        but ConfigResponse types them as required str, so a bare None raised a
+        pydantic ValidationError -> HTTP 500 that broke all config loading.
+        """
+        from sqlalchemy import text as sa_text
+
+        await _seed_config()
+        # Reproduce the real upgraded-DB shape: the buggy ADD COLUMN emitted a
+        # plain nullable VARCHAR (no NOT NULL, no default), so existing rows hold
+        # NULL. Rebuild the two columns as nullable, then NULL them out.
+        async with _unit_session_factory() as session:
+            for col in ("discord_template_completed", "discord_template_failed"):
+                await session.execute(sa_text(f"ALTER TABLE app_config DROP COLUMN {col}"))
+                await session.execute(sa_text(f"ALTER TABLE app_config ADD COLUMN {col} VARCHAR"))
+            await session.commit()
+
+        response = await client.get("/api/config")
+        assert response.status_code == 200
+        config = response.json()
+        assert config["discord_template_completed"] == ""
+        assert config["discord_template_failed"] == ""
+
+    async def test_ai_api_key_persists_and_blank_does_not_clobber(self, client):
+        """Reproduces the user's report end-to-end through the real routes:
+
+        a saved AI key must read back as '***' (so the UI shows "Key saved"),
+        and re-saving must not wipe it — neither when the field is omitted (the
+        frontend's blank-save behavior) nor when an empty string is sent directly.
+        """
+        await _seed_config()
+        # User enters their Gemini key.
+        r = await client.put("/api/config", json={"ai_api_key": "AIzaSy-secret-123"})
+        assert r.status_code == 200
+        # Reopening settings: GET signals a saved key (the UI's "Key saved" cue).
+        assert (await client.get("/api/config")).json()["ai_api_key"] == "***"
+        # An unchanged save (frontend omits the blank field) must not clobber it.
+        r = await client.put("/api/config", json={"staging_path": "/some/where"})
+        assert r.status_code == 200
+        assert (await client.get("/api/config")).json()["ai_api_key"] == "***"
+        # Defense-in-depth: even a direct blank must not clobber the stored key.
+        r = await client.put("/api/config", json={"ai_api_key": ""})
+        assert r.status_code == 200
+        assert (await client.get("/api/config")).json()["ai_api_key"] == "***"
+
+    async def test_ai_episode_matching_enabled_roundtrips(self, client):
+        """The AI episode-matching toggle must persist AND read back.
+
+        It gates the no-subtitle AI fallback (and the post-match LLM suggestion),
+        so if the API can't save/return it the whole feature is unreachable from
+        the UI — the checkbox would silently reset to off on every reload.
+        """
+        await _seed_config()
+        r = await client.put("/api/config", json={"ai_episode_matching_enabled": True})
+        assert r.status_code == 200
+        config = (await client.get("/api/config")).json()
+        assert config["ai_episode_matching_enabled"] is True
+
+    async def test_pretranscription_flags_default_on_and_off(self, client):
+        """GET must expose both prewarmer flags with their defaults.
+
+        The master switch ships enabled; the expensive full-file option ships
+        disabled. If either is missing from ConfigResponse the prewarmer
+        becomes uncontrollable from the UI (the PR #283 bug class).
+        """
+        await _seed_config()
+        config = (await client.get("/api/config")).json()
+        assert config["enable_background_pretranscription"] is True
+        assert config["pretranscribe_full_file"] is False
+
+    async def test_pretranscription_flags_roundtrip(self, client):
+        """PUT must persist each prewarmer flag and read it back."""
+        await _seed_config()
+        r = await client.put(
+            "/api/config",
+            json={
+                "enable_background_pretranscription": False,
+                "pretranscribe_full_file": True,
+            },
+        )
+        assert r.status_code == 200
+        config = (await client.get("/api/config")).json()
+        assert config["enable_background_pretranscription"] is False
+        assert config["pretranscribe_full_file"] is True
+
+    async def test_auto_eject_enabled_roundtrips(self, client):
+        """The auto-eject toggle must persist and read back correctly.
+
+        Gates disc ejection after ripping; if the API can't save/return it the
+        setting would silently reset to True on every reload.
+        """
+        await _seed_config()
+        r = await client.put("/api/config", json={"auto_eject_enabled": False})
+        assert r.status_code == 200
+        config = (await client.get("/api/config")).json()
+        assert config["auto_eject_enabled"] is False
+
+    async def test_pretranscription_flags_unrelated_put_leaves_unchanged(self, client):
+        """A PUT that omits both flags must not reset them to defaults."""
+        await _seed_config()
+        r = await client.put(
+            "/api/config",
+            json={
+                "enable_background_pretranscription": False,
+                "pretranscribe_full_file": True,
+            },
+        )
+        assert r.status_code == 200
+        # Unrelated update — neither flag in the payload.
+        r = await client.put("/api/config", json={"staging_path": "/some/where"})
+        assert r.status_code == 200
+        config = (await client.get("/api/config")).json()
+        assert config["enable_background_pretranscription"] is False
+        assert config["pretranscribe_full_file"] is True
+
+
+# ---------------------------------------------------------------------------
+# Network info
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkInfoEndpoint:
+    """Test the LAN access network info endpoint."""
+
+    async def test_reports_disabled_by_default(self, client):
+        await _seed_config()
+        info = (await client.get("/api/network/info")).json()
+        assert info["lan_access_enabled"] is False
+        assert info["active_lan_bound"] is False
+        assert isinstance(info["port"], int)
+
+    async def test_reports_enabled_toggle_before_restart(self, client):
+        # Toggle persisted but server still bound to localhost this session:
+        # enabled True, active_lan_bound False → UI shows "restart to apply".
+        await _seed_config(allow_lan_access=True)
+        info = (await client.get("/api/network/info")).json()
+        assert info["lan_access_enabled"] is True
+        assert info["active_lan_bound"] is False
+
+    async def test_active_when_bound_all_interfaces(self, client):
+        await _seed_config(allow_lan_access=True)
+        app.state.bound_host = "0.0.0.0"
+        app.state.bound_port = 8000
+        try:
+            info = (await client.get("/api/network/info")).json()
+        finally:
+            del app.state.bound_host
+            del app.state.bound_port
+        assert info["active_lan_bound"] is True
+        assert info["port"] == 8000
+        # lan_ip may be None in a network-less CI sandbox; when present, the URL
+        # is derived from it.
+        if info["lan_ip"] is not None:
+            assert info["lan_url"] == f"http://{info['lan_ip']}:8000"
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+class TestValidation:
+    """Test API request validation."""
+
+    async def test_invalid_job_id_type(self, client):
+        response = await client.get("/api/jobs/invalid")
+        assert response.status_code == 422
+
+    async def test_invalid_config_values(self, client):
+        await _seed_config()
+        invalid_data = {"max_concurrent_matches": -1}
+        response = await client.put("/api/config", json=invalid_data)
+        assert response.status_code in [200, 400, 422]
+
+
+# ---------------------------------------------------------------------------
+# Identity answer endpoints (walk-away B5)
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityAnswerRoutesAcceptRipping:
+    """set-name and re-identify accept RIPPING (mid-rip answers, walk-away B5)
+    in addition to REVIEW_NEEDED; everything else is still rejected."""
+
+    async def test_set_name_accepted_while_ripping(self, client):
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.job_manager import job_manager
+
+        job = await _seed_job(state=JobState.RIPPING)
+        with patch.object(job_manager, "set_name_and_resume", new_callable=AsyncMock) as mock_set:
+            response = await client.post(
+                f"/api/jobs/{job.id}/set-name",
+                json={"name": "Eureka", "content_type": "tv", "season": 2},
+            )
+
+        assert response.status_code == 200
+        mock_set.assert_awaited_once_with(job.id, "Eureka", "tv", 2)
+
+    async def test_re_identify_accepted_while_ripping(self, client):
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.job_manager import job_manager
+
+        job = await _seed_job(state=JobState.RIPPING)
+        with patch.object(job_manager, "re_identify_job", new_callable=AsyncMock) as mock_re_id:
+            response = await client.post(
+                f"/api/jobs/{job.id}/re-identify",
+                json={"title": "Frasier", "content_type": "tv", "tmdb_id": 195241},
+            )
+
+        assert response.status_code == 200
+        mock_re_id.assert_awaited_once_with(job.id, "Frasier", "tv", None, 195241)
+
+    async def test_set_name_still_rejected_in_other_states(self, client):
+        job = await _seed_job(state=JobState.MATCHING)
+        response = await client.post(
+            f"/api/jobs/{job.id}/set-name",
+            json={"name": "Eureka", "content_type": "tv"},
+        )
+        assert response.status_code == 400
+
+    async def test_re_identify_still_rejected_in_other_states(self, client):
+        job = await _seed_job(state=JobState.COMPLETED)
+        response = await client.post(
+            f"/api/jobs/{job.id}/re-identify",
+            json={"title": "Frasier", "content_type": "tv"},
+        )
+        assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+class TestErrorHandling:
+    """Test error handling in API endpoints."""
+
+    async def test_malformed_json(self, client):
+        response = await client.put(
+            "/api/config",
+            content="{invalid json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422
+
+    async def test_delete_single_job(self, client):
+        """Clearing a job soft-deletes it (sets cleared_at), hiding from list."""
+        job = await _seed_job(state=JobState.COMPLETED)
+        response = await client.delete(f"/api/jobs/{job.id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "cleared"
+        # Job still accessible directly (soft-deleted)
+        verify = await client.get(f"/api/jobs/{job.id}")
+        assert verify.status_code == 200
+        # But hidden from the active list
+        list_resp = await client.get("/api/jobs")
+        job_ids = [j["id"] for j in list_resp.json()]
+        assert job.id not in job_ids
+
+
+# ---------------------------------------------------------------------------
+# ASR Status
+# ---------------------------------------------------------------------------
+
+
+class TestAsrStatusEndpoint:
+    async def test_asr_status_reports_cpu_runtime(self, client):
+        from unittest.mock import patch
+
+        with (
+            patch("app.matcher.asr_models.detect_asr_device", return_value="cpu"),
+            patch("app.matcher.asr_models.psutil.cpu_count", return_value=8),
+        ):
+            resp = await client.get("/api/asr-status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["device"] == "cpu"
+        assert body["compute_type"] == "int8"
+        assert body["workers"] >= 1
+        assert "max_concurrent_matches" in body
+        assert "model" in body
+
+    async def test_asr_status_reports_enabled_gpu_that_fell_back_to_cpu(self, client):
+        """An enabled flag whose libs failed at startup is its own state, not "enable" (#694)."""
+        from unittest.mock import patch
+
+        from app.matcher import asr_models
+
+        await _seed_config(enable_gpu_acceleration=True)
+        asr_models.set_asr_device("cpu", gpu_fallback_reason="register_failed")
+        try:
+            with (
+                patch("app.matcher.asr_models.gpu_detected", return_value=True),
+                patch("app.matcher.cuda_runtime.is_supported_platform", return_value=True),
+                patch("app.matcher.cuda_runtime.is_cuda_runtime_installed", return_value=True),
+            ):
+                resp = await client.get("/api/asr-status")
+        finally:
+            asr_models.set_asr_device(None)
+        body = resp.json()
+        assert body["gpu_enabled"] is True
+        assert body["gpu_fallback_reason"] == "register_failed"
+        assert body["gpu_state"] == "enabled_not_active"
+
+
+# ---------------------------------------------------------------------------
+# Manual Subtitle Import
+# ---------------------------------------------------------------------------
+
+
+class TestManualSubtitleImport:
+    """Tests for POST /jobs/{job_id}/subtitles/preview and /commit."""
+
+    VALID_SRT = "1\n00:00:01,000 --> 00:00:02,000\nHello there, General Kenobi\n"
+
+    async def _seed_tv_job(self, tmp_path, **kwargs):
+        await _seed_config(subtitles_cache_path=str(tmp_path))
+        defaults = dict(
+            tmdb_id=999,
+            detected_title="Test Show",
+            detected_season=1,
+            state=JobState.REVIEW_NEEDED,
+        )
+        defaults.update(kwargs)
+        return await _seed_job(**defaults)
+
+    async def _seed_job_movie(self, tmp_path):
+        await _seed_config(subtitles_cache_path=str(tmp_path))
+        return await _seed_job(content_type=ContentType.MOVIE, tmdb_id=None, detected_season=None)
+
+    async def test_preview_requires_identified_tv_job(self, client, tmp_path):
+        job = await self._seed_job_movie(tmp_path)
+        response = await client.post(
+            f"/api/jobs/{job.id}/subtitles/preview",
+            json={"files": [{"filename": "x.srt", "content": self.VALID_SRT}]},
+        )
+        assert response.status_code == 400
+
+    async def test_preview_classifies_ready_file(self, client, tmp_path):
+        job = await self._seed_tv_job(tmp_path)
+        response = await client.post(
+            f"/api/jobs/{job.id}/subtitles/preview",
+            json={"files": [{"filename": "Test.Show.S01E05.srt", "content": self.VALID_SRT}]},
+        )
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert results[0]["season"] == 1
+        assert results[0]["episode"] == 5
+        assert results[0]["status"] == "ready"
+
+    async def test_preview_rejects_too_many_files(self, client, tmp_path):
+        job = await self._seed_tv_job(tmp_path)
+        files = [
+            {"filename": f"Test.Show.S01E{i:02d}.srt", "content": self.VALID_SRT}
+            for i in range(1, 62)
+        ]
+        response = await client.post(f"/api/jobs/{job.id}/subtitles/preview", json={"files": files})
+        assert response.status_code == 400
+
+    async def test_commit_writes_file_and_reports_imported(self, client, tmp_path):
+        job = await self._seed_tv_job(tmp_path)
+        response = await client.post(
+            f"/api/jobs/{job.id}/subtitles/commit",
+            json={
+                "files": [
+                    {"filename": "x.srt", "season": 1, "episode": 5, "content": self.VALID_SRT},
+                ]
+            },
+        )
+        assert response.status_code == 200
+        outcomes = response.json()["outcomes"]
+        assert outcomes[0]["status"] == "imported"
+        dest = tmp_path / "data" / "999" / "Test Show - S01E05.srt"
+        assert dest.exists()
+
+    async def test_commit_requires_identified_tv_job(self, client, tmp_path):
+        job = await self._seed_job_movie(tmp_path)
+        response = await client.post(
+            f"/api/jobs/{job.id}/subtitles/commit",
+            json={
+                "files": [
+                    {"filename": "x.srt", "season": 1, "episode": 1, "content": self.VALID_SRT}
+                ]
+            },
+        )
+        assert response.status_code == 400
+
+    async def test_commit_rejects_job_not_awaiting_review(self, client, tmp_path):
+        job = await self._seed_tv_job(tmp_path, state=JobState.COMPLETED)
+        response = await client.post(
+            f"/api/jobs/{job.id}/subtitles/commit",
+            json={
+                "files": [
+                    {"filename": "x.srt", "season": 1, "episode": 1, "content": self.VALID_SRT}
+                ]
+            },
+        )
+        assert response.status_code == 409
+
+    async def test_preview_rejects_job_not_awaiting_review(self, client, tmp_path):
+        job = await self._seed_tv_job(tmp_path, state=JobState.RIPPING)
+        response = await client.post(
+            f"/api/jobs/{job.id}/subtitles/preview",
+            json={"files": [{"filename": "x.srt", "content": self.VALID_SRT}]},
+        )
+        assert response.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# LLM Match Endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestLLMMatchEndpoint:
+    """The 503 body must carry the classified provider cause and human message,
+    not just the bare ``reason`` string, so the Inspector can render it verbatim
+    instead of the raw ApiError JSON."""
+
+    async def test_llm_error_503_carries_detail_and_message(self, client):
+        from unittest.mock import AsyncMock, patch
+
+        from app.api.routes import LLMMatchOutcome
+
+        job = await _seed_job()
+        titles = await _seed_titles(job.id, count=1)
+
+        outcome = LLMMatchOutcome.failed(
+            "llm_error",
+            detail="no_credits",
+            message="This account has no API credits.",
+        )
+        with patch(
+            "app.api.routes._run_llm_match_for_title",
+            new=AsyncMock(return_value=outcome),
+        ):
+            response = await client.post(f"/api/jobs/{job.id}/titles/{titles[0].id}/llm-match")
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["reason"] == "llm_error"
+        assert body["detail"] == "no_credits"
+        assert body["message"] == "This account has no API credits."
+
+
+class TestEjectEndpoint:
+    """POST /api/jobs/{id}/eject: release the disc without cancelling the job."""
+
+    @pytest.mark.asyncio
+    async def test_eject_returns_result_and_job_id(self, client, monkeypatch):
+        """The endpoint surfaces whether the tray actually opened."""
+        from app.services.job_manager import job_manager
+
+        job = await _seed_job(state=JobState.RIPPING)
+
+        async def fake_eject(job_id):
+            assert job_id == job.id
+            return {"ejected": True, "action": "rip_stopped"}
+
+        monkeypatch.setattr(job_manager, "eject_disc_for_job", fake_eject)
+
+        response = await client.post(f"/api/jobs/{job.id}/eject")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ejected": True,
+            "action": "rip_stopped",
+            "job_id": job.id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_tray_open_is_still_a_200(self, client, monkeypatch):
+        """A tray that would not open is reported, not raised: the rip still stopped."""
+        from app.services.job_manager import job_manager
+
+        job = await _seed_job(state=JobState.RIPPING)
+
+        async def fake_eject(job_id):
+            return {"ejected": False, "action": "rip_stopped"}
+
+        monkeypatch.setattr(job_manager, "eject_disc_for_job", fake_eject)
+
+        response = await client.post(f"/api/jobs/{job.id}/eject")
+
+        assert response.status_code == 200
+        assert response.json()["ejected"] is False
+
+    @pytest.mark.asyncio
+    async def test_eject_409s_on_wrong_state(self, client, monkeypatch):
+        """A job that does not hold the drive returns 409, not 500."""
+        from app.services.job_manager import job_manager
+
+        job = await _seed_job(state=JobState.MATCHING)
+
+        async def fake_eject(job_id):
+            raise ValueError("Cannot eject a job in state: matching")
+
+        monkeypatch.setattr(job_manager, "eject_disc_for_job", fake_eject)
+
+        response = await client.post(f"/api/jobs/{job.id}/eject")
+
+        assert response.status_code == 409
+        assert "Cannot eject" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_eject_409s_for_import_jobs(self, client, monkeypatch):
+        """An imported job holds no drive, so there is no tray to open."""
+        from app.services.job_manager import job_manager
+
+        job = await _seed_job(state=JobState.RIPPING, drive_id="import")
+
+        async def unreachable(job_id):
+            raise AssertionError("an import job must be rejected before reaching the manager")
+
+        monkeypatch.setattr(job_manager, "eject_disc_for_job", unreachable)
+
+        response = await client.post(f"/api/jobs/{job.id}/eject")
+
+        assert response.status_code == 409
+        assert "no disc" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_eject_404s_on_missing_job(self, client):
+        response = await client.post("/api/jobs/999999/eject")
+        assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_config_round_trips_new_notification_fields(client):
+    """Every new notification field survives PUT -> GET. Catches the silent
+    Pydantic drop that happens when a field is added to AppConfig but not to
+    ConfigUpdate."""
+    payload = {
+        "discord_template_review": "Review: {{title}}",
+        "discord_notify_completed": False,
+        "discord_notify_failed": True,
+        "discord_notify_review": True,
+        "discord_mention_review": "<@1234>",
+        "dashboard_base_url": "http://192.168.1.50:5173",
+    }
+    put = await client.put("/api/config", json=payload)
+    assert put.status_code == 200
+
+    got = (await client.get("/api/config")).json()
+    assert got["discord_template_review"] == "Review: {{title}}"
+    assert got["discord_notify_completed"] is False
+    assert got["discord_mention_review"] == "<@1234>"
+    assert got["dashboard_base_url"] == "http://192.168.1.50:5173"
+
+    # Restore defaults so later tests in this module see a clean config.
+    await client.put(
+        "/api/config",
+        json={
+            "discord_template_review": "",
+            "discord_notify_completed": True,
+            "discord_mention_review": "",
+            "dashboard_base_url": "",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_config_rejects_javascript_dashboard_url(client):
+    resp = await client.put("/api/config", json={"dashboard_base_url": "javascript:alert(1)"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_config_rejects_bad_review_template(client):
+    resp = await client.put("/api/config", json={"discord_template_review": "{{bogus}}"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_config_round_trips_ripped_notification_fields(client):
+    """The three-way sync: a field missing from ConfigUpdate or ConfigResponse
+    is dropped silently, so assert it survives a PUT and comes back on GET."""
+    resp = await client.put(
+        "/api/config",
+        json={"discord_notify_ripped": True, "discord_template_ripped": "**{{{title}}}** ripped"},
+    )
+    assert resp.status_code == 200
+
+    resp = await client.get("/api/config")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["discord_notify_ripped"] is True
+    assert body["discord_template_ripped"] == "**{{{title}}}** ripped"
+
+    # Restore defaults so later tests in this module see a clean config.
+    await client.put(
+        "/api/config",
+        json={"discord_notify_ripped": False, "discord_template_ripped": ""},
+    )
+
+
+@pytest.mark.asyncio
+async def test_config_rejects_unknown_var_in_ripped_template(client):
+    """The ripped template must be validated server-side like the other three."""
+    resp = await client.put(
+        "/api/config", json={"discord_template_ripped": "{{nonsense_variable}}"}
+    )
+    assert resp.status_code == 422
+    assert "nonsense_variable" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_null_notify_columns_read_as_off_for_ripped_and_on_for_the_rest(client):
+    """Pins the deliberate asymmetry in GET /api/config's notify-toggle
+    coalescing.
+
+    The three original toggles (completed/failed/review) read a NULL column
+    as enabled, so an out-of-band schema change can never silently mute
+    notifications a user already relies on. discord_notify_ripped is new and
+    opt-in, so the rationale inverts: a NULL there must read as disabled, or
+    an upgrade would switch it on for everyone and double the notification
+    volume for anyone already using discord_notify_completed.
+
+    Forces NULL into all four notify columns directly via SQL, since the ORM
+    refuses to write NULL into a non-optional field. Both halves of the
+    asymmetry are asserted together so that "fixing the inconsistency" by
+    unifying either expression fails this test, whichever direction it goes.
+    """
+    from sqlalchemy import text as sa_text
+
+    await _seed_config()
+    # These columns are NOT NULL with a server_default (see app_config.py), so
+    # a plain UPDATE ... = NULL is rejected by SQLite. Rebuild each as a
+    # nullable BOOLEAN first, matching how an out-of-band schema change (or an
+    # old ADD COLUMN migration) could actually leave a NULL in production.
+    async with _unit_session_factory() as session:
+        for col in (
+            "discord_notify_completed",
+            "discord_notify_failed",
+            "discord_notify_review",
+            "discord_notify_ripped",
+        ):
+            await session.execute(sa_text(f"ALTER TABLE app_config DROP COLUMN {col}"))
+            await session.execute(sa_text(f"ALTER TABLE app_config ADD COLUMN {col} BOOLEAN"))
+        await session.commit()
+
+    response = await client.get("/api/config")
+    assert response.status_code == 200
+    config = response.json()
+    assert config["discord_notify_completed"] is True
+    assert config["discord_notify_failed"] is True
+    assert config["discord_notify_review"] is True
+    assert config["discord_notify_ripped"] is False
+
+
+# ---------------------------------------------------------------------------
+# Job visibility invariant
+# ---------------------------------------------------------------------------
+
+
+class TestJobVisibilityInvariant:
+    """Every job must stay reachable from at least one UI surface.
+
+    Regression guard for the "review jobs silently disappear" report: the
+    dashboard list is capped at the 10 most recent uncleared jobs and history
+    only shows terminal states, so a REVIEW_NEEDED job that had 10 newer jobs
+    created after it fell into the gap between the two views. The row was never
+    deleted, it just became unreachable.
+    """
+
+    async def test_old_review_job_survives_a_full_recent_window(self, client):
+        """A REVIEW_NEEDED job must not age out of /api/jobs behind newer jobs."""
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        review = await _seed_job(
+            state=JobState.REVIEW_NEEDED, created_at=base, volume_label="OLD_REVIEW"
+        )
+        for i in range(12):
+            await _seed_job(state=JobState.COMPLETED, created_at=base + timedelta(days=i + 1))
+
+        response = await client.get("/api/jobs")
+        assert response.status_code == 200
+        assert review.id in [j["id"] for j in response.json()]
+
+    async def test_every_non_terminal_state_survives_the_window(self, client):
+        """The exemption covers all human/in-flight states, not just review."""
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        stuck = [
+            await _seed_job(state=state, created_at=base)
+            for state in (
+                JobState.IDLE,
+                JobState.IDENTIFYING,
+                JobState.REVIEW_NEEDED,
+                JobState.RIPPING,
+                JobState.MATCHING,
+                JobState.ORGANIZING,
+            )
+        ]
+        for i in range(12):
+            await _seed_job(state=JobState.COMPLETED, created_at=base + timedelta(days=i + 1))
+
+        response = await client.get("/api/jobs")
+        ids = [j["id"] for j in response.json()]
+        assert [j.id for j in stuck if j.id not in ids] == []
+
+    async def test_terminal_jobs_are_still_capped(self, client):
+        """The recency cap still applies to finished jobs: no unbounded list."""
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        for i in range(15):
+            await _seed_job(state=JobState.COMPLETED, created_at=base + timedelta(days=i))
+
+        response = await client.get("/api/jobs")
+        assert len(response.json()) == 10
+
+    async def test_newest_terminal_jobs_win_the_capped_slots(self, client):
+        """The cap keeps the most recent finished jobs, not an arbitrary 10."""
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        jobs = [
+            await _seed_job(state=JobState.COMPLETED, created_at=base + timedelta(days=i))
+            for i in range(15)
+        ]
+
+        response = await client.get("/api/jobs")
+        ids = [j["id"] for j in response.json()]
+        assert ids == [j.id for j in reversed(jobs[-10:])]
+
+    async def test_cleared_non_terminal_job_stays_hidden(self, client):
+        """The exemption must not resurrect a soft-deleted row."""
+        job = await _seed_job(state=JobState.REVIEW_NEEDED, cleared_at=datetime.now(UTC))
+        response = await client.get("/api/jobs")
+        assert job.id not in [j["id"] for j in response.json()]
+
+    async def test_history_state_filter_accepts_review_needed(self, client):
+        """History must be able to surface a review job on explicit request."""
+        job = await _seed_job(state=JobState.REVIEW_NEEDED)
+        await _seed_job(state=JobState.COMPLETED)
+
+        response = await client.get("/api/jobs/history?state=review_needed")
+        assert response.status_code == 200
+        assert [j["id"] for j in response.json()] == [job.id]
+
+    async def test_history_default_stays_terminal_only(self, client):
+        """Default history semantics are unchanged: finished jobs only."""
+        await _seed_job(state=JobState.REVIEW_NEEDED)
+        done = await _seed_job(state=JobState.COMPLETED)
+
+        response = await client.get("/api/jobs/history")
+        assert [j["id"] for j in response.json()] == [done.id]
+
+    async def test_history_include_all_states_is_a_backstop(self, client):
+        """include_all_states=true guarantees a view containing every job."""
+        seeded = [
+            await _seed_job(state=state)
+            for state in (JobState.RIPPING, JobState.REVIEW_NEEDED, JobState.COMPLETED)
+        ]
+
+        response = await client.get("/api/jobs/history?include_all_states=true")
+        assert response.status_code == 200
+        assert {j["id"] for j in response.json()} == {j.id for j in seeded}
+
+    async def test_history_rejects_an_unknown_state_filter(self, client):
+        """A typo'd filter must 422, not silently return everything."""
+        response = await client.get("/api/jobs/history?state=nonsense")
+        assert response.status_code == 422

@@ -1,0 +1,396 @@
+# Configuration
+
+## Config Wizard
+
+On first launch, Engram presents a Config Wizard that walks you through essential setup:
+
+- **MakeMKV path** -- auto-detected if on your system PATH
+- **FFmpeg path** -- auto-detected if on your system PATH
+- **Staging path** -- where ripped files are stored temporarily
+- **Library paths** -- separate directories for Movies and TV shows
+- **TMDB Read Access Token** -- for media metadata and poster art
+- **MakeMKV license key** -- your MakeMKV registration key
+
+Settings are stored in the SQLite database and can be edited at any time from the Settings page (gear icon in the dashboard header).
+
+## TMDB API Token
+
+The TMDB setting requires a **Read Access Token** (v4 auth), **not** the shorter v3 API Key.
+
+To obtain your token:
+
+1. Create an account at [TMDB](https://www.themoviedb.org/).
+2. Go to [API Settings](https://www.themoviedb.org/settings/api).
+3. Copy the **Read Access Token** -- this is a long JWT string starting with `eyJ...`.
+
+!!! warning "Common mistake"
+    The v3 "API Key" is a short alphanumeric string. Engram needs the v4 "Read Access Token" (the long JWT). Using the wrong one will cause TMDB lookups to fail silently.
+
+The configuration field is named `tmdb_api_key` for backwards compatibility, but it expects the v4 Read Access Token.
+
+## Environment Variables
+
+An optional `backend/.env` file can override server-level defaults. These settings are **not** managed through the Config Wizard -- they control the server itself.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | SQLite connection string | `sqlite+aiosqlite:///./engram.db` |
+| `HOST` | Server bind address | `127.0.0.1` |
+| `PORT` | Server port | `8000` |
+| `DEBUG` | Enable simulation endpoints | `false` |
+
+Example `.env` file:
+
+```ini
+DEBUG=true
+HOST=0.0.0.0
+PORT=8000
+```
+
+!!! note
+    The `.env` file is optional. All fields have sensible defaults. The file is included in `.gitignore` and should never be committed.
+
+## LAN Access (Dashboard on Other Devices)
+
+By default Engram binds to `127.0.0.1` (localhost only), so the dashboard is only reachable on the machine running Engram. To monitor from a phone, tablet, or another computer on the same network:
+
+### Via Settings (Windows desktop)
+
+1. Open the Settings page (gear icon) → **Preferences** step.
+2. Enable **"Allow access from other devices on my network (LAN)"**.
+3. The panel below the toggle shows your LAN address and a QR code once the change is applied.
+4. Click **Save** and **restart Engram** — the bind address is fixed at startup.
+
+!!! warning "No authentication"
+    Engram has no login. Anyone on your network can view job status and control the application.
+    Only enable this on a trusted home network.
+
+After restart, access the dashboard from any device on your LAN at `http://<host-ip>:8000`.
+The QR code makes it easy to open on a phone or tablet.
+
+### Via environment variable (power users / Docker)
+
+Set `HOST=0.0.0.0` in your `backend/.env` file (or pass it as an environment variable in Docker).
+The env var takes precedence over the UI toggle:
+
+```ini
+HOST=0.0.0.0
+PORT=8000
+```
+
+For Docker containers this is typically the right approach — the container has its own network
+namespace, so binding to `127.0.0.1` inside the container would make it unreachable even via
+published ports.
+
+## Configuration Sources
+
+Configuration is resolved in this priority order:
+
+1. **Database** (`app_config` table) -- runtime configuration, editable via API and Config Wizard
+2. **Environment variables** (or `.env` file) -- server-level settings only
+3. **Defaults** -- hardcoded in the `AppConfig` model
+
+## Configuration Fields
+
+### Paths
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `staging_path` | Temporary directory for ripped files | *(set during wizard)* |
+| `library_movies_path` | Movie library root directory | *(set during wizard)* |
+| `library_tv_path` | TV show library root directory | *(set during wizard)* |
+| `makemkv_path` | Path to `makemkvcon` executable | *(auto-detected)* |
+| `ffmpeg_path` | Path to `ffmpeg` executable | *(auto-detected)* |
+
+### API Keys
+
+| Field | Description | Notes |
+|-------|-------------|-------|
+| `makemkv_key` | MakeMKV registration key | Redacted in API responses |
+| `tmdb_api_key` | TMDB Read Access Token (v4) | Redacted in API responses |
+
+### Matching & Processing
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `max_concurrent_matches` | Parallel episode-matching (ASR) tasks | `2` |
+| `matcher_min_confidence` | Minimum confidence to auto-accept an episode match | `0.6` |
+| `enable_gpu_acceleration` | Run transcription on an NVIDIA GPU (opt-in; downloads the CUDA runtime) | `false` |
+| `conflict_resolution_default` | File conflict handling | `"ask"` |
+
+`max_concurrent_matches` is the main matching-throughput knob. It's clamped to your hardware and
+takes effect on restart — see [Performance & Hardware](../guide/performance.md#concurrency-tuning)
+for how to tune it for CPU vs GPU and bulk imports.
+
+`enable_gpu_acceleration` is best toggled from **Settings → Matching → GPU Acceleration** rather than
+edited directly, since enabling it triggers the one-time CUDA-runtime download. See
+[GPU acceleration](../guide/performance.md#gpu-acceleration-faster-whisper-asr).
+
+The `conflict_resolution_default` field accepts one of four values:
+
+- `"ask"` -- prompt via the review queue (default)
+- `"skip"` -- skip files that already exist in the library
+- `"overwrite"` -- replace existing files
+- `"rename"` -- keep both by writing a numbered `(vN)` variant
+
+### AI-Powered Title Resolution
+
+`ai_identification_enabled` (default: `false`) — when enabled, Engram sends the disc volume label and any collected metadata to your configured AI provider to help resolve ambiguous or unrecognised disc titles.
+
+| Field | Description | Notes |
+|-------|-------------|-------|
+| `ai_identification_enabled` | Enable AI-assisted disc title resolution | Requires `ai_provider`, plus `ai_api_key` for a hosted provider |
+| `ai_provider` | AI provider to use | Hosted: `anthropic`, `openai`, `openrouter`, `gemini`. Local: `ollama`, `lmstudio` |
+| `ai_api_key` | API key for the selected provider | Redacted in API responses. Not needed for a local provider |
+| `ai_model` | Model override | Blank uses Engram's default for the provider. Set this when your key has no access to that default. **Required** for a local provider, which has no default |
+| `ai_local_base_url` | Address of a local AI server | Local providers only. Blank uses the provider's conventional port |
+
+See [Local AI](#local-ai-ollama-and-lm-studio) to run this against your own machine instead of a paid API.
+
+### AI-Powered Episode Matching
+
+`ai_episode_matching_enabled` (default: `false`) — when enabled, low-confidence TV episode matches are sent to your configured AI provider with the season's TMDB synopses for a suggested episode. Always surfaces through the [review queue](../guide/review-queue.md); never auto-organizes. Shares `ai_provider`/`ai_api_key` with [AI-Powered Title Resolution](#ai-powered-title-resolution).
+
+See the [LLM Episode Matcher guide](../guide/llm-episode-matcher.md) for accuracy expectations and provider recommendations (Gemini Flash-Lite is best on this task).
+
+### Local AI (Ollama and LM Studio)
+
+Both AI features above can run against a model on your own machine instead of a
+paid hosted API. Two servers are supported, and they work the same way because
+they expose the same OpenAI-compatible interface.
+
+**No API key is required.** The key field is hidden when a local provider is
+selected.
+
+#### Setup
+
+1. Start your server:
+    - **Ollama:** run `ollama serve`, then pull a model with `ollama pull llama3.1:8b`.
+    - **LM Studio:** open the Developer tab, load a model, and start the server.
+2. In Engram, open **Settings → Data sharing → AI assistance**, enable AI
+   identification, and choose **Ollama (local)** or **LM Studio (local)**.
+3. Leave **Server Address** blank to use the default:
+
+    | Provider | Default address |
+    |----------|-----------------|
+    | Ollama | `http://localhost:11434/v1` |
+    | LM Studio | `http://localhost:1234/v1` |
+
+    Set it only if your server runs on another port, or on another machine on
+    your network.
+4. Pick a model from the **Model** dropdown. The list is read from your server,
+   so it only populates once the server is running. Unlike the hosted providers
+   there is no default model, because the answer depends on what you installed.
+5. Click **Test Connection** to confirm Engram can reach it.
+
+#### Choosing a model
+
+Any instruction-tuned model in roughly the 7B-14B range works well. Both tasks
+ask for a small JSON reply, so reasoning-heavy or very large models cost a lot
+of time for little benefit.
+
+The dropdown lists everything the server offers, including embedding models
+(names containing `embed`). Those cannot answer chat requests; pick an
+instruction-tuned model instead. Neither server's model list distinguishes the
+two, so Engram cannot filter them for you.
+
+#### Performance
+
+Set **Max Concurrent Matches** to 1 in *Preferences → Matching*. A local server
+has one GPU or CPU, so parallel requests queue rather than overlap, and several
+large contexts at once can exhaust VRAM. Engram shows a reminder in Settings
+when a local provider is selected with concurrency above 1; it does not override
+your setting.
+
+The first request after loading a model is slow. LM Studio loads weights on
+demand, which can take 30-60 seconds before any text appears. Engram allows up
+to five minutes for a local response, so this is expected rather than a failure.
+
+#### Troubleshooting
+
+| Message | Cause |
+|---------|-------|
+| `Could not reach Ollama at ...` | The server is not running, or the address is wrong |
+| `'<model>' is not installed on this server` | The model is not pulled (Ollama) or not downloaded (LM Studio). The message lists what is available |
+| `Select a model first` | Local providers have no default; pick one from the dropdown |
+
+!!! note "Why Engram checks the model list before testing"
+    LM Studio answers a request for an unknown model by silently serving
+    whichever model is currently loaded, returning HTTP 200 with no warning. A
+    typo would otherwise pass the connection test and then quietly matter at
+    match time, so Engram verifies the model against the server's own list
+    first.
+
+### Extras Policy
+
+Controls how bonus content (behind-the-scenes, deleted scenes, etc.) is handled during organization:
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `extras_policy` | How to handle extras (`"keep"`, `"skip"`, `"ask"`) | `"keep"` |
+
+### Import Watch Folder
+
+Engram can auto-ingest pre-ripped MKV files dropped into a watched folder. See the
+[Import Watch Folder guide](../guide/import-watch-folder.md) for folder layouts and the full
+workflow.
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `import_watch_path` | Folder to watch for incoming MKV files (unset = disabled) | *(none)* |
+| `import_destination_mode` | `"library"` files imports into your Movies/TV libraries; `"in_place"` organizes them inside the watch folder | `"library"` |
+| `staging_watch_enabled` | Also auto-import folders dropped into the staging directory | `false` |
+
+### Staging Cleanup
+
+Controls when the staging directory is reclaimed after a job finishes. Watch-folder imports are
+never deleted regardless of this setting (the source folder is yours). See
+[sizing the staging directory](../guide/performance.md#sizing-the-staging-directory).
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `staging_cleanup_policy` | `"on_success"`, `"on_completion"`, `"manual"`, or `"after_days"` | `"on_success"` |
+| `staging_cleanup_days` | Retention period when policy is `"after_days"` | `7` |
+
+### Drive Behavior
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `auto_eject_enabled` | Eject the disc automatically when ripping finishes | `true` |
+
+Disable `auto_eject_enabled` if you want to keep the disc in the drive after ripping — for example, to manually verify the output or to re-rip a title without re-inserting the disc. Applies to both normal rips and re-rips triggered from the review queue.
+
+### Disc Backup
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `backup_before_rip` | Copy the whole disc to a separate folder first, then extract from that copy | `false` |
+| `backup_path` | Where those copies go | (empty) |
+
+With this on, Engram writes a full decrypted MakeMKV copy of each disc under
+`backup_path` after identifying it, then extracts your MKVs from that copy
+instead of from the drive. Three things change:
+
+- **The disc is read once, sequentially**, instead of once per title. That is
+  much gentler on a scratched or fragile disc.
+- **The disc comes out of the drive as soon as the copy finishes**, not when the
+  whole rip finishes, so you can swap discs sooner.
+- **You keep the copy.** Engram never deletes a completed backup. It is yours to
+  move to a preservation server or re-import later.
+
+The cost is time and space: a Blu-ray backup is typically 25 to 50 GB and adds a
+full pass over the disc before extraction starts.
+
+Backups mirror your library layout, so the shelf browses the way your library
+does:
+
+```
+backups/
+  Movies/
+    Inception (2010)/
+  TV/
+    Frasier/
+      Season 01/
+        S01D01/
+  Unidentified/
+    THE_SWEETEST_THING/
+```
+
+The folder names come from your own naming settings, so if you customise
+`naming_movie_format` or `naming_tv_show_format` the backups follow.
+
+If anything prevents a backup (no folder configured, not enough free space, a
+disc MakeMKV cannot address, or a copy that fails partway) **Engram rips
+directly from the drive instead and tells you why on the job card.** Turning
+this on cannot make a disc less likely to finish.
+
+You can also point the **Import** button at a backup you already have. A folder
+containing `BDMV` or `VIDEO_TS`, or an `.iso` file, is recognised as a disc
+image and run through the normal scan, identify, rip, match and organize
+pipeline. Point it at a whole shelf of backups and it queues one job per disc.
+
+### Naming Conventions
+
+Out of the box, organized files follow these patterns:
+
+- **Movies**: `Movies/Name (Year)/Name (Year).mkv`
+- **TV Shows**: `TV/Show/Season XX/Show - SXXEXX.mkv`
+
+Both patterns are configurable under **Settings → Preferences → Naming & extras**. (The season
+and episode formats appear once you set Naming Convention to Custom.) Formats are Python format
+strings, and any placeholder that turns out to be empty takes its surrounding group with it, so
+a movie with no known year is filed as `Blade Runner`, never `Blade Runner ()`.
+
+#### Movie naming
+
+| Setting | Default | Placeholders |
+|---------|---------|--------------|
+| Movie Folder Format | `{title} ({year})` | `{title}`, `{year}`, `{tmdb_id}` |
+| Movie Filename Format | blank | `{title}`, `{year}`, `{tmdb_id}`, `{edition}` |
+
+Leaving the filename format blank means "reuse the folder format", so customizing the folder
+carries through to the file and the two cannot drift apart:
+
+```
+Folder format "{title} - {year}", filename blank
+  -> Movies/Blade Runner - 1982/Blade Runner - 1982.mkv
+```
+
+When a movie has an edition (chosen in the review queue), Engram appends the Plex
+`{edition-...}` tag to the inherited filename, because Plex reads the edition off the file
+rather than the folder:
+
+```
+Movies/Blade Runner (1982)/Blade Runner (1982) {edition-Final Cut}.mkv
+```
+
+Setting an explicit filename format takes full control and turns off both the inheritance and
+the automatic edition tag.
+
+#### TV naming
+
+| Setting | Default | Placeholders |
+|---------|---------|--------------|
+| Show Folder Format | `{show}` | `{show}`, `{year}`, `{tmdb_id}` |
+| Season Folder Format | `Season {season:02d}` | `{season}` |
+| Episode Filename Format | `{show} - S{season:02d}E{episode:02d}` | `{show}`, `{season}`, `{episode}`, `{year}`, `{tmdb_id}` |
+
+#### Letting same-name titles coexist
+
+Two different shows or movies can share a name (Frasier 1993 and Frasier 2023). Adding the id
+tag your media server expects keeps them in separate folders and stops the server from merging
+them:
+
+- **Plex**: `{title} ({year}) {{tmdb-{tmdb_id}}}` (or `{show} ...` for TV)
+- **Jellyfin**: `{title} ({year}) [tmdbid-{tmdb_id}]`
+
+The doubled braces in the Plex form are how a literal `{` is written in a format string.
+
+## Configuration Flow
+
+```
+User edits config in Config Wizard / Settings page
+  |
+  v
+PUT /api/config
+  |
+  v
+Update AppConfig in database
+  |
+  v
+JobManager reloads config on next operation
+  |
+  v
+Components use updated settings
+```
+
+## Validation
+
+Configuration is validated at multiple levels:
+
+- **Pydantic models** -- type checking and required fields
+- **API routes** -- path existence checks, MakeMKV license validation
+- **Validation endpoints** -- `POST /api/validate/makemkv`, `POST /api/validate/ffmpeg`, `GET /api/detect-tools`
+- **JobManager** -- pre-flight checks before starting any job
+
+API keys are **redacted** (masked as `"***"`) in `GET /api/config` responses. The `PUT /api/config` endpoint accepts new values but never returns sensitive fields in the response.
